@@ -8,7 +8,7 @@ export const BUILTIN_AUDITOR_AGENTS: Record<BuiltInFailureMode, AuditorAgentDefi
     id: "missing-constraint-auditor",
     displayName: "Missing Constraint Auditor",
     guidance:
-      "Look for a witnessed or assigned value that is used in a check but is never constrained to equal its intended source. Trace every input to the check back to equality, copy, lookup, range, or public-input constraints.",
+      "Check whether a security property is relied on by a verifier, guard, state transition, equation, or protocol rule but is not enforced by the visible implementation. Identify the exact enforcement edge or the specific missing edge.",
   },
   supply_balance_integrity: {
     failureMode: "supply_balance_integrity",

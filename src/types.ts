@@ -70,6 +70,18 @@ export interface ProjectProfile {
   notes: string[];
 }
 
+export interface ProjectLearning {
+  scopeSummary?: string;
+  securityObjectives?: string[];
+  domainConcepts?: string[];
+  trustBoundaries?: string[];
+  attackerCapabilities?: string[];
+  candidateInvariants?: string[];
+  implementationMechanics?: string[];
+  uncertainty?: string[];
+  evidenceRefs?: string[];
+}
+
 export interface AuditItem {
   id: string;
   location: string;

@@ -41,6 +41,7 @@ test("dry-run pipeline writes checklist and summary without model calls", async 
   cfg.sourcePaths = [fixtures];
   cfg.outputDir = out;
   cfg.dryRun = true;
+  cfg.localChecklistSeeders = true;
 
   const result = await runPipeline(cfg);
   assert.equal(result.summary.coverage.itemsTotal, 5);
@@ -63,6 +64,7 @@ test("mock pipeline runs enumerate, audit, verify, and report end to end", async
   cfg.sourcePaths = [fixtures];
   cfg.outputDir = out;
   cfg.trials = 2;
+  cfg.localChecklistSeeders = true;
 
   const result = await runPipeline(cfg, { llm: new MockAuditLlmClient(), verifyTopK: 2 });
   assert.equal(result.summary.coverage.itemsTotal, 6);
@@ -73,6 +75,8 @@ test("mock pipeline runs enumerate, audit, verify, and report end to end", async
   assert.equal(verification.length, 2);
   const lensPacks = JSON.parse(await readFile(path.join(result.runDir, "lens_packs.json"), "utf8"));
   assert.equal(lensPacks[0].id, "mock-project-lens");
+  const learning = JSON.parse(await readFile(path.join(result.runDir, "project_learning.json"), "utf8"));
+  assert.match(learning.scopeSummary, /Mock initialization notes/);
 
   const coverage = JSON.parse(await readFile(path.join(result.runDir, "run_coverage.json"), "utf8"));
   assert.equal(coverage.checklist.byFailureMode.missing_constraint, 6);
@@ -90,6 +94,7 @@ test("mock pipeline runs enumerate, audit, verify, and report end to end", async
 
   for (const artifact of [
     "source_index.json",
+    "project_learning.json",
     "checklist.json",
     "checklist_coverage.json",
     "run_coverage.json",
@@ -108,7 +113,7 @@ test("model-only mode requires checklist items from model enumeration", async ()
   cfg.sourcePaths = [fixtures];
   cfg.outputDir = out;
   cfg.trials = 2;
-  cfg.localChecklistSeeders = false;
+  assert.equal(cfg.localChecklistSeeders, false);
 
   const result = await runPipeline(cfg, { llm: new MockAuditLlmClient(), verifyTopK: 1 });
   assert.equal(result.summary.coverage.itemsTotal, 1);
@@ -120,6 +125,7 @@ test("model-only mode requires checklist items from model enumeration", async ()
   assert.equal(checklist[0].why, "Mock enumeration item used to test end-to-end model-driven audit flow.");
 
   const calls = await readdir(path.join(result.runDir, "calls"));
+  assert.ok(calls.some((file) => /_learn_project\.json$/.test(file)));
   assert.ok(calls.some((file) => /_discover_lenses\.json$/.test(file)));
   assert.ok(calls.some((file) => /_enumerate\.json$/.test(file)));
   assert.ok(calls.some((file) => /_audit_/.test(file)));
@@ -145,7 +151,7 @@ test("multi-round mode deepens with novel follow-up checklist items", async () =
 
   const deepening = JSON.parse(await readFile(path.join(result.runDir, "round_2_deepening_items.json"), "utf8"));
   assert.equal(deepening.accepted.length, 1);
-  assert.equal(deepening.accepted[0].id, "mock-round-2-source-binding");
+  assert.equal(deepening.accepted[0].id, "mock-round-2-enforcement-edge");
 
   const calls = await readdir(path.join(result.runDir, "calls"));
   assert.ok(calls.some((file) => /_deepen_round_2\.json$/.test(file)));

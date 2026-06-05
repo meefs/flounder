@@ -4,7 +4,7 @@
 
 `full-stack-auditor` has two layers:
 
-- Audit engine: deterministic TypeScript modules under `src/ingest`, `src/index`, `src/profile`, `src/lens`, `src/seeders`, `src/audit`, `src/verify`, and `src/reports`.
+- Audit engine: deterministic TypeScript modules under `src/ingest`, `src/index`, `src/profile`, `src/learn`, `src/lens`, `src/seeders`, `src/audit`, `src/verify`, and `src/reports`.
 - Pi integration: thin adapters under `src/llm/pi-ai.ts` and `src/pi/extension.ts`.
 - Optional local fallback: `src/llm/codex-cli.ts` for authenticated Codex CLI environments when pi provider credentials are unavailable.
 
@@ -30,6 +30,7 @@ flowchart TD
     INGEST["Ingest and path sanitization"]
     INDEX["SourceIndex and structural retrieval"]
     PROFILE["Deterministic project profile"]
+    LEARN["Model initialization learning"]
     LENS["Model reconnaissance and dynamic lens packs"]
     ENUM["Model checklist enumeration"]
     ROUND1["Round 1 checklist"]
@@ -60,10 +61,19 @@ flowchart TD
   SRC --> INGEST
   CORPUS --> INGEST
   CFG --> PROFILE
+  CFG --> LEARN
   CFG --> LENS
   CFG --> ENUM
   INGEST --> INDEX
   INGEST --> PROFILE
+  INDEX --> LEARN
+  PROFILE --> LEARN
+  LEARN --> LENS
+  LEARN --> ENUM
+  LEARN --> AUDIT1
+  LEARN --> DEEPEN
+  LEARN --> AUDITN
+  LEARN --> VERIFY
   INDEX --> LENS
   PROFILE --> LENS
   LENS --> ENUM
@@ -77,16 +87,19 @@ flowchart TD
   AUDITN --> AGG
   AGG --> VERIFY
   VERIFY --> REPORT
+  PIAI -. default .-> LEARN
   PIAI -. default .-> LENS
   PIAI -. default .-> ENUM
   PIAI -. default .-> AUDIT1
   PIAI -. default .-> DEEPEN
   PIAI -. default .-> VERIFY
+  CODEX -. explicit fallback .-> LEARN
   CODEX -. explicit fallback .-> LENS
   CODEX -. explicit fallback .-> ENUM
   CODEX -. explicit fallback .-> AUDIT1
   CODEX -. explicit fallback .-> DEEPEN
   CODEX -. explicit fallback .-> VERIFY
+  MOCK -. tests .-> LEARN
   MOCK -. tests .-> LENS
   MOCK -. tests .-> ENUM
   MOCK -. tests .-> AUDIT1
@@ -102,8 +115,9 @@ source + corpus
   -> ingest
   -> source index / retrieval
   -> deterministic project profile
+  -> model initialization learning notes
   -> model project reconnaissance / dynamic lens packs
-  -> local checklist seeders
+  -> optional local checklist seeders
   -> LLM enumeration
   -> round 1 checklist
   -> specialized audit trials
@@ -114,9 +128,11 @@ source + corpus
   -> disclosure draft
 ```
 
-Project profile, source index, dynamic lens packs, and local checklist seeders are planning and context mechanisms. They may propose audit questions and routing guidance, but they must not produce bug findings. Findings come only from model-backed audit trials.
+Project profile, source index, initialization learning notes, dynamic lens packs, and optional local checklist seeders are planning and context mechanisms. They may propose audit questions and routing guidance, but they must not produce bug findings. Findings come only from model-backed audit trials.
 
-`AuditorConfig.localChecklistSeeders` controls whether deterministic seeders contribute checklist items. Normal exploratory runs can keep them enabled for coverage hints. Blind proof runs should disable them so both checklist enumeration and audit findings come from model calls.
+`AuditorConfig.projectLearning` controls the model initialization stage. It is enabled by default for live runs and writes `project_learning.json`, a reviewable record of what the model learned from the loaded source, corpus, deterministic profile, and configured high-level scope before it proposes lenses or checklist items.
+
+`AuditorConfig.localChecklistSeeders` controls whether deterministic seeders contribute checklist items. They are disabled by default and should be enabled only for dry-run coverage inspection or local regression tests. Source-discovery proof runs should leave them disabled so both checklist enumeration and audit findings come from model calls.
 
 ## Rounds vs Trials
 
@@ -131,10 +147,11 @@ The deepening stage is still a planning stage. It does not produce findings. It 
 
 ## Agent Roles
 
+- ProjectLearningAgent: reads loaded source and reference material, then writes source-backed planning notes without claiming vulnerabilities.
 - LensDiscoveryAgent: reads the loaded project context and proposes dynamic lens packs for the target's assets, trust boundaries, invariants, attacker capabilities, and domain-specific failure modes.
 - Enumerator: maps code locations, spec statements, security properties, and failure modes.
 - DeepeningAgent: reads prior coverage and audit observations, then proposes novel follow-up checklist items for later rounds.
-- MissingConstraintAuditor: traces witness values to equality/copy/range constraints.
+- MissingConstraintAuditor: checks whether a relied-on security property has a visible enforcement edge.
 - BalanceIntegrityAuditor: checks conservation and turnstile boundaries.
 - NullifierAuditor: checks uniqueness of spend markers and replay resistance.
 - SpecMismatchAuditor: compares implementation and written spec line by line.
@@ -150,13 +167,13 @@ Project-specific customization has two layers:
 - `projectContext`: human- or config-provided assets, attacker capabilities, trust boundaries, invariants, focus areas, and out-of-scope notes.
 - `lensPacks`: scenario-specific failure modes, enumeration guidance, audit guidance, and optional auditor agents.
 
-Live runs can also enable `dynamicLensDiscovery`, which asks the model to produce additional lens packs before enumeration. These packs are normalized, bounded, written to `lens_packs.json`, and merged into the current run config. They are reviewable planning artifacts, not findings.
+Live runs enable `projectLearning` and `dynamicLensDiscovery` by default. Project learning writes `project_learning.json`; lens discovery writes `lens_packs.json`. Both are normalized, bounded, reviewable planning artifacts, not findings.
 
-## Blind Discovery Gate
+## Local Seeder Regression Gate
 
 `npm run check:blind-discovery` runs the framework against a neutral fixture. The fixture does not name a target protocol, impact, or expected bug. The gate passes only if local checklist generation produces a generic missing-constraint audit item from source structure alone.
 
-This is not a substitute for model discovery. Local checklist seeders prepare coverage; only model-backed audit trials count as autonomous bug-discovery evidence.
+This legacy-named command is not a substitute for model discovery. Local checklist seeders prepare optional coverage; only model-backed learning, enumeration, and audit trials count as autonomous bug-discovery evidence.
 
 ## Pi Integration
 
@@ -180,8 +197,8 @@ Model calls should use pi-ai providers by default. `provider=codex-cli` is an ex
 - `npm test`: build plus Node tests for JSON parsing, seeders, dry-run pipeline, mock end-to-end pipeline, and pi extension registration.
 - `npm run dry-run`: local checklist seeder run against fixtures. It must produce zero findings.
 - `npm run mock-run`: full model-shaped pipeline using deterministic mock LLM.
-- `npm run check:blind-discovery`: blind fixture regression for checklist enumeration.
-- `npm run check:source-discovery -- --source <path>`: opt-in live model assertion that disables local checklist seeders by default, requires an enumeration model call, requires audit model calls, and requires a model-produced finding without committing that source.
+- `npm run check:blind-discovery`: local seeder regression for checklist enumeration.
+- `npm run check:source-discovery -- --source <path>`: opt-in live model assertion that disables local checklist seeders by default, requires initialization learning, enumeration, and audit model calls, and requires a model-produced finding without committing that source.
 
 Use `--rounds <n>` with the source-discovery gate when evaluating iterative deepening. Round artifacts must show that later coverage came from `deepen_round_<n>` model calls and survived duplicate filtering.
 

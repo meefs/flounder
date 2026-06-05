@@ -24,8 +24,9 @@ export default function fullStackAuditorExtension(pi: ExtensionAPI): void {
       outputDir: Type.Optional(Type.String({ description: "Artifact output directory." })),
       projectContext: Type.Optional(Type.Any({ description: "Project-specific assets, threats, invariants, focus areas, and out-of-scope notes." })),
       lensPacks: Type.Optional(Type.Array(Type.Any(), { description: "Project-specific audit lens packs." })),
+      projectLearning: Type.Optional(Type.Boolean({ description: "When true in live runs, let the model write initialization learning notes before lens discovery." })),
       dynamicLensDiscovery: Type.Optional(Type.Boolean({ description: "When true in live runs, let the model propose project-specific lens packs before enumeration." })),
-      localChecklistSeeders: Type.Optional(Type.Boolean({ description: "When false, checklist items must come from model enumeration." })),
+      localChecklistSeeders: Type.Optional(Type.Boolean({ description: "When true, add deterministic local checklist seeders as coverage hints." })),
       dryRun: Type.Optional(Type.Boolean({ description: "When true, run local checklist seeders only and make no model calls." })),
     }),
     async execute(_toolCallId, params) {
@@ -42,8 +43,9 @@ export default function fullStackAuditorExtension(pi: ExtensionAPI): void {
       cfg.dryRun = params.dryRun ?? true;
       cfg.projectContext = normalizeProjectContext(params.projectContext) ?? cfg.projectContext;
       cfg.lensPacks = normalizeLensPacks(params.lensPacks);
+      cfg.projectLearning = params.projectLearning ?? cfg.projectLearning;
       cfg.dynamicLensDiscovery = params.dynamicLensDiscovery ?? cfg.dynamicLensDiscovery;
-      cfg.localChecklistSeeders = params.localChecklistSeeders ?? cfg.localChecklistSeeders;
+      cfg.localChecklistSeeders = params.localChecklistSeeders ?? cfg.dryRun;
       if (params.model) {
         cfg.enumModel = params.model;
         cfg.auditModel = params.model;

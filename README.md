@@ -10,16 +10,17 @@ The core workflow is:
 
 1. Load source, specs, papers, books, and implementation notes.
 2. Build a deterministic project profile from language, framework, manifest, entrypoint, and security-domain signals.
-3. In live runs, let the model perform project reconnaissance and propose dynamic lens packs.
-4. Enumerate concrete audit items before looking for bugs.
-5. Route each item to built-in or project-specific failure-mode agents.
-6. Run one or more exploration rounds. Later rounds use prior coverage and audit observations to propose novel follow-up items.
-7. Run multiple independent model audit trials per item.
-8. Aggregate by severity, hit rate, confidence, and evidence quality.
-9. Verify findings separately, in local sandbox-only tests.
-10. Keep a complete audit trail of prompts, model outputs, artifacts, and events.
+3. In live runs, let the model write initialization learning notes from the loaded material.
+4. Let the model perform project reconnaissance and propose dynamic lens packs.
+5. Enumerate concrete audit items before looking for bugs.
+6. Route each item to built-in or project-specific failure-mode agents.
+7. Run one or more exploration rounds. Later rounds use prior coverage and audit observations to propose novel follow-up items.
+8. Run multiple independent model audit trials per item.
+9. Aggregate by severity, hit rate, confidence, and evidence quality.
+10. Verify findings separately, in local sandbox-only tests.
+11. Keep a complete audit trail of prompts, model outputs, artifacts, and events.
 
-Only model-backed audit trials produce bug findings. Project profiles, source indexes, dynamic lens packs, and local checklist seeders organize context and propose questions; they do not count as discovery evidence by themselves.
+Only model-backed audit trials produce bug findings. Project profiles, source indexes, initialization learning notes, dynamic lens packs, and optional local checklist seeders organize context and propose questions; they do not count as discovery evidence by themselves.
 
 `rounds` and `trials` are separate controls. Rounds deepen project exploration by generating new checklist items from previous coverage gaps. Trials repeat the audit of one item to measure stochastic agreement and reduce one-off model noise. A multi-round run must add novel checklist coverage; it is not a replay of a single pass.
 
@@ -57,6 +58,8 @@ npm run dry-run
 
 This reads local source and emits checklist items without calling a model. Dry-run output is useful for coverage inspection, but it cannot produce bug findings.
 
+The default live pipeline does not use deterministic local seeders. `npm run dry-run` enables them explicitly because dry-run has no model available.
+
 ## Mock End-to-End Run
 
 ```bash
@@ -80,6 +83,8 @@ fsa run \
 ```
 
 Artifacts are written under `runs/<target>-<timestamp>/`.
+
+This live run uses model initialization learning, model-generated lenses, and model enumeration by default. Deterministic local seeders are off unless `--local-seeders` is passed.
 
 If pi provider credentials are unavailable but local Codex CLI is authenticated, use the fallback provider:
 
@@ -139,6 +144,8 @@ fsa run --config ./audit-config.json --provider openai --model gpt-5.5 --thinkin
 
 Live runs also enable dynamic lens discovery by default. The model reads the project profile and loaded context, writes `lens_packs.json`, and uses those lens packs during enumeration and audit. Disable that stage with `--no-dynamic-lenses` when you want only configured lenses.
 
+Live runs also enable project learning by default. The model reads the loaded source and corpus before lens discovery, writes `project_learning.json`, and uses those notes as the audit-trail record of what it learned from the target material. Disable that stage with `--no-project-learning` only for ablation tests.
+
 ## Public Release Check
 
 ```bash
@@ -147,13 +154,13 @@ npm run check:public
 
 This scans the public source surface for local absolute paths and high-confidence secret patterns. It is also part of `npm run verify`.
 
-## Blind Discovery Check
+## Local Seeder Regression Check
 
 ```bash
 npm run check:blind-discovery
 ```
 
-This runs a dry-run audit against a neutral fixture and asserts that the framework can enumerate a generic checklist item without target-specific hints. It is a checklist coverage gate, not proof of model reasoning.
+This legacy-named command runs a dry-run audit against a neutral fixture and asserts that optional local seeders still produce bounded checklist coverage. It is a seeder regression gate, not proof of model reasoning or autonomous discovery.
 
 To run a live model-only discovery assertion against an external source tree without committing that source:
 
@@ -170,9 +177,9 @@ npm run check:source-discovery -- \
   --max-items 25
 ```
 
-`check:source-discovery` is intentionally not part of default CI because it requires provider credentials and live model calls. It fails unless an audit model call is recorded and a model-produced finding generates a disclosure report.
+`check:source-discovery` is intentionally not part of default CI because it requires provider credentials and live model calls. It fails unless initialization learning, enumeration, and audit model calls are recorded and a model-produced finding generates a disclosure report.
 
-For stronger blind-proof runs, this gate disables local checklist seeders by default. The model must first enumerate the matching audit item, then audit it. Use `--allow-local-seeders` only for debugging checklist coverage.
+For stronger source-discovery runs, this gate disables local checklist seeders by default. The model must first learn from the provided source and corpus, enumerate the matching audit item, then audit it. Use `--allow-local-seeders` only for debugging checklist coverage.
 
 Add `--rounds <n>` to test iterative deepening. Round 2 and later write `round_<n>_deepening_items.json`; the gate can then prove that follow-up coverage came from model reasoning rather than local checklist seeders.
 
@@ -186,7 +193,7 @@ Try the package locally from this directory:
 pi -e .
 ```
 
-The extension registers `fsa_run_audit`. It defaults to `dryRun: true`, so the first call only uses local checklist seeders. It also accepts `projectContext`, `lensPacks`, `dynamicLensDiscovery`, `localChecklistSeeders`, `rounds`, `maxNewItemsPerRound`, and `maxAuditItems` parameters for project-specific audits. The extension blocks bash commands that combine public live networks with exploit/broadcast-style operations.
+The extension registers `fsa_run_audit`. It defaults to `dryRun: true`, so the first call only uses local checklist seeders. It also accepts `projectContext`, `lensPacks`, `projectLearning`, `dynamicLensDiscovery`, `localChecklistSeeders`, `rounds`, `maxNewItemsPerRound`, and `maxAuditItems` parameters for project-specific audits. The extension blocks bash commands that combine public live networks with exploit/broadcast-style operations.
 
 ## Outputs
 
@@ -194,6 +201,7 @@ Each run writes:
 
 - `checklist.json`: enumerated audit items.
 - `project_profile.json`: deterministic project profile.
+- `project_learning.json`: model-written initialization notes derived from loaded source, corpus, and configured high-level scope.
 - `lens_packs.json`: configured plus model-generated audit lens packs.
 - `round_<n>_deepening_items.json`: model-generated novel follow-up items for round 2 and later.
 - `round_<n>_audit_results.json`: audit results for one exploration round.
@@ -231,7 +239,7 @@ cfg.auditorAgents = [
     failureMode: "custom_constraint_system",
     id: "custom-constraint-system-auditor",
     displayName: "Custom Constraint System Auditor",
-    guidance: "Trace assigned witnesses to enforced equations in the target DSL.",
+    guidance: "Trace assigned values to enforced equations in the target DSL.",
   },
 ];
 ```

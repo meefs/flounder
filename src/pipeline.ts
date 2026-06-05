@@ -4,6 +4,7 @@ import { runAudit } from "./audit/runner.js";
 import { enumerateAuditItems } from "./enumerate.js";
 import { loadCorpus, loadSource } from "./ingest/source.js";
 import { SourceIndex } from "./index/source-index.js";
+import { learnProject } from "./learn/project.js";
 import { mergeProjectContexts } from "./lens/context.js";
 import { discoverLensPacks } from "./lens/discover.js";
 import { createLlmClient } from "./llm/client.js";
@@ -34,6 +35,9 @@ export async function runPipeline(cfg: AuditorConfig, options: { verifyTopK?: nu
     verifyModel: cfg.verifyModel,
     rounds: cfg.rounds,
     trials: cfg.trials,
+    projectLearning: cfg.projectLearning,
+    dynamicLensDiscovery: cfg.dynamicLensDiscovery,
+    localChecklistSeeders: cfg.localChecklistSeeders,
     dryRun: cfg.dryRun,
   });
 
@@ -49,13 +53,14 @@ export async function runPipeline(cfg: AuditorConfig, options: { verifyTopK?: nu
   if (llm && "setLogger" in llm && typeof llm.setLogger === "function") {
     llm.setLogger(logger);
   }
-  const lensPacks = await discoverLensPacks({ cfg, corpus, source, projectProfile, ...(llm ? { llm } : {}), logger });
+  const projectLearning = await learnProject({ cfg, corpus, source, projectProfile, ...(llm ? { llm } : {}), logger });
+  const lensPacks = await discoverLensPacks({ cfg, corpus, source, projectProfile, projectLearning, ...(llm ? { llm } : {}), logger });
   const runCfg = {
     ...cfg,
     lensPacks,
     projectContext: mergeProjectContexts([cfg.projectContext, ...lensPacks.map((pack) => pack.projectContext)]),
   };
-  const items = await enumerateAuditItems({ cfg: runCfg, corpus, source, projectProfile, ...(llm ? { llm } : {}), logger, round: 1 });
+  const items = await enumerateAuditItems({ cfg: runCfg, corpus, source, projectProfile, projectLearning, ...(llm ? { llm } : {}), logger, round: 1 });
   await logger.artifact("checklist_coverage.json", summarizeChecklist(items));
   const results: AuditResult[] = [];
   const rounds = Math.max(1, Math.floor(runCfg.rounds));
@@ -70,6 +75,7 @@ export async function runPipeline(cfg: AuditorConfig, options: { verifyTopK?: nu
             corpus,
             source,
             projectProfile,
+            projectLearning,
             existingItems: items,
             results,
             round,
@@ -88,6 +94,7 @@ export async function runPipeline(cfg: AuditorConfig, options: { verifyTopK?: nu
       items: roundItems,
       source,
       corpus,
+      projectLearning,
       ...(llm ? { llm } : {}),
       logger,
       artifactName: `round_${round}_audit_results.json`,
@@ -108,6 +115,7 @@ export async function runPipeline(cfg: AuditorConfig, options: { verifyTopK?: nu
       cfg: runCfg,
       findings: summary.findings,
       source,
+      projectLearning,
       ...(llm ? { llm } : {}),
       logger,
       topK: options.verifyTopK ?? 3,

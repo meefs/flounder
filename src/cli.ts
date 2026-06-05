@@ -70,7 +70,10 @@ async function parseConfig(args: string[]): Promise<{ cfg: AuditorConfig; verify
   cfg.maxTokens = readIntFlag(args, "--max-tokens") ?? cfg.maxTokens;
   cfg.contextCharBudget = readIntFlag(args, "--context-chars") ?? cfg.contextCharBudget;
   if (args.includes("--dry-run")) cfg.dryRun = true;
+  if (args.includes("--no-project-learning")) cfg.projectLearning = false;
   if (args.includes("--no-dynamic-lenses")) cfg.dynamicLensDiscovery = false;
+  if (cfg.dryRun && !args.includes("--no-local-seeders")) cfg.localChecklistSeeders = true;
+  if (args.includes("--local-seeders")) cfg.localChecklistSeeders = true;
   if (args.includes("--no-local-seeders")) cfg.localChecklistSeeders = false;
   const thinking = readFlag(args, "--thinking");
   if (thinking === "minimal" || thinking === "low" || thinking === "medium" || thinking === "high" || thinking === "xhigh") {
@@ -120,6 +123,7 @@ function applyConfigOverrides(cfg: AuditorConfig, raw: Record<string, unknown>):
   if ("projectContext" in raw || "project_context" in raw) {
     cfg.projectContext = normalizeProjectContext(raw.projectContext ?? raw.project_context) ?? cfg.projectContext;
   }
+  if (typeof raw.projectLearning === "boolean") cfg.projectLearning = raw.projectLearning;
   if (typeof raw.dynamicLensDiscovery === "boolean") cfg.dynamicLensDiscovery = raw.dynamicLensDiscovery;
   if (typeof raw.localChecklistSeeders === "boolean") cfg.localChecklistSeeders = raw.localChecklistSeeders;
   if (typeof raw.dryRun === "boolean") cfg.dryRun = raw.dryRun;
@@ -185,7 +189,9 @@ Options:
   --max-items <n>         cap enumerated audit items for cost-controlled runs
   --thinking <level>      minimal|low|medium|high|xhigh
   --dry-run               no model calls; local checklist seeders only
+  --no-project-learning   disable model initialization learning notes
   --no-dynamic-lenses     disable model-generated project lens packs
+  --local-seeders         add deterministic local checklist seeders
   --no-local-seeders      require checklist items to come from model enumeration
   --mock-llm              run full pipeline with deterministic mock model
 `);

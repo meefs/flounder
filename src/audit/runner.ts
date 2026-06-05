@@ -4,8 +4,9 @@ import { effectiveAuditorAgents } from "../config.js";
 import { AUDIT_SYSTEM, buildAuditPrompt } from "../agents/prompts.js";
 import { createAgentRegistry } from "../agents/registry.js";
 import { SourceIndex } from "../index/source-index.js";
+import { renderProjectLearning } from "../learn/project.js";
 import { renderAuditGuidanceForFailureMode } from "../lens/context.js";
-import type { AuditItem, AuditResult, Doc, LlmClient, TrialFinding } from "../types.js";
+import type { AuditItem, AuditResult, Doc, LlmClient, ProjectLearning, TrialFinding } from "../types.js";
 import type { RunLogger } from "../trace/logger.js";
 import { extractJsonObject } from "../util/json.js";
 
@@ -14,6 +15,7 @@ export async function runAudit(input: {
   items: AuditItem[];
   source: Doc[];
   corpus?: Doc[];
+  projectLearning?: ProjectLearning;
   llm?: LlmClient;
   logger: RunLogger;
   artifactName?: string;
@@ -38,6 +40,7 @@ export async function runAudit(input: {
       item,
       index,
       agentRegistry,
+      projectLearning: input.projectLearning,
       llm: input.llm!,
       logger: input.logger,
     }),
@@ -51,12 +54,13 @@ async function auditItem(input: {
   item: AuditItem;
   index: SourceIndex;
   agentRegistry: ReturnType<typeof createAgentRegistry>;
+  projectLearning: ProjectLearning | undefined;
   llm: LlmClient;
   logger: RunLogger;
 }): Promise<AuditResult> {
   const sourceContext = input.index.contextForItem(input.item, input.cfg.contextCharBudget);
   const lensGuidance = renderAuditGuidanceForFailureMode(input.cfg.lensPacks, input.item.failureMode);
-  const user = buildAuditPrompt(input.item, sourceContext, input.agentRegistry, lensGuidance);
+  const user = buildAuditPrompt(input.item, sourceContext, input.agentRegistry, lensGuidance, renderProjectLearning(input.projectLearning));
   const trials = await mapLimit(
     Array.from({ length: input.cfg.trials }, (_, idx) => idx),
     Math.min(input.cfg.trials, Math.max(1, Math.floor(os.cpus().length / 2))),

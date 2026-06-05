@@ -30,6 +30,20 @@ export class MockAuditLlmClient implements LlmClient {
 }
 
 function responseFor(tag: string, user: string): string {
+  if (tag === "learn_project") {
+    return JSON.stringify({
+      scopeSummary: "Mock initialization notes for a small source set with circuit-like checks.",
+      securityObjectives: ["Checked statements should enforce the properties they rely on."],
+      domainConcepts: ["assigned values", "verification checks", "local enforcement edges"],
+      trustBoundaries: ["prover-controlled data entering trusted verification logic"],
+      attackerCapabilities: ["choose private inputs or other values accepted by the checked code"],
+      candidateInvariants: ["Values that affect a verified statement should be enforced by visible checks or equations."],
+      implementationMechanics: ["Some source locations assign values before later checks use them."],
+      uncertainty: ["Mock learning is only a deterministic test fixture."],
+      evidenceRefs: ["fixtures"],
+    });
+  }
+
   if (tag === "discover_lenses") {
     return JSON.stringify([
       {
@@ -37,13 +51,13 @@ function responseFor(tag: string, user: string): string {
         displayName: "Mock Project Lens",
         description: "Mock lens pack used to test model-generated project reconnaissance.",
         projectContext: {
-          criticalAssets: ["circuit witness integrity"],
-          attackerCapabilities: ["choose private witness values"],
-          securityInvariants: ["logical inputs must be constrained to intended source values"],
+          criticalAssets: ["verified statement integrity"],
+          attackerCapabilities: ["choose private values accepted by the checked code"],
+          securityInvariants: ["properties relied on by checks must be visibly enforced"],
         },
         failureModes: ["missing_constraint"],
-        enumerationGuidance: ["Map witness assignments to the checks that consume them."],
-        auditGuidance: ["Trace equality or copy constraints before claiming a missing constraint."],
+        enumerationGuidance: ["Map values used by checks to the code that enforces them."],
+        auditGuidance: ["Identify the visible enforcement edge before claiming a missing constraint."],
       },
     ]);
   }
@@ -53,10 +67,10 @@ function responseFor(tag: string, user: string): string {
       {
         id: "mock-balance-integrity",
         location: "fixtures/halo2_missing_constraint.rs:5",
-        securityProperty: "Advice assignments used as logical circuit inputs must be constrained to their intended source values.",
+        securityProperty: "Values used by a verified statement must be enforced before downstream checks rely on them.",
         failureMode: "missing_constraint",
         why: "Mock enumeration item used to test end-to-end model-driven audit flow.",
-        attackerControlledInputs: ["private witness assignment"],
+        attackerControlledInputs: ["private value assignment"],
       },
     ]);
   }
@@ -64,12 +78,12 @@ function responseFor(tag: string, user: string): string {
   if (tag === "deepen_round_2") {
     return JSON.stringify([
       {
-        id: "mock-round-2-source-binding",
+        id: "mock-round-2-enforcement-edge",
         location: "fixtures/halo2_scalar_mul_binding.rs:13-14",
-        securityProperty: "Caller-owned scalar and point values assigned into advice cells must be constrained to the intended source values, not only reused internally.",
+        securityProperty: "Neighboring values used by the same checked computation must have a visible enforcement edge.",
         failureMode: "missing_constraint",
-        why: "Round 2 follows the prior witness-integrity coverage into a neighboring source-binding path that was not checked by the initial checklist.",
-        attackerControlledInputs: ["private witness assignment", "caller-provided scalar or point"],
+        why: "Round 2 follows prior coverage into a neighboring data-flow edge that was not checked by the initial checklist.",
+        attackerControlledInputs: ["private values used by the checked computation"],
       },
     ]);
   }
@@ -78,20 +92,20 @@ function responseFor(tag: string, user: string): string {
     const hasMissingConstraintShape = /assign_advice|missing_constraint|witness advice/i.test(user);
     return JSON.stringify({
       finding: hasMissingConstraintShape,
-      title: hasMissingConstraintShape ? "Unconstrained advice assignment can diverge from intended source" : "No finding",
+      title: hasMissingConstraintShape ? "Assigned value can affect checked logic without visible enforcement" : "No finding",
       severity: hasMissingConstraintShape ? "high" : "info",
       confidence: hasMissingConstraintShape ? 0.82 : 0.2,
       description: hasMissingConstraintShape
-        ? "The assigned advice value is treated as a logical input but the local context does not show a copy/equality constraint tying it to the intended source."
+        ? "The assigned value is treated as a logical input but the local context does not show an enforcement edge before downstream checks rely on it."
         : "The mocked auditor did not detect the target bug shape.",
       evidence: hasMissingConstraintShape
         ? "The source context contains assign_advice calls without a nearby copy_advice/constrain_equal chain in the vulnerable function."
         : "No matching evidence in mock response.",
       exploitSketch: hasMissingConstraintShape
-        ? "A malicious prover could choose a different private witness value and satisfy downstream checks that assume it equals the intended source."
+        ? "A malicious prover could choose a different private value while satisfying downstream checks that assume the property was enforced."
         : "",
       fix: hasMissingConstraintShape
-        ? "Use copy_advice or an explicit equality constraint for the first assigned value, then rely on existing loop equality constraints."
+        ? "Add an explicit constraint or equivalent enforcement edge before the downstream check relies on the value."
         : "",
     });
   }

@@ -14,6 +14,7 @@ export function buildEnumerationPrompt(input: {
   target: string;
   failureModes: FailureMode[];
   projectProfile: string;
+  projectLearning: string;
   projectContext: string;
   lensPacks: string;
   corpus: string;
@@ -25,6 +26,9 @@ Allowed failure modes: ${input.failureModes.join(", ")}
 
 Project profile:
 ${input.projectProfile || "(not available)"}
+
+Initialization learning notes:
+${input.projectLearning || "(not available)"}
 
 Project context:
 ${input.projectContext || "(none configured)"}
@@ -46,9 +50,10 @@ Grounding rules:
 - Every item should point to the most specific visible location available. Prefer file:line-range locations from the loaded source.
 - Treat missing manifests, tests, configs, docs, or entrypoints as unknown context, not as vulnerabilities or audit items, unless the loaded material explicitly makes their absence security-relevant.
 - If only a narrow source excerpt is loaded, stay within that excerpt's observable language and domain. Do not infer a web/API/dependency audit surface from a standalone circuit, contract, library, or algorithm file.
-- For proof, circuit, constraint-system, verifier, or witness-assignment code, include source-binding items when caller-owned values, public inputs, private witness values, or function arguments are assigned into advice/witness cells. The later audit must verify that assigned cells are constrained to the intended source values; internal equality or constancy across rows is not enough.
+- Use the initialization learning notes as source-backed hypotheses for what must be checked, but do not treat those notes as findings.
+- Derive security properties from the loaded material and configured high-level scope. Do not rely on memorized project-specific bug patterns.
 
-Prioritize issues that match the project profile and evidence in the loaded material. Consider implementation/spec mismatch, trust-boundary mistakes, under-constrained witness values, value conservation, replay or uniqueness failures, auth/session bugs, injection, SSRF, path traversal, deserialization, unsafe external calls, race conditions, consensus divergence, dependency trust, secret exposure, and cheap-to-trigger expensive work.
+Prioritize issues that match the project profile and evidence in the loaded material. Consider implementation/spec mismatch, trust-boundary mistakes, unenforced invariants, value conservation, replay or uniqueness failures, auth/session bugs, injection, SSRF, path traversal, deserialization, unsafe external calls, race conditions, consensus divergence, dependency trust, secret exposure, and cheap-to-trigger expensive work.
 
 Return only a JSON array. No markdown fences.
 
@@ -65,7 +70,7 @@ Analyze only the assigned item. Real audited code can contain critical bugs, but
 Reason from actual constraints, checks, and data flow. If the invariant is enforced, say so plainly.
 Do not treat plausible intent, comments, internal repetition, or naming similarity as proof of enforcement.`;
 
-export function buildAuditPrompt(item: AuditItem, source: string, registry?: AuditorAgentRegistry, lensGuidance = ""): string {
+export function buildAuditPrompt(item: AuditItem, source: string, registry?: AuditorAgentRegistry, lensGuidance = "", projectLearning = ""): string {
   const agent = getAuditorAgent(item.failureMode, registry);
   return `Audit item:
   id: ${item.id}
@@ -84,12 +89,16 @@ ${agent.guidance}
 Project-specific lens guidance:
 ${lensGuidance || "(none)"}
 
+Initialization learning notes:
+${projectLearning || "(not available)"}
+
 Relevant source:
 ${source}
 
 Audit reasoning rules:
 - Ground every positive finding in exact source lines, visible checks, visible constraints, or a visible missing edge in data flow.
-- If the item is about a proof, circuit, constraint system, verifier, or witness assignment, trace from the original input/argument/cell to every assigned advice/witness cell and then to the enforcing constraint. Internal equality, row-to-row constancy, or curve/arithmetic validity does not prove binding to the intended source by itself.
+- Trace attacker-controlled or security-critical values through the relevant transformations, checks, constraints, state updates, and verifier or authorization decisions.
+- State exactly what enforces the assigned security property, or identify the specific visible edge where enforcement is missing.
 - If relevant source lines are missing from the context, return "finding": false with a needs-more-context explanation instead of guessing.
 
 Respond as a JSON object only:
@@ -118,6 +127,7 @@ export function buildDeepeningPrompt(input: {
   maxItems: number;
   failureModes: FailureMode[];
   projectProfile: string;
+  projectLearning: string;
   projectContext: string;
   lensPacks: string;
   existingChecklist: string;
@@ -134,6 +144,9 @@ Allowed failure modes: ${input.failureModes.join(", ")}
 
 Project profile:
 ${input.projectProfile || "(not available)"}
+
+Initialization learning notes:
+${input.projectLearning || "(not available)"}
 
 Project context:
 ${input.projectContext || "(none configured)"}
@@ -160,11 +173,10 @@ Create only new audit items for the next round. Each item must have:
 - attackerControlledInputs: optional list of inputs a malicious actor/prover controls
 
 Depth rules:
-- Prefer items that connect two pieces of evidence not checked together in prior rounds, such as source-to-witness binding, caller input to assigned cell, spec statement to implementation branch, or authorization identity to storage predicate.
+- Prefer items that connect two pieces of evidence not checked together in prior rounds, such as input to enforcement edge, spec statement to implementation branch, authorization identity to storage predicate, or value/state transition to conservation check.
 - Follow unresolved, low-confidence, or skeptical audit observations into adjacent code and data flow instead of re-auditing the same location.
 - If a prior finding depends on an assumption, enumerate the cheapest item that would refute or support that assumption.
 - If the loaded source is narrow, stay within the visible source and reference material. Do not invent files, APIs, manifests, routes, dependencies, or deployment surfaces.
-- For proof, circuit, constraint-system, verifier, or witness-assignment code, prioritize unexamined source-binding paths where assigned advice/witness cells must be tied to intended caller-owned values or input cells.
 - Do not include an item if its normalized location, failure mode, and security property are already present in the existing checklist.
 
 Return only a JSON array. No markdown fences.
@@ -193,6 +205,7 @@ export function buildVerifyPrompt(input: {
   description: string;
   evidence: string;
   fix: string;
+  projectLearning?: string;
   source: string;
 }): string {
   return `Candidate finding:
@@ -202,6 +215,9 @@ export function buildVerifyPrompt(input: {
   description: ${input.description}
   evidence: ${input.evidence}
   proposed fix: ${input.fix}
+
+Initialization learning notes:
+${input.projectLearning || "(not available)"}
 
 Relevant source:
 ${input.source}

@@ -1,13 +1,15 @@
 import type { AuditorConfig } from "../config.js";
 import { buildVerifyPrompt, VERIFY_SYSTEM } from "../agents/prompts.js";
 import { SourceIndex } from "../index/source-index.js";
-import type { Doc, LlmClient, RankedFinding, Verification } from "../types.js";
+import { renderProjectLearning } from "../learn/project.js";
+import type { Doc, LlmClient, ProjectLearning, RankedFinding, Verification } from "../types.js";
 import type { RunLogger } from "../trace/logger.js";
 
 export async function verifyTop(input: {
   cfg: AuditorConfig;
   findings: RankedFinding[];
   source: Doc[];
+  projectLearning?: ProjectLearning;
   llm?: LlmClient;
   logger: RunLogger;
   topK: number;
@@ -40,6 +42,7 @@ export async function verifyTop(input: {
       description: finding.description,
       evidence: finding.evidence,
       fix: finding.fix,
+      projectLearning: renderProjectLearning(input.projectLearning),
       source: sourceText,
     });
     const markdown = await input.llm.complete({

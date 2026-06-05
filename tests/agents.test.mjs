@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildAuditPrompt } from "../dist/agents/prompts.js";
+import { buildAuditPrompt, buildDeepeningPrompt, buildEnumerationPrompt } from "../dist/agents/prompts.js";
 import { createAgentRegistry, getAuditorAgent } from "../dist/agents/registry.js";
 import { defaultConfig, effectiveFailureModes } from "../dist/config.js";
 
@@ -33,4 +33,51 @@ test("auditor agent registry can be extended with custom failure modes", () => {
   );
   assert.match(prompt, /Custom Constraint System Auditor/);
   assert.match(prompt, /Trace custom DSL constraints/);
+});
+
+test("default prompts do not embed report-specific source-binding hints", () => {
+  const cfg = defaultConfig();
+  const enumeration = buildEnumerationPrompt({
+    target: "neutral",
+    failureModes: effectiveFailureModes(cfg),
+    projectProfile: "Languages: Rust",
+    projectLearning: "Candidate invariants: checked statements should enforce their required properties.",
+    projectContext: "",
+    lensPacks: "",
+    corpus: "",
+    source: "fn example() {}",
+  });
+  const audit = buildAuditPrompt(
+    {
+      id: "neutral-1",
+      location: "src/lib.rs:1",
+      securityProperty: "A checked property is enforced.",
+      failureMode: "missing_constraint",
+      why: "Neutral test item.",
+    },
+    "fn example() {}",
+  );
+  const deepening = buildDeepeningPrompt({
+    target: "neutral",
+    round: 2,
+    maxItems: 4,
+    failureModes: effectiveFailureModes(cfg),
+    projectProfile: "Languages: Rust",
+    projectLearning: "Domain concepts: local checks and state transitions.",
+    projectContext: "",
+    lensPacks: "",
+    existingChecklist: "",
+    auditObservations: "",
+    currentFindings: "",
+    corpus: "",
+    source: "fn example() {}",
+  });
+
+  const combined = `${enumeration}\n${audit}\n${deepening}`;
+  assert.doesNotMatch(combined, /source[- ]binding/i);
+  assert.doesNotMatch(combined, /row[- ]to[- ]row/i);
+  assert.doesNotMatch(combined, /row constancy/i);
+  assert.doesNotMatch(combined, /intended source/i);
+  assert.doesNotMatch(combined, /\bwitness\b|\badvice\b/i);
+  assert.doesNotMatch(combined, /assign_advice|copy_advice/i);
 });

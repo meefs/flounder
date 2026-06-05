@@ -2,10 +2,11 @@ import type { AuditorConfig } from "./config.js";
 import { effectiveFailureModes } from "./config.js";
 import { buildEnumerationPrompt, ENUM_SYSTEM } from "./agents/prompts.js";
 import { assemble } from "./ingest/source.js";
+import { renderProjectLearning } from "./learn/project.js";
 import { renderLensPacks, renderProjectContext } from "./lens/context.js";
 import { renderProjectProfile } from "./profile/project.js";
 import { runSeeders } from "./seeders/index.js";
-import type { AuditItem, Doc, LlmClient, ProjectProfile } from "./types.js";
+import type { AuditItem, Doc, LlmClient, ProjectLearning, ProjectProfile } from "./types.js";
 import { extractJsonArray } from "./util/json.js";
 import type { RunLogger } from "./trace/logger.js";
 import { dedupeAuditItems, normalizeAuditItem, type RawAuditItem } from "./items.js";
@@ -15,6 +16,7 @@ export async function enumerateAuditItems(input: {
   corpus: Doc[];
   source: Doc[];
   projectProfile?: ProjectProfile;
+  projectLearning?: ProjectLearning;
   llm?: LlmClient;
   logger: RunLogger;
   round?: number;
@@ -34,6 +36,7 @@ export async function enumerateAuditItems(input: {
     target: input.cfg.targetName,
     failureModes: effectiveFailureModes(input.cfg),
     projectProfile: input.projectProfile ? renderProjectProfile(input.projectProfile) : "",
+    projectLearning: renderProjectLearning(input.projectLearning),
     projectContext: renderProjectContext(input.cfg.projectContext),
     lensPacks: renderLensPacks(input.cfg.lensPacks),
     corpus: corpusText,

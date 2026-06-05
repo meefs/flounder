@@ -34,7 +34,7 @@
     "verify": "npm run check && npm test && npm run dry-run && npm run mock-run && npm run check:blind-discovery && npm run check:public",
     "prepack": "npm run build",
     "start": "node ./dist/cli.js",
-    "dry-run": "node ./dist/cli.js run --target dry-run --source ./fixtures --dry-run",
+    "dry-run": "node ./dist/cli.js run --target dry-run --source ./fixtures --dry-run --local-seeders",
     "mock-run": "node ./dist/cli.js run --target mock-run --source ./fixtures --mock-llm --trials 2"
   },
   "keywords": [
@@ -50,6 +50,7 @@
     "dist/audit/**",
     "dist/index/**",
     "dist/ingest/**",
+    "dist/learn/**",
     "dist/lens/**",
     "dist/llm/**",
     "dist/pi/**",

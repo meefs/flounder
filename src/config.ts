@@ -46,6 +46,7 @@ export interface AuditorConfig {
   auditorAgents: AuditorAgentDefinition[];
   projectContext: ProjectContext;
   lensPacks: AuditLensPackDefinition[];
+  projectLearning: boolean;
   dynamicLensDiscovery: boolean;
   localChecklistSeeders: boolean;
   dryRun: boolean;
@@ -72,8 +73,9 @@ export function defaultConfig(): AuditorConfig {
     auditorAgents: [],
     projectContext: {},
     lensPacks: [],
+    projectLearning: true,
     dynamicLensDiscovery: true,
-    localChecklistSeeders: true,
+    localChecklistSeeders: false,
     dryRun: false,
   };
 }

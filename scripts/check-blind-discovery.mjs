@@ -10,6 +10,7 @@ cfg.targetName = "blind-discovery";
 cfg.sourcePaths = ["fixtures/halo2_scalar_mul_binding.rs"];
 cfg.outputDir = out;
 cfg.dryRun = true;
+cfg.localChecklistSeeders = true;
 
 const result = await runPipeline(cfg);
 const checklist = JSON.parse(await readFile(path.join(result.runDir, "checklist.json"), "utf8"));
@@ -27,4 +28,4 @@ if (!/scalar\/point-binding context/.test(body)) {
   throw new Error("Blind checklist item did not explain the generic code shape it found.");
 }
 
-console.log("Blind checklist coverage check passed.");
+console.log("Local seeder checklist coverage check passed.");

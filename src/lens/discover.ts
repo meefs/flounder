@@ -1,8 +1,9 @@
 import type { AuditorConfig } from "../config.js";
 import { effectiveFailureModes } from "../config.js";
 import { assemble } from "../ingest/source.js";
+import { renderProjectLearning } from "../learn/project.js";
 import { renderProjectProfile } from "../profile/project.js";
-import type { AuditLensPackDefinition, Doc, LlmClient, ProjectProfile } from "../types.js";
+import type { AuditLensPackDefinition, Doc, LlmClient, ProjectLearning, ProjectProfile } from "../types.js";
 import type { RunLogger } from "../trace/logger.js";
 import { extractJsonArray } from "../util/json.js";
 import { normalizeLensPacks, renderLensPacks, renderProjectContext } from "./context.js";
@@ -18,6 +19,7 @@ export async function discoverLensPacks(input: {
   corpus: Doc[];
   source: Doc[];
   projectProfile: ProjectProfile;
+  projectLearning?: ProjectLearning;
   llm?: LlmClient;
   logger: RunLogger;
 }): Promise<AuditLensPackDefinition[]> {
@@ -34,6 +36,7 @@ export async function discoverLensPacks(input: {
     user: buildLensDiscoveryPrompt({
       target: input.cfg.targetName,
       projectProfile: renderProjectProfile(input.projectProfile),
+      projectLearning: renderProjectLearning(input.projectLearning),
       configuredProjectContext: renderProjectContext(input.cfg.projectContext),
       configuredLensPacks: renderLensPacks(input.cfg.lensPacks),
       knownFailureModes: effectiveFailureModes(input.cfg),
@@ -55,6 +58,7 @@ export async function discoverLensPacks(input: {
 function buildLensDiscoveryPrompt(input: {
   target: string;
   projectProfile: string;
+  projectLearning: string;
   configuredProjectContext: string;
   configuredLensPacks: string;
   knownFailureModes: string[];
@@ -68,6 +72,9 @@ ${input.knownFailureModes.join(", ")}
 
 Deterministic project profile:
 ${input.projectProfile}
+
+Initialization learning notes:
+${input.projectLearning}
 
 Configured project context:
 ${input.configuredProjectContext}
@@ -90,7 +97,7 @@ Each lens pack must have:
 Grounding rules:
 - Create lenses only for domains, assets, and trust boundaries visible in the profile, loaded source, configured context, or corpus.
 - If the source set is narrow, design narrow lenses for what is visible. Do not add web/API/dependency/configuration lenses unless those surfaces are loaded or configured.
-- If proof, circuit, constraint-system, verifier, or witness-assignment code is visible, include guidance to inspect source binding: assigned advice/witness cells must be constrained to the intended caller-owned values or input cells, not merely internally consistent.
+- Derive project-specific guidance from the initialization learning notes and loaded material. Do not add a domain lens just because it is common in other audits.
 - Absence of a manifest, route table, deployment file, or test suite is unknown context unless loaded reference material states it is security-critical.
 
 Hard boundaries:

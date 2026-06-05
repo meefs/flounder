@@ -26,6 +26,7 @@ cfg.trials = readIntFlag(args, "--trials") ?? cfg.trials;
 cfg.maxAuditItems = readIntFlag(args, "--max-items") ?? cfg.maxAuditItems;
 cfg.thinkingLevel = readThinkingFlag(args, "--thinking") ?? cfg.thinkingLevel;
 cfg.dryRun = false;
+cfg.projectLearning = !hasFlag(args, "--no-project-learning");
 cfg.dynamicLensDiscovery = !hasFlag(args, "--no-dynamic-lenses");
 cfg.localChecklistSeeders = hasFlag(args, "--allow-local-seeders");
 
@@ -34,13 +35,17 @@ const expectedFailureModeRegex = readRegexFlag(args, "--expect-failure-mode-rege
 const expectedLocation = readRegexFlag(args, "--expect-location-regex");
 const expectedLocationFile = readRegexFlag(args, "--expect-location-file-regex");
 const expectedLocationLine = readIntFlag(args, "--expect-location-line");
-const expectedEvidence = readRegexFlag(args, "--expect-evidence-regex") ?? /(constraint|bound|bind|advice|witness|source|input)/i;
+const expectedEvidence = readRegexFlag(args, "--expect-evidence-regex") ?? /(constraint|enforce|equation|guard|check|invariant|verification|binding|mismatch|authorization|validation)/i;
 const minimumSeverity = readFlag(args, "--expect-min-severity") ?? readFlag(args, "--expect-severity") ?? "high";
 
 const result = existingRunDir ? { runDir: existingRunDir } : await runPipeline(cfg);
 const calls = await readdir(path.join(result.runDir, "calls"));
 const auditCalls = calls.filter((file) => /_audit_/.test(file));
+const learningCalls = calls.filter((file) => /_learn_project\.json$/.test(file));
 const enumerateCalls = calls.filter((file) => /_enumerate\.json$/.test(file));
+if (cfg.projectLearning && learningCalls.length === 0) {
+  throw new Error("No initialization learning model call was recorded; project learning did not run as model reasoning.");
+}
 if (enumerateCalls.length === 0) {
   throw new Error("No enumeration model call was recorded; checklist generation did not run as model reasoning.");
 }

@@ -4,9 +4,10 @@ import type { AuditorConfig } from "../config.js";
 import { effectiveFailureModes } from "../config.js";
 import { assemble } from "../ingest/source.js";
 import { auditItemKey, dedupeAuditItems, normalizeAuditItem, type RawAuditItem } from "../items.js";
+import { renderProjectLearning } from "../learn/project.js";
 import { renderLensPacks, renderProjectContext } from "../lens/context.js";
 import { renderProjectProfile } from "../profile/project.js";
-import type { AuditItem, AuditResult, Doc, LlmClient, ProjectProfile, RankedFinding } from "../types.js";
+import type { AuditItem, AuditResult, Doc, LlmClient, ProjectLearning, ProjectProfile, RankedFinding } from "../types.js";
 import type { RunLogger } from "../trace/logger.js";
 import { extractJsonArray } from "../util/json.js";
 
@@ -15,6 +16,7 @@ export async function deepenAuditItems(input: {
   corpus: Doc[];
   source: Doc[];
   projectProfile?: ProjectProfile;
+  projectLearning?: ProjectLearning;
   existingItems: AuditItem[];
   results: AuditResult[];
   round: number;
@@ -42,6 +44,7 @@ export async function deepenAuditItems(input: {
       maxItems,
       failureModes: effectiveFailureModes(input.cfg),
       projectProfile: input.projectProfile ? renderProjectProfile(input.projectProfile) : "",
+      projectLearning: renderProjectLearning(input.projectLearning),
       projectContext: renderProjectContext(input.cfg.projectContext),
       lensPacks: renderLensPacks(input.cfg.lensPacks),
       existingChecklist: renderChecklist(input.existingItems),

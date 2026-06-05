@@ -7,6 +7,7 @@ export * from "./enumerate.js";
 export * from "./items.js";
 export * from "./index/source-index.js";
 export * from "./ingest/source.js";
+export * from "./learn/project.js";
 export * from "./lens/context.js";
 export * from "./lens/discover.js";
 export * from "./rounds/deepen.js";
