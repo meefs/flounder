@@ -2,6 +2,7 @@ export * from "./agents/prompts.js";
 export * from "./agents/registry.js";
 export * from "./audit/aggregate.js";
 export * from "./audit/runner.js";
+export * from "./audit/static.js";
 export * from "./config.js";
 export * from "./enumerate.js";
 export * from "./index/source-index.js";

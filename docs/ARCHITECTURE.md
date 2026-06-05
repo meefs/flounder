@@ -18,6 +18,7 @@ source + corpus
   -> static seeders
   -> LLM enumeration
   -> checklist
+  -> deterministic static audit passes
   -> specialized audit trials
   -> aggregation
   -> independent verification plan
@@ -65,6 +66,7 @@ The command guardrail lives in `src/security/policy.ts` so non-pi integrations c
 - `npm run dry-run`: static seeder run against fixtures.
 - `npm run mock-run`: full model-shaped pipeline using deterministic mock LLM.
 - `npm run check:blind-discovery`: blind fixture regression for autonomous missing-constraint enumeration.
+- `npm run check:source-discovery -- --source <path>`: external-source assertion for the same generic binding finding without committing that source.
 
 ## Local-Only Verification
 

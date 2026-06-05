@@ -30,6 +30,7 @@
     "test": "npm run build && node --test tests/*.test.mjs",
     "check:public": "node scripts/check-public-surface.mjs",
     "check:blind-discovery": "npm run build && node scripts/check-blind-discovery.mjs",
+    "check:source-discovery": "npm run build && node scripts/check-source-discovery.mjs",
     "verify": "npm run check && npm test && npm run dry-run && npm run mock-run && npm run check:blind-discovery && npm run check:public",
     "prepack": "npm run build",
     "start": "node ./dist/cli.js",

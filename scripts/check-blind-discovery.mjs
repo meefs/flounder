@@ -13,6 +13,7 @@ cfg.dryRun = true;
 
 const result = await runPipeline(cfg);
 const checklist = JSON.parse(await readFile(path.join(result.runDir, "checklist.json"), "utf8"));
+const summary = JSON.parse(await readFile(path.join(result.runDir, "summary.json"), "utf8"));
 const bindingItems = checklist.filter((item) => item.seeder === "halo2_advice_binding");
 
 if (bindingItems.length !== 1) {
@@ -25,6 +26,9 @@ if (!/missing_constraint/.test(bindingItems[0].failureMode) || !/constrained to 
 }
 if (!/scalar\/point-binding context/.test(body)) {
   throw new Error("Blind discovery item did not explain the generic code shape it found.");
+}
+if (summary.coverage.itemsWithFinding !== 1 || summary.coverage.bySeverity.high !== 1) {
+  throw new Error("Blind discovery did not promote the generic binding risk to a high-severity finding.");
 }
 
 console.log("Blind discovery check passed.");

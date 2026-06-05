@@ -44,7 +44,9 @@ test("dry-run pipeline writes checklist and summary without model calls", async 
 
   const result = await runPipeline(cfg);
   assert.equal(result.summary.coverage.itemsTotal, 5);
-  assert.equal(result.summary.coverage.itemsWithFinding, 0);
+  assert.equal(result.summary.coverage.itemsWithFinding, 1);
+  assert.equal(result.summary.coverage.bySeverity.high, 1);
+  assert.match(result.summary.findings[0].title, /Advice input is not visibly bound/);
   await stat(path.join(result.runDir, "checklist.json"));
   await stat(path.join(result.runDir, "summary.json"));
   await stat(path.join(result.runDir, "source_index.json"));

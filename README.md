@@ -55,6 +55,8 @@ npm run mock-run
 
 This runs the full pipeline with a deterministic mock LLM: enumeration, audit trials, aggregation, verification, report generation, and audit-trail logging. It is the no-API-key smoke test.
 
+Dry-run mode does not call a model, but it can still promote strong deterministic static checks into candidate findings.
+
 ## Full Run
 
 ```bash
@@ -84,6 +86,12 @@ npm run check:blind-discovery
 ```
 
 This runs a dry-run audit against a neutral halo2 scalar-multiplication fixture and asserts that the framework autonomously enumerates a generic missing-constraint checklist item without target-specific hints.
+
+To run the same generic discovery assertion against an external source tree without committing that source:
+
+```bash
+npm run check:source-discovery -- --source <path>
+```
 
 ## Pi Package Usage
 

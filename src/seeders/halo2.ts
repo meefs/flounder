@@ -40,7 +40,10 @@ export function halo2AdviceBindingSeeder(source: Doc[]): AuditItem[] {
     const lines = doc.content.split(/\r?\n/);
     const assignments = lines
       .map((line, idx) => ({ line, lineNo: idx + 1, parsed: parseAssignAdvice(line) }))
-      .filter((entry): entry is { line: string; lineNo: number; parsed: AdviceAssignment } => entry.parsed !== undefined);
+      .filter(
+        (entry): entry is { line: string; lineNo: number; parsed: AdviceAssignment } =>
+          entry.parsed !== undefined && looksLikePointInputAssignment(entry.parsed),
+      );
 
     for (let idx = 0; idx < assignments.length; idx += 1) {
       const current = assignments[idx];
@@ -113,6 +116,11 @@ function looksLikeHalo2BindingRisk(assignments: AdviceAssignment[], context: str
   const hasStructuredColumn = assignments.some((assignment) => /(^self\.|\.x_|\.y_|base|point|double_and_add)/i.test(assignment.column));
   const hasWitnessSource = assignments.some((assignment) => assignment.source.length > 0);
   return hasWitnessSource && hasHalo2ScalarContext && hasStructuredColumn;
+}
+
+function looksLikePointInputAssignment(assignment: AdviceAssignment): boolean {
+  const text = `${assignment.label} ${assignment.column} ${assignment.source}`;
+  return /\b(x_p|y_p|base_[xy]|point_[xy]|base|point)\b/i.test(text);
 }
 
 function hasDirectBinding(assignments: AdviceAssignment[], context: string): boolean {
