@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { defaultConfig } from "../dist/config.js";
 import { ProjectMemory } from "../dist/agent/memory.js";
-import { buildTools, newSession } from "../dist/agent/tools.js";
+import { buildTools, ingestFindingsFromScratch, newSession } from "../dist/agent/tools.js";
 import { runHunt } from "../dist/agent/hunt.js";
 import { MockAuditLlmClient } from "../dist/llm/mock.js";
 import { RunLogger } from "../dist/trace/logger.js";
@@ -41,7 +41,7 @@ test("project memory persists notes and recalls by keyword overlap", async () =>
     const all = await memory.all();
     assert.equal(all.length, 2);
 
-    // No lexical overlap -> no scored recall (the agent must query with relevant terms).
+    // No lexical overlap -> no scored recall.
     assert.equal((await memory.recall("totally unrelated xyzzy")).length, 0);
 
     // A fresh memory file is empty, not an error.
@@ -51,125 +51,78 @@ test("project memory persists notes and recalls by keyword overlap", async () =>
   }
 });
 
-test("report_finding only reaches confirmed-executable when it cites a passing test run", async () => {
-  const dir = await tempDir();
-  try {
-    const cfg = defaultConfig();
-    const logger = await tempLogger(dir);
-    const session = newSession();
-    const ctx = { cfg, source: [], corpus: [], memory: new ProjectMemory(path.join(dir, "memory.jsonl")), logger, session };
-    const report = tool("report_finding");
+test("findings.json only reaches confirmed-executable when it cites a passing bash command", () => {
+  const session = newSession();
+  session.commandRuns.push({ id: "cmd1", passed: true, command: "node --test x", matched: ["ok"], missing: [], exitCode: 0, expectedExitCode: 0, timedOut: false, workspace: "w" });
+  session.commandRuns.push({ id: "cmd2", passed: false, command: "node --test y", matched: [], missing: ["ok"], exitCode: 1, expectedExitCode: 0, timedOut: false, workspace: "w" });
+  session.scratchFiles.set(
+    "findings.json",
+    JSON.stringify([
+      { title: "A", location: "a.rs:1" },
+      { title: "B", location: "a.rs:2", command_id: "cmd9" },
+      { title: "C", location: "a.rs:3", command_id: "cmd1" },
+      { title: "D", location: "a.rs:4", command_id: "cmd2" },
+    ]),
+  );
 
-    // No test cited -> suspected.
-    await report.run({ title: "A", location: "a.rs:1" }, ctx);
-    assert.equal(session.findings.at(-1).confirmationStatus, "suspected");
-
-    // Cites a test that does not exist -> suspected.
-    await report.run({ title: "B", location: "a.rs:2", test_run_id: "t9" }, ctx);
-    assert.equal(session.findings.at(-1).confirmationStatus, "suspected");
-
-    // A passing test run exists and is cited -> confirmed-executable.
-    session.testRuns.push({ id: "t1", passed: true, command: "node --test x", matched: ["ok"], missing: [], exitCode: 0, expectedExitCode: 0, timedOut: false, workspace: "w" });
-    await report.run({ title: "C", location: "a.rs:3", test_run_id: "t1" }, ctx);
-    assert.equal(session.findings.at(-1).confirmationStatus, "confirmed-executable");
-
-    // A failing test run cited -> stays suspected (the gate is the framework's, not the model's).
-    session.testRuns.push({ id: "t2", passed: false, command: "node --test y", matched: [], missing: ["ok"], exitCode: 1, expectedExitCode: 0, timedOut: false, workspace: "w" });
-    await report.run({ title: "D", location: "a.rs:4", test_run_id: "t2" }, ctx);
-    assert.equal(session.findings.at(-1).confirmationStatus, "suspected");
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
+  const result = ingestFindingsFromScratch(session);
+  assert.equal(result.parsed, 4);
+  assert.match(result.errors.join("\n"), /cmd9/);
+  assert.match(result.errors.join("\n"), /cmd2/);
+  assert.equal(session.findings[0].confirmationStatus, "suspected");
+  assert.equal(session.findings[1].confirmationStatus, "suspected");
+  assert.equal(session.findings[2].confirmationStatus, "confirmed-executable");
+  assert.equal(session.findings[3].confirmationStatus, "suspected");
 });
 
-test("run_test refuses non-test runners and live-network commands without touching the workspace", async () => {
+test("bash refuses non-local or non-inspection commands without touching the workspace", async () => {
   const dir = await tempDir();
   try {
     const cfg = defaultConfig();
     cfg.sourcePaths = [fixtures];
     const logger = await tempLogger(dir);
     const ctx = { cfg, source: [], corpus: [], memory: new ProjectMemory(path.join(dir, "memory.jsonl")), logger, session: newSession() };
-    const runTest = tool("run_test");
+    const bash = tool("bash");
 
-    const destructive = await runTest.run({ files: [], command: { program: "rm", args: ["-rf", "."] } }, ctx);
+    const destructive = await bash.run({ cmd: "rm -rf ." }, ctx);
     assert.match(destructive.observation, /blocked/i);
 
-    const liveNetwork = await runTest.run(
-      { files: [], command: { program: "forge", args: ["test", "--fork-url", "https://mainnet.example/rpc"] }, success_patterns: ["x"] },
-      ctx,
-    );
+    const liveNetwork = await bash.run({ cmd: "forge test --fork-url https://mainnet.example/rpc", success_patterns: ["x"] }, ctx);
     assert.match(liveNetwork.observation, /blocked/i);
 
-    assert.equal(ctx.session.testRuns.length, 0, "blocked commands must not record a test run");
+    assert.equal(ctx.session.commandRuns.length, 0, "blocked commands must not record a command run");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test("read_file and search operate over loaded source without disk access", async () => {
+test("read, write, edit, and bash operate on loaded material and the copied workspace", async () => {
   const dir = await tempDir();
   try {
     const cfg = defaultConfig();
+    cfg.sourcePaths = [fixtures];
     const logger = await tempLogger(dir);
     const source = [{ path: "circuit.rs", kind: "source", content: "fn assign() {\n  region.assign_advice(x);\n}\n" }];
     const ctx = { cfg, source, corpus: [], memory: new ProjectMemory(path.join(dir, "memory.jsonl")), logger, session: newSession() };
 
-    const read = await tool("read_file").run({ path: "circuit.rs", start: 1, end: 2 }, ctx);
+    const read = await tool("read").run({ path: "circuit.rs", start: 1, end: 2 }, ctx);
     assert.match(read.observation, /assign_advice/);
     assert.match(read.observation, /circuit\.rs lines 1-2 of 4/);
 
-    const search = await tool("search").run({ query: "assign_advice" }, ctx);
-    assert.match(search.observation, /circuit\.rs:2/);
+    await tool("write").run({ path: "scratch.txt", content: "hello old value\n" }, ctx);
+    const edited = await tool("edit").run({ path: "scratch.txt", old: "old", new: "new" }, ctx);
+    assert.match(edited.observation, /edited scratch\.txt/);
+    const scratch = await tool("read").run({ path: "scratch.txt" }, ctx);
+    assert.match(scratch.observation, /hello new value/);
 
-    const missing = await tool("read_file").run({ path: "nope.rs" }, ctx);
-    assert.match(missing.observation, /no loaded file/);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("known_bug_classes is an optional library: lists classes and details one", async () => {
-  const dir = await tempDir();
-  try {
-    const cfg = defaultConfig();
-    const logger = await tempLogger(dir);
-    const ctx = { cfg, source: [], corpus: [], memory: new ProjectMemory(path.join(dir, "memory.jsonl")), logger, session: newSession() };
-
-    const list = await tool("known_bug_classes").run({}, ctx);
-    assert.match(list.observation, /optional/i);
-    assert.match(list.observation, /missing_constraint/);
-
-    const detail = await tool("known_bug_classes").run({ name: "reentrancy" }, ctx);
-    assert.match(detail.observation, /reentrancy/i);
-
-    const missing = await tool("known_bug_classes").run({ name: "no_such_class" }, ctx);
-    assert.match(missing.observation, /no class named/);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("dataflow surfaces provenance facts on demand without producing findings", async () => {
-  const dir = await tempDir();
-  try {
-    const cfg = defaultConfig();
-    const logger = await tempLogger(dir);
-    const source = [
-      {
-        path: "circuit.rs",
-        kind: "source",
-        content: "fn region(r: &mut Region) {\n  r.assign_advice(|| \"x\", col, 0, || x)?;\n}\n",
-      },
-    ];
-    const session = newSession();
-    const ctx = { cfg, source, corpus: [], memory: new ProjectMemory(path.join(dir, "memory.jsonl")), logger, session };
-
-    const out = await tool("dataflow").run({ domain: "halo2" }, ctx);
-    assert.match(out.observation, /halo2/i);
-    assert.equal(session.findings.length, 0, "dataflow is routing evidence, not a finding");
-
-    const emptyDomain = await tool("dataflow").run({ domain: "solidity" }, ctx);
-    assert.match(emptyDomain.observation, /no provenance|available domains/i);
+    await tool("write").run({
+      path: "hunt_repro.test.mjs",
+      content: "import test from 'node:test';\n\ntest('local harness success', () => {});\n",
+    }, ctx);
+    const run = await tool("bash").run({ cmd: "node --test hunt_repro.test.mjs", success_patterns: ["local harness success"] }, ctx);
+    assert.match(run.observation, /CONFIRMATION-ELIGIBLE PASS/);
+    assert.equal(ctx.session.commandRuns.length, 1);
+    assert.equal(ctx.session.commandRuns[0].passed, true);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -194,12 +147,14 @@ test("hunt produces an execution-confirmed finding and banks cross-run memory", 
 
     const transcript = JSON.parse(await readFile(path.join(runDir, "hunt_transcript.json"), "utf8"));
     assert.equal(transcript.stoppedReason, "finished");
-    assert.ok(transcript.steps.some((step) => step.tool === "run_test"));
-    assert.ok(transcript.steps.some((step) => step.tool === "dataflow"), "agent consulted the demoted provenance tool on demand");
+    assert.ok(transcript.steps.some((step) => step.tool === "read"));
+    assert.ok(transcript.steps.some((step) => step.tool === "write"));
+    assert.ok(transcript.steps.some((step) => step.tool === "bash"));
+    assert.ok(!transcript.steps.some((step) => step.tool === "dataflow"), "hunt default tools must not include strategy aids");
 
-    const testRuns = JSON.parse(await readFile(path.join(runDir, "hunt_test_runs.json"), "utf8"));
-    assert.equal(testRuns.length, 1);
-    assert.equal(testRuns[0].passed, true);
+    const commandRuns = JSON.parse(await readFile(path.join(runDir, "hunt_command_runs.json"), "utf8"));
+    assert.equal(commandRuns.length, 1);
+    assert.equal(commandRuns[0].passed, true);
 
     // Run artifacts must stay free of machine-absolute source paths.
     const report = await readFile(path.join(runDir, "report_f1.md"), "utf8");

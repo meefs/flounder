@@ -6,10 +6,8 @@ import { extractRustSolanaProvenance, extractRustZkProvenance } from "./rust.js"
 import { extractSolidityProvenance } from "./solidity.js";
 
 // Single place that runs every provenance adapter over loaded source. The staged
-// pipeline consumes this at enumeration time; the hunt `dataflow` tool consumes
-// the same function on demand. Provenance is attention-routing evidence only — it
-// never asserts a bug. Keeping one extractor means a new adapter is available to
-// both drivers without duplication.
+// pipeline consumes this at enumeration time. Provenance is attention-routing
+// evidence only; it never asserts a bug.
 export function extractAllProvenanceGraphs(source: Doc[]): ProvenanceGraph[] {
   return [
     extractHalo2Provenance(source),

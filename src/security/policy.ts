@@ -59,6 +59,40 @@ export function analyzeCommandSafety(
 }
 
 export function analyzeReproductionCommandSafety(command: StructuredReproductionCommand): CommandSafetyDecision {
+  const baseDecision = analyzeStructuredCommandBaseSafety(command);
+  if (baseDecision.blocked) return baseDecision;
+
+  if (!isAllowedLocalTestCommand(command.program.trim(), command.args.map((arg) => String(arg)))) {
+    return {
+      blocked: true,
+      reason: "Blocked by full-stack-auditor guardrail: reproduction execution is limited to local test commands.",
+    };
+  }
+
+  return { blocked: false };
+}
+
+export function analyzeAgentBashCommandSafety(command: StructuredReproductionCommand): CommandSafetyDecision {
+  const baseDecision = analyzeStructuredCommandBaseSafety(command);
+  if (baseDecision.blocked) return baseDecision;
+
+  const program = command.program.trim();
+  const args = command.args.map((arg) => String(arg));
+  const workspaceDecision = analyzeWorkspacePathSafety(args);
+  if (workspaceDecision.blocked) return workspaceDecision;
+
+  if (isAllowedLocalTestCommand(program, args) || isAllowedLocalInspectionCommand(program, args)) {
+    return { blocked: false };
+  }
+
+  return {
+    blocked: true,
+    reason:
+      "Blocked by full-stack-auditor guardrail: agent bash is limited to local inspection commands and local test commands.",
+  };
+}
+
+function analyzeStructuredCommandBaseSafety(command: StructuredReproductionCommand): CommandSafetyDecision {
   const program = command.program.trim();
   const args = command.args.map((arg) => String(arg));
   const rendered = [program, ...args].join(" ");
@@ -81,13 +115,20 @@ export function analyzeReproductionCommandSafety(command: StructuredReproduction
     };
   }
 
-  if (!isAllowedLocalTestCommand(program, args)) {
-    return {
-      blocked: true,
-      reason: "Blocked by full-stack-auditor guardrail: reproduction execution is limited to local test commands.",
-    };
-  }
+  return { blocked: false };
+}
 
+function analyzeWorkspacePathSafety(args: string[]): CommandSafetyDecision {
+  for (const arg of args) {
+    const value = valueAfterEquals(arg) ?? arg;
+    if (looksLikePathEscape(value)) {
+      return {
+        blocked: true,
+        reason: "Blocked by full-stack-auditor guardrail: agent bash paths must stay inside the copied workspace.",
+        matchedAction: arg,
+      };
+    }
+  }
   return { blocked: false };
 }
 
@@ -163,6 +204,27 @@ function isAllowedLocalTestCommand(program: string, args: string[]): boolean {
   return false;
 }
 
+function isAllowedLocalInspectionCommand(program: string, args: string[]): boolean {
+  const name = program.toLowerCase();
+  if (name === "pwd") return args.length === 0;
+  if (name === "ls") return args.every((arg) => isSafeInspectionArg(name, arg));
+  if (name === "find") return args.every((arg) => isSafeInspectionArg(name, arg));
+  if (name === "rg" || name === "grep") return args.every((arg) => isSafeInspectionArg(name, arg));
+  if (name === "sed") return args.every((arg) => isSafeInspectionArg(name, arg));
+  if (["cat", "head", "tail", "wc", "sort", "uniq", "cut"].includes(name)) {
+    return args.every((arg) => isSafeInspectionArg(name, arg));
+  }
+  return false;
+}
+
+function isSafeInspectionArg(program: string, arg: string): boolean {
+  const lowered = arg.toLowerCase();
+  if (program === "find" && ["-exec", "-execdir", "-ok", "-okdir", "-delete"].includes(lowered)) return false;
+  if (program === "sed" && (lowered === "-i" || lowered.startsWith("-i." ) || lowered === "--in-place" || lowered.startsWith("--in-place="))) return false;
+  if (arg.includes("\0") || /[\r\n]/.test(arg)) return false;
+  return true;
+}
+
 function isRpcFlag(input: string): boolean {
   return input === "--fork-url" || input.startsWith("--fork-url=") || input === "--rpc-url" || input.startsWith("--rpc-url=") || input === "--rpc" || input.startsWith("--rpc=");
 }
@@ -185,6 +247,14 @@ function isLocalNetworkValue(input: string): boolean {
 
 function looksLikeRemoteUrl(input: string): boolean {
   return /^https?:\/\//i.test(input) || /^wss?:\/\//i.test(input);
+}
+
+function looksLikePathEscape(input: string): boolean {
+  if (!input) return false;
+  if (/^[A-Za-z]:[\\/]/.test(input)) return true;
+  if (input.startsWith("/") || input.startsWith("~/") || input === "~") return true;
+  const normalized = input.replace(/\\/g, "/");
+  return normalized === ".." || normalized.startsWith("../") || normalized.includes("/../");
 }
 
 function isLocalUrl(input: string): boolean {

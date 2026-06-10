@@ -5,7 +5,7 @@ import { analyzeReproductionCommandSafety } from "./policy.js";
 import type { ReproductionCommand, ReproductionCommandResult, ReproductionFile } from "../types.js";
 
 // Shared, security-critical local sandbox primitives. Both the reproduction
-// stage and the agent run_test capability route execution through this module
+// stage and the agent bash capability route execution through this module
 // so command safety, workspace isolation, and output redaction have a single
 // implementation. The framework owns these guarantees; the model never does.
 

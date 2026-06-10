@@ -401,8 +401,8 @@ Usage:
   fsa history import-run --target <name> --run <dir> [--history-dir <dir>]
 
 hunt is the thin agentic mode: the model drives its own investigation with
-read/search/run_test tools and durable cross-run memory. The framework supplies
-capability and verification, not a checklist.
+pi-style read/write/edit/bash tools and durable cross-run memory. The framework
+supplies capability and verification, not a checklist.
 
 Options:
   --config <file>         JSON config with project context, models, and paths

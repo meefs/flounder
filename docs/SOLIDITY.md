@@ -29,7 +29,7 @@ For larger repositories, include the highest-signal specs, prior audits, test su
 
 ## Local Reproduction
 
-The hunt agent can call `run_test` during investigation. Later reproduction can also be run against an existing hunt artifact:
+The hunt agent can call `bash` during investigation to run local tests in the copied workspace. Later reproduction can also be run against an existing hunt artifact:
 
 ```bash
 fsa reproduce \

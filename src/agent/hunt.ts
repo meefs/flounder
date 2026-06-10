@@ -10,7 +10,7 @@ import type { AuditSummary, Doc, LlmClient, RankedFinding, Severity } from "../t
 import { publicPath } from "../util/paths.js";
 import { runHuntLoop } from "./loop.js";
 import { ProjectMemory } from "./memory.js";
-import { buildTools, newSession, type AgentFinding, type ToolContext } from "./tools.js";
+import { buildTools, ingestFindingsFromScratch, newSession, type AgentFinding, type ToolContext } from "./tools.js";
 
 // Orchestrates one autonomous hunt: load authorized material, give the model the
 // capability surface, run the ReAct loop, then turn whatever it proved into the
@@ -77,9 +77,15 @@ export async function runHunt(
     ...(memoryHint ? { memoryHint } : {}),
   });
 
+  const findingParse = ingestFindingsFromScratch(session);
+  if (findingParse.errors.length > 0) {
+    await logger.artifact("hunt_findings_errors.json", findingParse.errors);
+    await logger.event("hunt_findings_parse_errors", { errors: findingParse.errors.length });
+  }
+
   await logger.artifact("hunt_transcript.json", { stoppedReason: loop.stoppedReason, steps: loop.steps });
   await logger.artifact("hunt_findings.json", session.findings);
-  await logger.artifact("hunt_test_runs.json", session.testRuns);
+  await logger.artifact("hunt_command_runs.json", session.commandRuns);
 
   const summary = buildSummary(session.findings, loop.steps);
   await logger.artifact("summary.json", summary);
@@ -88,12 +94,14 @@ export async function runHunt(
     await logger.artifact(reportArtifactName(finding.id), renderDisclosure(cfg.targetName, finding));
   }
 
+  await persistFindingMemory(memory, session.findings);
+
   await logger.event("hunt_done", {
     stoppedReason: loop.stoppedReason,
     steps: loop.steps.length,
     findings: summary.findings.length,
     confirmedExecutable: summary.findings.filter((finding) => finding.confirmationStatus === "confirmed-executable").length,
-    testRuns: session.testRuns.length,
+    commandRuns: session.commandRuns.length,
     finishSummary: session.finishSummary ?? "",
   });
   await writeLastRunPointer(path.dirname(logger.runDir), logger.runDir, cfg.targetName);
@@ -136,6 +144,17 @@ function buildSummary(findings: AgentFinding[], steps: { tool: string }[]): Audi
     },
     findings: ranked,
   };
+}
+
+async function persistFindingMemory(memory: ProjectMemory, findings: AgentFinding[]): Promise<void> {
+  for (const finding of findings) {
+    await memory.remember({
+      note: `${finding.title} (${finding.confirmationStatus}) at ${finding.location}: ${finding.description}`.slice(0, 600),
+      kind: "finding",
+      tags: ["hunt", finding.severity, finding.confirmationStatus],
+      sourceRef: finding.location,
+    });
+  }
 }
 
 function toRankedFinding(finding: AgentFinding): RankedFinding {

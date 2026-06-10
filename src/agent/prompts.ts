@@ -19,15 +19,19 @@ to guarantee (its invariants and trust boundaries), then look for where the impl
 break that guarantee.
 
 How you act:
-- Each turn, respond with exactly ONE JSON object and nothing else:
+- Each tool turn, respond with exactly ONE JSON object and nothing else:
   {"thought": "<your reasoning>", "tool": "<tool name>", "args": { ... }}
+- When finished, write any findings to findings.json, then respond:
+  {"thought": "<why you are done>", "done": true, "summary": "<brief summary>"}
 - No prose outside the JSON. No markdown fences. One action per turn. You will receive the tool's observation, then act again.
-- Work in whatever order you judge best: explore, search, read deeply, recall prior runs, form a hypothesis, then test it.
+- Work in whatever order you judge best: explore with bash, read deeply, write/edit local harnesses, form a hypothesis, then test it.
 
 The one rule the framework enforces:
-- A claim is not proven until a local test confirms it. report_finding only reaches "confirmed-executable" when you
-  cite a run_test that actually passed (expected exit status AND your declared success patterns observed). Otherwise the
-  finding is recorded as "suspected". Aim to confirm your strongest findings with a run_test; report the rest as suspected.
+- A claim is not proven until a local command confirms it. A finding only reaches "confirmed-executable" when findings.json
+  cites a bash command_id that actually passed (expected exit status AND declared success_patterns observed). Otherwise the
+  finding is recorded as "suspected". Aim to confirm your strongest findings with bash; report the rest as suspected.
+- findings.json must be an array of objects:
+  [{"title","severity","location","description","evidence","exploit_sketch","fix","confidence","command_id"?}]
 
 White-hat boundaries (non-negotiable):
 - Verification is local-only: unit tests, component tests, local regtest/devnet, or forked/fake nodes. Never target a public testnet, mainnet, production, or any live network or third-party system.
@@ -43,7 +47,7 @@ export function buildHuntKickoff(input: {
   maxSteps: number;
 }): string {
   return `Target: ${input.target}
-Step budget: up to ${input.maxSteps} actions. Spend them where expected value is highest. Call finish early if further effort is low-value.
+Step budget: up to ${input.maxSteps} actions. Spend them where expected value is highest. Return {"done": true} early if further effort is low-value.
 
 Authorized scope note:
 ${input.scopeNote && input.scopeNote.trim().length > 0 ? input.scopeNote.trim() : "(none provided — treat all loaded source as in scope)"}
@@ -54,10 +58,10 @@ ${renderToolCatalogue(input.tools)}
 Durable memory from prior runs of this target:
 ${input.memoryHint && input.memoryHint.trim().length > 0 ? input.memoryHint.trim() : "(empty)"}
 
-Loaded source files (read and search them with the tools):
+Loaded source files:
 ${input.fileManifest}
 
-Begin. Respond with one JSON action.`;
+Begin. Respond with one JSON tool action or done object.`;
 }
 
 export interface TranscriptWindow {

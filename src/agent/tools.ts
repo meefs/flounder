@@ -1,27 +1,26 @@
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { AuditorConfig } from "../config.js";
-import { AUDITOR_AGENTS } from "../agents/registry.js";
-import { renderProofObligations } from "../obligations/extract.js";
-import { extractAllProvenanceGraphs } from "../provenance/all.js";
-import { renderProvenanceGraph } from "../provenance/halo2.js";
+import { analyzeAgentBashCommandSafety } from "../security/policy.js";
 import {
-  firstBlockedSandboxCommand,
   firstBlockedSandboxFile,
   matchSuccessPatterns,
+  normalizeRelativePath,
   prepareSandboxWorkspace,
+  resolveWorkspacePath,
   runSandboxCommand,
-  safeName,
+  type SandboxWorkspace,
   writeSandboxFiles,
 } from "../security/sandbox.js";
 import type { RunLogger } from "../trace/logger.js";
-import type { ConfirmationStatus, Doc, ProvenanceGraph, ReproductionCommand, ReproductionFile, Severity } from "../types.js";
+import type { ConfirmationStatus, Doc, ReproductionCommand, ReproductionFile, Severity } from "../types.js";
 import type { ProjectMemory } from "./memory.js";
 
-// The capability surface. Each tool gives the model an affordance it physically
-// lacks (read the repo, search it, run a local test, recall prior runs) or a way
-// to record an outcome. No tool tells the model what to look for or how to think.
-// The single hard opinion lives here: a finding only reaches confirmed-executable
-// when a sandboxed local test actually passed — never on the model's say-so.
+// Pi-style capability surface for hunt mode. The framework exposes generic
+// affordances and hard guarantees only: read material, write/edit a copied
+// workspace, run a policy-gated local command, and validate executable evidence.
+// Bug classes, search schedules, source facts, and report actions are not
+// default tools because they tell the model how to reason.
 
 export interface AgentFinding {
   id: string;
@@ -34,10 +33,10 @@ export interface AgentFinding {
   fix: string;
   confidence: number;
   confirmationStatus: ConfirmationStatus;
-  testRunId?: string;
+  commandRunId?: string;
 }
 
-export interface TestRunRecord {
+export interface CommandRunRecord {
   id: string;
   passed: boolean;
   command: string;
@@ -51,14 +50,22 @@ export interface TestRunRecord {
 
 export interface AgentSession {
   findings: AgentFinding[];
-  testRuns: TestRunRecord[];
+  commandRuns: CommandRunRecord[];
   finished: boolean;
   finishSummary?: string;
-  counters: { test: number; finding: number };
+  counters: { command: number; finding: number };
+  workspace?: SandboxWorkspace;
+  scratchFiles: Map<string, string>;
 }
 
 export function newSession(): AgentSession {
-  return { findings: [], testRuns: [], finished: false, counters: { test: 0, finding: 0 } };
+  return {
+    findings: [],
+    commandRuns: [],
+    finished: false,
+    counters: { command: 0, finding: 0 },
+    scratchFiles: new Map(),
+  };
 }
 
 export interface ToolContext {
@@ -82,7 +89,7 @@ export interface AgentTool {
 }
 
 export function buildTools(): AgentTool[] {
-  return [listFilesTool, readFileTool, searchTool, knownBugClassesTool, dataflowTool, runTestTool, reportFindingTool, recallTool, rememberTool, finishTool];
+  return [readTool, writeTool, editTool, bashTool];
 }
 
 /** Render the tool catalogue for the system prompt. */
@@ -90,159 +97,175 @@ export function renderToolCatalogue(tools: AgentTool[]): string {
   return tools.map((tool) => `- ${tool.name}: ${tool.description}`).join("\n");
 }
 
-const listFilesTool: AgentTool = {
-  name: "list_files",
-  description:
-    'List loaded files. args: {"kind"?: "source"|"corpus"|"all" (default source), "filter"?: substring}. Returns path and line count for each file.',
-  async run(args, ctx) {
-    const kind = asEnum(args.kind, ["source", "corpus", "all"], "source");
-    const filter = asString(args.filter)?.toLowerCase();
-    const docs = selectDocs(ctx, kind).filter((doc) => !filter || doc.path.toLowerCase().includes(filter));
-    if (docs.length === 0) return { observation: "(no matching files)" };
-    const lines = docs.slice(0, 400).map((doc) => `${doc.path} (${countLines(doc.content)} lines, ${doc.kind})`);
-    const more = docs.length > 400 ? `\n…and ${docs.length - 400} more` : "";
-    return { observation: `${docs.length} file(s):\n${lines.join("\n")}${more}`, meta: { count: docs.length } };
-  },
-};
+export function ingestFindingsFromScratch(session: AgentSession): { parsed: number; errors: string[] } {
+  const entry = findingsJsonEntry(session);
+  if (!entry) {
+    session.findings = [];
+    session.counters.finding = 0;
+    return { parsed: 0, errors: [] };
+  }
 
-const readFileTool: AgentTool = {
-  name: "read_file",
+  let raw: unknown;
+  try {
+    raw = JSON.parse(entry.content);
+  } catch (error) {
+    session.findings = [];
+    return { parsed: 0, errors: [`${entry.path}: invalid JSON: ${error instanceof Error ? error.message : String(error)}`] };
+  }
+
+  const items = Array.isArray(raw)
+    ? raw
+    : raw && typeof raw === "object" && Array.isArray((raw as Record<string, unknown>).findings)
+      ? ((raw as Record<string, unknown>).findings as unknown[])
+      : undefined;
+  if (!items) {
+    session.findings = [];
+    return { parsed: 0, errors: [`${entry.path}: expected an array or an object with a findings array.`] };
+  }
+
+  const findings: AgentFinding[] = [];
+  const errors: string[] = [];
+  for (const [idx, item] of items.entries()) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      errors.push(`findings[${idx}]: expected object.`);
+      continue;
+    }
+    const record = item as Record<string, unknown>;
+    const title = asString(record.title);
+    const location = asString(record.location);
+    if (!title || !location) {
+      errors.push(`findings[${idx}]: "title" and "location" are required.`);
+      continue;
+    }
+
+    const commandRunId = asString(record.command_id) ?? asString(record.commandRunId) ?? asString(record.test_run_id);
+    const citedRun = commandRunId ? session.commandRuns.find((run) => run.id === commandRunId) : undefined;
+    const confirmed = Boolean(citedRun?.passed);
+    const id = asString(record.id) ?? `f${findings.length + 1}`;
+    findings.push({
+      id,
+      title,
+      severity: asEnum(record.severity, ["info", "low", "medium", "high", "critical"], "medium") as Severity,
+      location,
+      description: asString(record.description) ?? "",
+      evidence: asString(record.evidence) ?? "",
+      exploitSketch: asString(record.exploit_sketch) ?? asString(record.exploitSketch) ?? "",
+      fix: asString(record.fix) ?? "",
+      confidence: clampFloat(record.confidence, 0, 1, 0.5),
+      confirmationStatus: confirmed ? "confirmed-executable" : "suspected",
+      ...(confirmed && citedRun ? { commandRunId: citedRun.id } : {}),
+    });
+
+    if (commandRunId && !citedRun) errors.push(`findings[${idx}]: command_id "${commandRunId}" does not match a bash command run.`);
+    if (commandRunId && citedRun && !citedRun.passed) errors.push(`findings[${idx}]: command_id "${commandRunId}" is not confirmation-eligible.`);
+  }
+
+  session.findings = findings;
+  session.counters.finding = findings.length;
+  return { parsed: findings.length, errors };
+}
+
+const readTool: AgentTool = {
+  name: "read",
   description:
-    'Read a loaded file, optionally a line range. args: {"path": string, "start"?: int (1-based), "end"?: int}. Without a range it returns up to 400 lines.',
+    'Read loaded source/corpus or a file written in the sandbox. args: {"path": string, "start"?: int (1-based), "end"?: int}. Without a range it returns up to 400 lines.',
   async run(args, ctx) {
     const target = asString(args.path);
     if (!target) return { observation: 'error: "path" is required' };
-    const doc = findDoc(ctx, target);
-    if (!doc) return { observation: `error: no loaded file matches "${target}". Use list_files to see available paths.` };
-    const allLines = doc.content.split("\n");
-    const start = clampInt(args.start, 1, allLines.length, 1);
-    const defaultEnd = Math.min(allLines.length, start + 399);
-    const end = clampInt(args.end, start, allLines.length, defaultEnd);
+    const readable = await findReadable(ctx, target);
+    if (!readable) return { observation: `error: no loaded or sandbox file matches "${target}". Use bash with ls/find/rg to inspect the copied workspace.` };
+    const allLines = readable.content.split(/\r?\n/);
+    const total = allLines.length;
+    const start = clampInt(args.start, 1, Math.max(1, total), 1);
+    const defaultEnd = Math.min(total, start + 399);
+    const end = clampInt(args.end, start, Math.max(start, total), defaultEnd);
     const slice = allLines.slice(start - 1, end);
     const numbered = slice.map((line, idx) => `${start + idx}\t${line}`).join("\n");
-    const header = `${doc.path} lines ${start}-${end} of ${allLines.length}`;
-    return { observation: `${header}\n${numbered}`, meta: { path: doc.path, start, end, total: allLines.length } };
-  },
-};
-
-const searchTool: AgentTool = {
-  name: "search",
-  description:
-    'Regex search across loaded files. args: {"query": regex string, "kind"?: "source"|"corpus"|"all", "max_results"?: int (default 60), "ignore_case"?: bool (default true)}. Returns path:line and the matching line.',
-  async run(args, ctx) {
-    const query = asString(args.query);
-    if (!query) return { observation: 'error: "query" is required' };
-    let regex: RegExp;
-    try {
-      regex = new RegExp(query, asBool(args.ignore_case, true) ? "i" : "");
-    } catch (error) {
-      return { observation: `error: invalid regex: ${error instanceof Error ? error.message : String(error)}` };
-    }
-    const kind = asEnum(args.kind, ["source", "corpus", "all"], "source");
-    const maxResults = clampInt(args.max_results, 1, 300, 60);
-    const hits: string[] = [];
-    for (const doc of selectDocs(ctx, kind)) {
-      const lines = doc.content.split("\n");
-      for (let i = 0; i < lines.length; i += 1) {
-        if (regex.test(lines[i] ?? "")) {
-          hits.push(`${doc.path}:${i + 1}: ${(lines[i] ?? "").trim().slice(0, 240)}`);
-          if (hits.length >= maxResults) break;
-        }
-      }
-      if (hits.length >= maxResults) break;
-    }
-    if (hits.length === 0) return { observation: `no matches for /${query}/` };
-    return { observation: `${hits.length} match(es):\n${hits.join("\n")}`, meta: { count: hits.length } };
-  },
-};
-
-// Demoted prior #1: the failure-mode taxonomy. In the staged pipeline this is an
-// enforced vocabulary every audit item must use. Here it is an OPTIONAL reference
-// library the model may consult or ignore. A stronger model needs it less; it is
-// never imposed and never limits what the model may report.
-const knownBugClassesTool: AgentTool = {
-  name: "known_bug_classes",
-  description:
-    'Optional reference: common security bug classes and what each looks for. You are NOT required to use these and you may report bugs that fit none of them. args: {"name"?: string for one class\'s detail, else lists all}.',
-  async run(args, _ctx) {
-    const name = asString(args.name);
-    const entries = Object.values(AUDITOR_AGENTS);
-    if (name) {
-      const match = entries.find((agent) => agent.failureMode === name || agent.id === name);
-      if (!match) return { observation: `no class named "${name}". Call known_bug_classes with no args to list them.` };
-      return { observation: `${match.failureMode} (${match.displayName}):\n${match.guidance}` };
-    }
-    const lines = entries.map((agent) => `- ${agent.failureMode}: ${agent.guidance}`);
     return {
-      observation: `Reference library of ${entries.length} bug classes (optional, non-exhaustive):\n${lines.join("\n")}`,
-      meta: { count: entries.length },
+      observation: `${readable.path} lines ${start}-${end} of ${total} (${readable.kind})\n${numbered}`,
+      meta: { path: readable.path, start, end, total, kind: readable.kind },
     };
   },
 };
 
-// Demoted prior #2: provenance / value-dataflow facts. In the staged pipeline
-// adapters run as a mandatory stage and inject facts into enumeration prompts.
-// Here the model pulls them on demand when it wants help mapping ingress edges.
-// Routing evidence only — never a finding; the model must still read the code.
-const dataflowTool: AgentTool = {
-  name: "dataflow",
+const writeTool: AgentTool = {
+  name: "write",
   description:
-    'Optional: machine-extracted value-provenance facts for the loaded source (entrypoints, assignments, external calls, authority/signature edges, token/state mutations, L1/L2 messages, etc.) for supported domains (halo2, solidity, solana-rust, zk, cairo-starknet, go-wormhole). Routing evidence only — not findings. args: {"domain"?: string, "path"?: substring filter, "max_facts"?: int (default 60)}.',
+    'Write a file inside the copied sandbox workspace. args: {"path": relative, "content": string}. To report results, write findings.json at the workspace root.',
   async run(args, ctx) {
-    const graphs = extractAllProvenanceGraphs(ctx.source);
-    if (graphs.length === 0) return { observation: "no provenance facts were extracted for the loaded source (no supported domain detected)." };
-    const domain = asString(args.domain)?.toLowerCase();
-    const pathFilter = asString(args.path)?.toLowerCase();
-    const maxFacts = clampInt(args.max_facts, 5, 200, 60);
-    const selected = domain ? graphs.filter((graph) => graph.domain.toLowerCase() === domain) : graphs;
-    if (selected.length === 0) {
-      return { observation: `no provenance for domain "${domain}". Available domains: ${graphs.map((graph) => graph.domain).join(", ")}.` };
+    const normalized = normalizeToolPath(args.path);
+    if (!normalized) return { observation: 'error: "path" must be a safe relative path.' };
+    const content = typeof args.content === "string" ? args.content : undefined;
+    if (content === undefined) return { observation: 'error: "content" is required.' };
+    if (Buffer.byteLength(content, "utf8") > ctx.cfg.reproductionMaxFileBytes) return { observation: "error: content exceeds the configured file-size limit." };
+
+    if (normalized !== "findings.json") {
+      const blockedFile = firstBlockedSandboxFile([{ path: normalized, content }]);
+      if (blockedFile) return { observation: `blocked: ${blockedFile}` };
     }
-    const blocks: string[] = [];
-    for (const graph of selected) {
-      const scoped = pathFilter ? filterGraphByPath(graph, pathFilter) : graph;
-      if (scoped.facts.length === 0) continue;
-      const facts = renderProvenanceGraph(scoped, maxFacts);
-      const obligations = renderProofObligations(scoped.obligations, Math.max(8, Math.floor(maxFacts / 4)));
-      blocks.push(`## ${graph.domain} (${scoped.facts.length} facts)\n${facts}${obligations ? `\n\nRouting obligations:\n${obligations}` : ""}`);
-    }
-    if (blocks.length === 0) return { observation: pathFilter ? `no provenance facts touch "${pathFilter}".` : "no provenance facts to show." };
-    return { observation: blocks.join("\n\n"), meta: { domains: selected.map((graph) => graph.domain) } };
+
+    const workspace = await ensureWorkspace(ctx);
+    if (!workspace) return { observation: "error: write needs on-disk source roots (sourcePaths); none are configured for this run." };
+    await writeSandboxFiles(workspace.absolute, [{ path: normalized, content }]);
+    ctx.session.scratchFiles.set(normalized, content);
+    await ctx.logger.event("hunt_write", { path: normalized, bytes: Buffer.byteLength(content, "utf8") });
+    return { observation: `wrote ${normalized} (${Buffer.byteLength(content, "utf8")} bytes) in sandbox workspace ${workspace.relative}.`, meta: { path: normalized } };
   },
 };
 
-const runTestTool: AgentTool = {
-  name: "run_test",
+const editTool: AgentTool = {
+  name: "edit",
   description:
-    'Run ONE local test in an isolated copy of the source to prove or disprove a hypothesis. args: {"files": [{"path": relative, "content": string}], "command": {"program": string, "args": [string]}, "expected_exit_code"?: int, "success_patterns": [string]}. Only local test runners are allowed (cargo test, forge test, go test, npm test, pytest, node --test, …); no networks, no subprocess spawning, no secrets. Returns the outcome and a run id you can cite in report_finding to reach confirmed-executable.',
+    'Replace text in a file inside the copied sandbox workspace. args: {"path": relative, "old": string, "new": string, "replace_all"?: bool}. This never modifies the target source tree.',
   async run(args, ctx) {
-    if (ctx.cfg.sourcePaths.length === 0) {
-      return { observation: "error: run_test needs on-disk source roots (sourcePaths); none are configured for this run." };
+    const target = asString(args.path);
+    if (!target) return { observation: 'error: "path" is required.' };
+    const oldText = typeof args.old === "string" ? args.old : undefined;
+    const newText = typeof args.new === "string" ? args.new : undefined;
+    if (oldText === undefined || newText === undefined || oldText.length === 0) return { observation: 'error: "old" and "new" strings are required, and "old" must be non-empty.' };
+
+    const workspace = await ensureWorkspace(ctx);
+    if (!workspace) return { observation: "error: edit needs on-disk source roots (sourcePaths); none are configured for this run." };
+    const existing = await readWorkspaceCandidate(ctx, target);
+    if (!existing) return { observation: `error: no sandbox file matches "${target}".` };
+    if (!existing.content.includes(oldText)) return { observation: `error: old text was not found in ${existing.path}.` };
+
+    const next = asBool(args.replace_all, false) ? existing.content.split(oldText).join(newText) : existing.content.replace(oldText, newText);
+    if (Buffer.byteLength(next, "utf8") > ctx.cfg.reproductionMaxFileBytes) return { observation: "error: edited file exceeds the configured file-size limit." };
+    if (existing.path !== "findings.json") {
+      const blockedFile = firstBlockedSandboxFile([{ path: existing.path, content: next }]);
+      if (blockedFile) return { observation: `blocked: ${blockedFile}` };
     }
-    const files = normalizeFiles(args.files, ctx.cfg.reproductionMaxFileBytes);
-    const command = normalizeCommand(args.command, args, ctx.cfg);
-    if (!command) return { observation: 'error: "command" must be {"program": string, "args": [string]}.' };
-    const successPatterns = asStringList(args.success_patterns);
 
-    const blockedCommand = firstBlockedSandboxCommand([command]);
-    if (blockedCommand) return { observation: `blocked: ${blockedCommand}` };
-    const blockedFile = firstBlockedSandboxFile(files);
-    if (blockedFile) return { observation: `blocked: ${blockedFile}` };
+    await writeSandboxFiles(workspace.absolute, [{ path: existing.path, content: next }]);
+    ctx.session.scratchFiles.set(existing.path, next);
+    await ctx.logger.event("hunt_edit", { path: existing.path, bytes: Buffer.byteLength(next, "utf8") });
+    return { observation: `edited ${existing.path} in sandbox workspace ${workspace.relative}.`, meta: { path: existing.path } };
+  },
+};
 
-    ctx.session.counters.test += 1;
-    const runId = `t${ctx.session.counters.test}`;
-    const relativeDir = path.posix.join("hunt", "tests", safeName(runId), "workspace");
-    const workspace = await prepareSandboxWorkspace(ctx.cfg.sourcePaths, ctx.logger.runDir, relativeDir);
-    await writeSandboxFiles(workspace.absolute, files);
-    const result = await runSandboxCommand(command, workspace.absolute, ctx.cfg.reproductionMaxLogBytes, ctx.cfg.sourcePaths);
+const bashTool: AgentTool = {
+  name: "bash",
+  description:
+    'Run one local inspection or test command in the copied sandbox workspace. args: {"cmd": string, "cwd"?: relative, "expected_exit_code"?: int, "success_patterns"?: [string], "timeout_ms"?: int}. Shell control operators, remote networks, destructive commands, and paths outside the workspace are blocked. A command is confirmation-eligible only when it exits as expected and all success_patterns appear in output.',
+  async run(args, ctx) {
+    const normalized = normalizeBashCommand(args, ctx.cfg);
+    if ("error" in normalized) return { observation: normalized.error };
+    const blocked = analyzeAgentBashCommandSafety(normalized.command);
+    if (blocked.blocked) return { observation: `blocked: ${blocked.reason ?? "command blocked by policy"}` };
+
+    const workspace = await ensureWorkspace(ctx);
+    if (!workspace) return { observation: "error: bash needs on-disk source roots (sourcePaths); none are configured for this run." };
+    ctx.session.counters.command += 1;
+    const runId = `cmd${ctx.session.counters.command}`;
+    const result = await runSandboxCommand(normalized.command, workspace.absolute, ctx.cfg.reproductionMaxLogBytes, ctx.cfg.sourcePaths);
     const exitMatched = result.exitCode === result.expectedExitCode && !result.timedOut;
-    const patternCheck = matchSuccessPatterns(successPatterns, [result]);
-    const passed = exitMatched && patternCheck.missing.length === 0 && patternCheck.matched.length > 0;
-
-    const record: TestRunRecord = {
+    const patternCheck = matchSuccessPatterns(normalized.successPatterns, [result]);
+    const passed = exitMatched && normalized.successPatterns.length > 0 && patternCheck.missing.length === 0 && patternCheck.matched.length > 0;
+    const record: CommandRunRecord = {
       id: runId,
       passed,
-      command: [command.program, ...command.args].join(" "),
+      command: normalized.raw,
       matched: patternCheck.matched,
       missing: patternCheck.missing,
       exitCode: result.exitCode,
@@ -250,8 +273,8 @@ const runTestTool: AgentTool = {
       timedOut: result.timedOut,
       workspace: workspace.relative,
     };
-    ctx.session.testRuns.push(record);
-    await ctx.logger.event("hunt_test_run", {
+    ctx.session.commandRuns.push(record);
+    await ctx.logger.event("hunt_command_run", {
       runId,
       passed,
       exitCode: result.exitCode,
@@ -261,10 +284,10 @@ const runTestTool: AgentTool = {
       missing: patternCheck.missing.length,
     });
 
-    const tail = (text: string): string => (text.length > 1600 ? `…${text.slice(-1600)}` : text);
+    const tail = (text: string): string => (text.length > 1600 ? `...${text.slice(-1600)}` : text);
     const verdict = passed
-      ? `run ${runId}: PASS — exit=${result.exitCode} (expected ${result.expectedExitCode}); matched success patterns: ${patternCheck.matched.join(", ")}. Cite test_run_id="${runId}" in report_finding for confirmed-executable.`
-      : `run ${runId}: NOT CONFIRMED — exit=${result.exitCode} expected=${result.expectedExitCode} timedOut=${result.timedOut}; missing patterns: ${patternCheck.missing.join(" | ")}`;
+      ? `command ${runId}: CONFIRMATION-ELIGIBLE PASS; cite command_id="${runId}" in findings.json for confirmed-executable.`
+      : `command ${runId}: exit=${result.exitCode} expected=${result.expectedExitCode} timedOut=${result.timedOut}; not confirmation-eligible (${patternCheck.missing.join(" | ")}).`;
     return {
       observation: `${verdict}\n--- stdout ---\n${tail(result.stdout) || "(empty)"}\n--- stderr ---\n${tail(result.stderr) || "(empty)"}`,
       meta: { runId, passed },
@@ -272,95 +295,52 @@ const runTestTool: AgentTool = {
   },
 };
 
-const reportFindingTool: AgentTool = {
-  name: "report_finding",
-  description:
-    'Record a candidate vulnerability. args: {"title", "severity": info|low|medium|high|critical, "location": "file:line", "description", "evidence", "exploit_sketch", "fix", "confidence": 0..1, "test_run_id"?: string}. A finding only becomes confirmed-executable if test_run_id names a run_test that actually passed; otherwise it is recorded as suspected. Reporting does not end the hunt — keep going.',
-  async run(args, ctx) {
-    const title = asString(args.title);
-    const location = asString(args.location);
-    if (!title || !location) return { observation: 'error: "title" and "location" are required.' };
-    ctx.session.counters.finding += 1;
-    const id = `f${ctx.session.counters.finding}`;
-    const testRunId = asString(args.test_run_id);
-    const citedRun = testRunId ? ctx.session.testRuns.find((run) => run.id === testRunId) : undefined;
-    const confirmed = Boolean(citedRun?.passed);
-    const finding: AgentFinding = {
-      id,
-      title,
-      severity: asEnum(args.severity, ["info", "low", "medium", "high", "critical"], "medium") as Severity,
-      location,
-      description: asString(args.description) ?? "",
-      evidence: asString(args.evidence) ?? "",
-      exploitSketch: asString(args.exploit_sketch) ?? "",
-      fix: asString(args.fix) ?? "",
-      confidence: clampFloat(args.confidence, 0, 1, 0.5),
-      confirmationStatus: confirmed ? "confirmed-executable" : "suspected",
-      ...(confirmed && citedRun ? { testRunId: citedRun.id } : {}),
-    };
-    ctx.session.findings.push(finding);
-    await ctx.logger.event("hunt_finding", { id, severity: finding.severity, confirmationStatus: finding.confirmationStatus, location });
-    let note = `recorded ${id} as ${finding.confirmationStatus} (${finding.severity}).`;
-    if (testRunId && !citedRun) note += ` Note: test_run_id "${testRunId}" does not match any run_test in this session, so it stays suspected.`;
-    else if (testRunId && citedRun && !citedRun.passed) note += ` Note: run ${testRunId} did not pass, so it stays suspected — fix the local test to confirm.`;
-    return { observation: note, meta: { id, confirmationStatus: finding.confirmationStatus } };
-  },
-};
-
-const recallTool: AgentTool = {
-  name: "recall",
-  description: 'Search durable memory from prior runs of this target. args: {"query": string, "limit"?: int}. Returns past notes (confirmed findings, dead ends, insights).',
-  async run(args, ctx) {
-    const query = asString(args.query) ?? "";
-    const limit = clampInt(args.limit, 1, 20, 8);
-    const notes = await ctx.memory.recall(query, limit);
-    if (notes.length === 0) return { observation: "(no relevant memory)" };
-    return {
-      observation: notes.map((note) => `[${note.kind}] ${note.note}${note.sourceRef ? ` (ref: ${note.sourceRef})` : ""}`).join("\n"),
-      meta: { count: notes.length },
-    };
-  },
-};
-
-const rememberTool: AgentTool = {
-  name: "remember",
-  description:
-    'Persist a durable note for future runs of this target. args: {"note": string, "kind"?: "finding"|"dead-end"|"insight"|"note", "tags"?: [string], "source_ref"?: string}. Use it to bank what would save effort next time.',
-  async run(args, ctx) {
-    const note = asString(args.note);
-    if (!note) return { observation: 'error: "note" is required.' };
-    const stored = await ctx.memory.remember({
-      note,
-      kind: asEnum(args.kind, ["finding", "dead-end", "insight", "note"], "note") as never,
-      tags: asStringList(args.tags),
-      ...(asString(args.source_ref) ? { sourceRef: asString(args.source_ref) as string } : {}),
-    });
-    await ctx.logger.event("hunt_remember", { id: stored.id, kind: stored.kind });
-    return { observation: `remembered (${stored.kind}).` };
-  },
-};
-
-const finishTool: AgentTool = {
-  name: "finish",
-  description: 'End the hunt when you judge coverage is sufficient or further effort has low expected value. args: {"summary": string}.',
-  async run(args, ctx) {
-    ctx.session.finished = true;
-    ctx.session.finishSummary = asString(args.summary) ?? "";
-    return { observation: "hunt finished." };
-  },
-};
-
-function filterGraphByPath(graph: ProvenanceGraph, pathFilter: string): ProvenanceGraph {
-  const facts = graph.facts.filter((fact) => fact.path.toLowerCase().includes(pathFilter));
-  const factIds = new Set(facts.map((fact) => fact.id));
-  const obligations = graph.obligations.filter((obligation) => obligation.evidenceRefs.some((ref) => ref.toLowerCase().includes(pathFilter)) || obligation.id.split(":").some((part) => factIds.has(part)));
-  return { ...graph, facts, obligations, summary: { ...graph.summary, facts: facts.length } };
+async function ensureWorkspace(ctx: ToolContext): Promise<SandboxWorkspace | undefined> {
+  if (ctx.session.workspace) return ctx.session.workspace;
+  if (ctx.cfg.sourcePaths.length === 0) return undefined;
+  const workspace = await prepareSandboxWorkspace(ctx.cfg.sourcePaths, ctx.logger.runDir, "hunt/workspace");
+  ctx.session.workspace = workspace;
+  await ctx.logger.event("hunt_workspace", { workspace: workspace.relative });
+  return workspace;
 }
 
-function selectDocs(ctx: ToolContext, kind: "source" | "corpus" | "all"): Doc[] {
-  if (kind === "source") return ctx.source;
-  if (kind === "corpus") return ctx.corpus;
-  return [...ctx.source, ...ctx.corpus];
+async function findReadable(ctx: ToolContext, target: string): Promise<{ path: string; content: string; kind: string } | undefined> {
+  const normalized = normalizeToolPath(target);
+  if (normalized && ctx.session.scratchFiles.has(normalized)) {
+    return { path: normalized, content: ctx.session.scratchFiles.get(normalized) as string, kind: "scratch" };
+  }
+  const workspaceContent = await readWorkspaceCandidate(ctx, target);
+  if (workspaceContent) return { ...workspaceContent, kind: "sandbox" };
+  const doc = findDoc(ctx, target);
+  if (doc) return { path: doc.path, content: doc.content, kind: doc.kind };
+  return undefined;
+}
+
+async function readWorkspaceCandidate(ctx: ToolContext, target: string): Promise<{ path: string; content: string } | undefined> {
+  const workspace = ctx.session.workspace;
+  if (!workspace) return undefined;
+  for (const candidate of workspacePathCandidates(ctx, target)) {
+    if (ctx.session.scratchFiles.has(candidate)) return { path: candidate, content: ctx.session.scratchFiles.get(candidate) as string };
+    try {
+      const content = await readFile(resolveWorkspacePath(workspace.absolute, candidate), "utf8");
+      return { path: candidate, content };
+    } catch {
+      // Try the next candidate.
+    }
+  }
+  return undefined;
+}
+
+function workspacePathCandidates(ctx: ToolContext, target: string): string[] {
+  const normalized = normalizeToolPath(target);
+  if (!normalized) return [];
+  const out = [normalized];
+  if (ctx.cfg.sourcePaths.length === 1) {
+    const sourceBase = path.basename(path.resolve(ctx.cfg.sourcePaths[0] ?? ""));
+    const parts = normalized.split("/");
+    if (parts.length > 1 && parts[0] === sourceBase) out.push(parts.slice(1).join("/"));
+  }
+  return [...new Set(out)];
 }
 
 function findDoc(ctx: ToolContext, target: string): Doc | undefined {
@@ -372,32 +352,80 @@ function findDoc(ctx: ToolContext, target: string): Doc | undefined {
   );
 }
 
-function normalizeFiles(value: unknown, maxFileBytes: number): ReproductionFile[] {
-  if (!Array.isArray(value)) return [];
-  const out: ReproductionFile[] = [];
-  for (const item of value) {
-    if (!item || typeof item !== "object") continue;
-    const record = item as Record<string, unknown>;
-    const rawPath = asString(record.path);
-    const content = typeof record.content === "string" ? record.content : undefined;
-    if (!rawPath || content === undefined || Buffer.byteLength(content, "utf8") > maxFileBytes) continue;
-    out.push({ path: rawPath, content });
-  }
-  return out.slice(0, 8);
+function findingsJsonEntry(session: AgentSession): { path: string; content: string } | undefined {
+  const direct = session.scratchFiles.get("findings.json");
+  if (direct !== undefined) return { path: "findings.json", content: direct };
+  const matches = [...session.scratchFiles.entries()]
+    .filter(([filePath]) => path.posix.basename(filePath) === "findings.json")
+    .sort((a, b) => a[0].length - b[0].length);
+  const first = matches[0];
+  return first ? { path: first[0], content: first[1] } : undefined;
 }
 
-function normalizeCommand(value: unknown, args: Record<string, unknown>, cfg: AuditorConfig): ReproductionCommand | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const record = value as Record<string, unknown>;
-  const program = asString(record.program);
-  if (!program) return undefined;
-  const commandArgs = Array.isArray(record.args) ? record.args.map((arg) => String(arg)).filter((arg) => arg.length > 0) : [];
+function normalizeBashCommand(args: Record<string, unknown>, cfg: AuditorConfig): { raw: string; command: ReproductionCommand; successPatterns: string[] } | { error: string } {
+  const raw = asString(args.cmd) ?? asString(args.command);
+  if (!raw) return { error: 'error: "cmd" is required.' };
+  if (raw.length > 4000) return { error: "error: command is too long." };
+  const split = splitCommandLine(raw);
+  if ("error" in split) return split;
+  if (split.argv.length === 0) return { error: "error: command is empty." };
+  const program = split.argv[0] ?? "";
+  const commandArgs = split.argv.slice(1);
   const command: ReproductionCommand = { program, args: commandArgs };
-  const cwd = asString(record.cwd);
-  if (cwd && cwd !== ".") command.cwd = cwd;
-  command.timeoutMs = clampInt(record.timeoutMs ?? record.timeout_ms, 1000, cfg.reproductionCommandTimeoutMs, cfg.reproductionCommandTimeoutMs);
-  command.expectedExitCode = clampInt(args.expected_exit_code ?? record.expectedExitCode ?? record.expected_exit_code, 0, 255, 0);
-  return command;
+  const cwd = asString(args.cwd);
+  if (cwd && cwd !== ".") {
+    const normalizedCwd = normalizeRelativePath(cwd);
+    if (!normalizedCwd) return { error: 'error: "cwd" must be a safe relative path.' };
+    command.cwd = normalizedCwd;
+  }
+  command.timeoutMs = clampInt(args.timeout_ms ?? args.timeoutMs, 1000, cfg.reproductionCommandTimeoutMs, cfg.reproductionCommandTimeoutMs);
+  command.expectedExitCode = clampInt(args.expected_exit_code ?? args.expectedExitCode, 0, 255, 0);
+  return { raw, command, successPatterns: asStringList(args.success_patterns) };
+}
+
+function splitCommandLine(input: string): { argv: string[] } | { error: string } {
+  const argv: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | undefined;
+  let escaping = false;
+  for (let idx = 0; idx < input.length; idx += 1) {
+    const ch = input[idx] as string;
+    if (escaping) {
+      current += ch;
+      escaping = false;
+      continue;
+    }
+    if (ch === "\\" && quote !== "'") {
+      escaping = true;
+      continue;
+    }
+    if (!quote && (ch === ";" || ch === "&" || ch === "|" || ch === "<" || ch === ">" || ch === "`")) {
+      return { error: "blocked: shell control operators are not allowed in agent bash commands." };
+    }
+    if (ch === "$" && !quote && input[idx + 1] === "(") {
+      return { error: "blocked: shell command substitution is not allowed in agent bash commands." };
+    }
+    if ((ch === "'" || ch === '"') && (!quote || quote === ch)) {
+      quote = quote ? undefined : ch;
+      continue;
+    }
+    if (!quote && /\s/.test(ch)) {
+      if (current.length > 0) {
+        argv.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += ch;
+  }
+  if (escaping) current += "\\";
+  if (quote) return { error: "error: unterminated quote in command." };
+  if (current.length > 0) argv.push(current);
+  return { argv };
+}
+
+function normalizeToolPath(value: unknown): string | undefined {
+  return typeof value === "string" ? normalizeRelativePath(value) : undefined;
 }
 
 function asString(value: unknown): string | undefined {
@@ -428,8 +456,4 @@ function clampFloat(value: unknown, min: number, max: number, fallback: number):
   const num = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
   if (!Number.isFinite(num)) return fallback;
   return Math.min(max, Math.max(min, num));
-}
-
-function countLines(content: string): number {
-  return content.length === 0 ? 0 : content.split("\n").length;
 }

@@ -7,7 +7,7 @@
 The main layers are:
 
 - Agent loop: `src/agent/loop.ts`, `src/agent/prompts.ts`, and `src/agent/hunt.ts`.
-- Agent tools: `src/agent/tools.ts` for read/search/source facts/local tests/reporting/memory.
+- Agent tools: `src/agent/tools.ts` for pi-style read/write/edit/bash capabilities.
 - Ingestion: `src/ingest/source.ts` loads authorized source and corpus material with public-safe paths.
 - Safety: `src/security/policy.ts` and `src/security/sandbox.ts` gate local command execution.
 - Reporting and history: `src/reports`, `src/trace`, and `src/agent/memory.ts`.
@@ -22,40 +22,36 @@ flowchart TD
   PI["pi tool: fsa_hunt"] --> HUNT
   HUNT --> INGEST["load source and corpus"]
   INGEST --> SESSION["logger, session, project memory"]
-  SESSION --> TOOLS["build generic tools"]
+  SESSION --> TOOLS["build pi-style tools"]
   TOOLS --> PROMPT["thin kickoff prompt"]
   PROMPT --> LOOP["agent loop"]
-  LOOP --> MODEL["LLM returns one JSON action"]
+  LOOP --> MODEL["LLM returns one JSON action or done"]
   MODEL --> PARSE{"valid action?"}
   PARSE -->|no| LOOP
   PARSE -->|yes| DISPATCH["dispatch tool"]
-  DISPATCH --> READ["list_files/read_file/search"]
-  DISPATCH --> MEMORY["recall/remember"]
-  DISPATCH --> FACTS["optional source facts"]
-  DISPATCH --> TEST["run_test sandbox"]
-  DISPATCH --> REPORT["report_finding"]
-  DISPATCH --> FINISH["finish"]
+  DISPATCH --> READ["read"]
+  DISPATCH --> WRITE["write/edit sandbox"]
+  DISPATCH --> BASH["bash sandbox"]
   READ --> OBS["append observation"]
-  MEMORY --> OBS
-  FACTS --> OBS
-  TEST --> OBS
-  REPORT --> CONFIRM{"cites passed test run?"}
-  CONFIRM -->|yes| EXEC["confirmed-executable"]
-  CONFIRM -->|no| SUSPECT["suspected"]
-  EXEC --> OBS
-  SUSPECT --> OBS
+  WRITE --> OBS
+  BASH --> OBS
   OBS --> WINDOW["transcript windowing"]
   WINDOW --> LOOP
-  FINISH --> ARTIFACTS["write transcript, findings, tests, reports, history"]
+  MODEL -->|done| FINDINGS["parse findings.json"]
+  FINDINGS --> CONFIRM{"cites passed command_id?"}
+  CONFIRM -->|yes| EXEC["confirmed-executable"]
+  CONFIRM -->|no| SUSPECT["suspected"]
+  EXEC --> ARTIFACTS["write transcript, findings, commands, reports, history"]
+  SUSPECT --> ARTIFACTS
 ```
 
-The loop has one protocol: the model emits exactly one JSON action per turn. The framework parses it, runs the requested tool, appends the observation, and calls the model again until the agent finishes or the step budget is exhausted.
+The loop has one protocol: the model emits exactly one JSON tool action per turn, or a `done` object after writing `findings.json`. The framework parses it, runs the requested tool, appends the observation, and calls the model again until the agent finishes or the step budget is exhausted.
 
 ## Thin-Layer Rule
 
 A component belongs in hunt mode only if it gives the model something it cannot provide for itself:
 
-- an affordance: read source, search source, inspect corpus, run a local test, recall prior work;
+- an affordance: read source, write/edit a copied workspace, inspect with local commands, run a local test;
 - a guarantee: sandbox isolation, command safety, path redaction, replayable logs, durable history, executable-confirmation gating.
 
 A component does not belong in the default hunt path if it tells the model what bug class to look for, what schedule to follow, or what conclusion to reach. If a human prior is still useful, expose it as an optional model-callable tool.
@@ -64,26 +60,20 @@ A component does not belong in the default hunt path if it tells the model what 
 
 Default tools:
 
-- `list_files`: enumerate loaded source/corpus files.
-- `read_file`: read a file or line range from loaded material.
-- `search`: regex search over loaded material.
-- `run_test`: write bounded files into a copied workspace and run one allowed local test command.
-- `report_finding`: record a candidate finding.
-- `recall` / `remember`: use durable per-target memory.
-- `finish`: stop the hunt.
+- `read`: read loaded source/corpus or files created in the sandbox.
+- `write`: write bounded files into the copied sandbox workspace.
+- `edit`: replace text in a file inside the copied sandbox workspace.
+- `bash`: run one policy-gated local inspection or test command in the copied workspace.
 
-Optional planning aids:
-
-- `known_bug_classes`: a reference library only. It is not an enforced taxonomy.
-- `dataflow`: machine-extracted provenance facts only. It is not a detector and cannot produce findings.
+There are no default bug-class, dataflow, checklist, memory, or report tools. Optional priors should live as extension skills, prompt packs, corpus material, or package add-ons, not as default strategy in hunt mode.
 
 ## Confirmation Boundary
 
 The hard rule is that the model cannot confirm a bug by assertion.
 
-`report_finding` records `confirmed-executable` only when it cites a `run_test` record that passed. Otherwise it records `suspected`.
+`findings.json` records reach `confirmed-executable` only when they cite a `bash` `command_id` that passed with expected exit status and declared success patterns. Otherwise they record as `suspected`.
 
-`run_test` routes through `src/security/sandbox.ts` and the command-safety policy. It must stay local-only: unit tests, fixtures, local regtest/devnet, forked local nodes, or isolated harnesses. Public network broadcast, transfer, credential use, persistence, exploit optimization, and destructive commands are blocked.
+`bash` routes through `src/security/sandbox.ts` and the command-safety policy. It must stay local-only: source inspection, unit tests, fixtures, local regtest/devnet, forked local nodes, or isolated harnesses. Public network broadcast, transfer, credential use, persistence, exploit optimization, destructive commands, and paths outside the copied workspace are blocked.
 
 The next hardening target is to make executable confirmation less self-certifying: a generic passing test or printed success string should not be enough to prove exploitability. Confirmation should prefer tests that touch target code, exercise the vulnerable condition, and match framework- or verifier-owned success signals.
 
@@ -93,12 +83,12 @@ Each hunt writes:
 
 - `hunt_transcript.json`: action/observation replay.
 - `hunt_findings.json`: raw agent findings.
-- `hunt_test_runs.json`: sandboxed local test records.
+- `hunt_command_runs.json`: sandboxed local command records.
 - `summary.json`: ranked summary.
 - `report_<id>.md`: private disclosure drafts.
 - `events.jsonl` and `calls/*.json`: trace and model calls.
 
-Per-target memory lives at `<out>/history/<target>/memory.jsonl`. The framework stores notes; the model decides what to remember and when to recall.
+Per-target memory lives at `<out>/history/<target>/memory.jsonl`. Hunt surfaces recent memory at kickoff and automatically stores parsed findings for later runs.
 
 Project history lives under `<out>/history/<target>/manifest.json` and records sanitized run metadata, findings, and materials. Paths must stay repository-relative or placeholder-based in public-facing artifacts.
 

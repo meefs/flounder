@@ -40,7 +40,7 @@ export async function runHuntLoop(input: {
   let consecutiveParseErrors = 0;
 
   for (let n = 1; n <= input.maxSteps; n += 1) {
-    const user = `${kickoff}\n\n===== TRANSCRIPT SO FAR =====\n${renderTranscript(steps)}\n\n===== YOUR NEXT ACTION =====\nRespond with one JSON action.`;
+    const user = `${kickoff}\n\n===== TRANSCRIPT SO FAR =====\n${renderTranscript(steps)}\n\n===== YOUR NEXT ACTION =====\nRespond with one JSON tool action or done object.`;
     let raw: string;
     try {
       raw = await input.llm.complete({
@@ -68,13 +68,22 @@ export async function runHuntLoop(input: {
         thought: "",
         tool: "(parse-error)",
         args: {},
-        observation: 'error: could not parse a JSON action. Respond with exactly one object: {"thought": "...", "tool": "...", "args": {...}}.',
+        observation:
+          'error: could not parse a JSON action. Respond with exactly one object: {"thought": "...", "tool": "...", "args": {...}} or {"thought": "...", "done": true, "summary": "..."}',
       });
       await input.logger.event("hunt_parse_error", { step: n });
       if (consecutiveParseErrors >= 3) return { steps, stoppedReason: "stalled" };
       continue;
     }
     consecutiveParseErrors = 0;
+
+    if (action.done) {
+      input.ctx.session.finished = true;
+      input.ctx.session.finishSummary = action.summary;
+      steps.push({ n, thought: action.thought, tool: "(done)", args: {}, observation: action.summary || "hunt finished." });
+      await input.logger.event("hunt_step", { step: n, tool: "(done)" });
+      return { steps, stoppedReason: "finished" };
+    }
 
     const tool = toolsByName.get(action.tool);
     if (!tool) {
@@ -108,14 +117,20 @@ interface ParsedAction {
   thought: string;
   tool: string;
   args: Record<string, unknown>;
+  done: boolean;
+  summary: string;
 }
 
 function parseAction(raw: string): ParsedAction | undefined {
   const parsed = extractJsonObject<Record<string, unknown>>(raw);
   if (!parsed || typeof parsed !== "object") return undefined;
+  const thought = typeof parsed.thought === "string" ? parsed.thought.trim() : "";
+  if (parsed.done === true) {
+    const summary = typeof parsed.summary === "string" ? parsed.summary.trim() : "";
+    return { thought, tool: "(done)", args: {}, done: true, summary };
+  }
   const tool = typeof parsed.tool === "string" ? parsed.tool.trim() : "";
   if (!tool) return undefined;
   const args = parsed.args && typeof parsed.args === "object" && !Array.isArray(parsed.args) ? (parsed.args as Record<string, unknown>) : {};
-  const thought = typeof parsed.thought === "string" ? parsed.thought.trim() : "";
-  return { thought, tool, args };
+  return { thought, tool, args, done: false, summary: "" };
 }

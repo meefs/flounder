@@ -9,7 +9,7 @@ export default function fullStackAuditorExtension(pi: ExtensionAPI): void {
     name: "fsa_hunt",
     label: "Autonomous Security Hunt",
     description:
-      "Run the thin agentic hunt: the model drives its own investigation with read/search/run_test tools and durable cross-run memory. The framework supplies capability and verification, not a checklist. Verification is local-only; a finding only reaches confirmed-executable when a sandboxed local test passes. Requires a live model provider.",
+      "Run the thin agentic hunt: the model drives its own investigation with pi-style read/write/edit/bash tools. The framework supplies capability and verification, not a checklist. Verification is local-only; a finding only reaches confirmed-executable when a sandboxed local command passes. Requires a live model provider.",
     parameters: Type.Object({
       target: Type.String({ description: "Target name used for run artifacts and durable memory." }),
       sourcePaths: Type.Array(Type.String(), { description: "Local authorized source files or directories to audit." }),
