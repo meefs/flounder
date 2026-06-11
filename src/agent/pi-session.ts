@@ -18,7 +18,7 @@ import type { AgentTool, ToolContext } from "./tools.js";
 
 export interface SessionDriverResult {
   steps: TranscriptStep[];
-  stoppedReason: "finished" | "error";
+  stoppedReason: "finished" | "error" | "step-budget";
 }
 
 export function isPiSessionProvider(provider: string): boolean {
@@ -60,18 +60,31 @@ export async function runHuntSession(input: {
     sessionManager: SessionManager.inMemory(),
   });
 
+  // Budget: the continuous session runs until the model stops on its own. Cap the
+  // number of model turns so a real run cannot grow unbounded in cost/time.
+  const maxTurns = Math.max(1, Math.floor(input.cfg.huntMaxSteps));
+  let turns = 0;
+  let budgetAborted = false;
   const unsubscribe = session.subscribe((event) => {
     if (event.type === "tool_execution_start") {
       void input.logger.event("hunt_step", { step: stepNo + 1, tool: event.toolName });
     } else if (event.type === "tool_execution_end" && event.isError) {
       void input.logger.event("hunt_tool_error", { tool: event.toolName });
+    } else if (event.type === "turn_end") {
+      turns += 1;
+      if (turns >= maxTurns && !budgetAborted) {
+        budgetAborted = true;
+        void input.logger.event("hunt_session_budget", { turns, maxTurns });
+        void session.abort();
+      }
     }
   });
 
   try {
     await session.prompt(buildSessionPrompt(input));
-    return { steps, stoppedReason: "finished" };
+    return { steps, stoppedReason: budgetAborted ? "step-budget" : "finished" };
   } catch (error) {
+    if (budgetAborted) return { steps, stoppedReason: "step-budget" };
     const message = error instanceof Error ? error.message : String(error);
     await input.logger.event("hunt_session_error", { error: message.slice(0, 500) });
     // Authentication is an environment setup step, not a finding. Surface it
@@ -155,7 +168,8 @@ Use the provided tools to investigate:
 
 How to report:
 - Record candidates by writing findings.json at the workspace root: a JSON array of objects with fields title, severity (info|low|medium|high|critical), location ("file:line"), description, evidence, exploit_sketch, fix, confidence (0..1), and optionally command_id.
-- The one hard rule the framework enforces: a claim is only confirmed-executable if it cites command_id of a purpose=confirm bash run that actually passed. Everything else is recorded as an unconfirmed hypothesis. Aim to confirm your strongest findings with a real local test; the dependency toolchain has already been warmed up so tests should compile.
+- The one hard rule the framework enforces: a claim is only confirmed-executable if it cites command_id of a purpose=confirm bash run that actually passed. Everything else is recorded as an unconfirmed hypothesis.
+- A confirm test must exercise the ACTUAL vulnerable code path: construct the malicious input or condition and show the code accepts it or the invariant breaks. The strongest proof fails on the current code and passes only after your minimal fix. A test that merely prints a success string without triggering the bug proves nothing — do not cite it. The dependency toolchain is prepared automatically on your first test run, so allow extra time for that first compile.
 
 White-hat boundaries (non-negotiable):
 - Verification is local-only: unit tests, component tests, local regtest/devnet, or forked/fake nodes. Never target a public testnet, mainnet, production, or any live network.
@@ -182,10 +196,8 @@ function getModelSafe(provider: string, modelId?: string): ReturnType<typeof get
   }
 }
 
-function mapThinkingLevel(level: AuditorConfig["thinkingLevel"]): "low" | "medium" | "high" {
-  if (level === "minimal" || level === "low") return "low";
-  if (level === "medium") return "medium";
-  return "high";
+export function mapThinkingLevel(level: AuditorConfig["thinkingLevel"]): AuditorConfig["thinkingLevel"] {
+  return level;
 }
 
 async function shutdownSession(session: unknown): Promise<void> {

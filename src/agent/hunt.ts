@@ -8,11 +8,10 @@ import { writeLastRunPointer } from "../trace/last-run.js";
 import { RunLogger } from "../trace/logger.js";
 import type { AuditSummary, Doc, LlmClient, RankedFinding, Severity } from "../types.js";
 import { publicPath } from "../util/paths.js";
-import { prepareSandboxWorkspace } from "../security/sandbox.js";
+import { normalizeRelativePath, prepareSandboxWorkspace, writeSandboxFiles, type SandboxWorkspace } from "../security/sandbox.js";
 import { runHuntLoop } from "./loop.js";
 import { ProjectMemory } from "./memory.js";
 import { isPiSessionProvider, runHuntSession } from "./pi-session.js";
-import { prepareWorkspaceToolchain } from "./prepare.js";
 import type { TranscriptStep } from "./prompts.js";
 import { buildTools, ingestFindingsFromScratch, newSession, type AgentFinding, type ToolContext } from "./tools.js";
 
@@ -56,16 +55,20 @@ export async function runHunt(
   const tools = buildTools();
   const ctx: ToolContext = { cfg, source, corpus, memory, logger, session };
 
-  // Create the shared isolated workspace up front. It is the sandbox for tools,
-  // the cwd for the agent session, and the surface the warm-up prepares.
+  // Create the shared isolated workspace up front. It is the sandbox for tools
+  // and the cwd for the agent session. The toolchain warm-up is lazy (run by the
+  // bash tool on the first test command) so read-only or unauthenticated runs do
+  // not pay for it.
   let workspaceCwd = process.cwd();
+  const corpusManifest: string[] = [];
   if (cfg.sourcePaths.length > 0) {
     const workspace = await prepareSandboxWorkspace(cfg.sourcePaths, logger.runDir, "hunt/workspace");
     session.workspace = workspace;
     workspaceCwd = workspace.absolute;
-    // Warm-up guarantee: prepare the toolchain once (deps fetched/built) so the
-    // model's later test runs can actually compile and confirm.
-    if (cfg.huntPrepare) await prepareWorkspaceToolchain({ workspace, cfg, logger });
+    // Make corpus (specs, papers, books) visible to the agent: copy it into the
+    // workspace so the model can read/grep it, and list it in the manifest. This
+    // reference material is often what makes a subtle bug discoverable.
+    corpusManifest.push(...(await copyCorpusIntoWorkspace(workspace, corpus)));
   }
 
   const scopeNote = resolveScopeNote(cfg);
@@ -78,6 +81,7 @@ export async function runHunt(
   // Driver choice: real pi providers (e.g. openai-codex) run a continuous
   // AgentSession that owns the loop; the deterministic mock and CLI fallbacks use
   // the legacy per-step complete() loop.
+  const fileManifest = renderFileManifest(source, corpusManifest);
   const useSession = !options.llm && isPiSessionProvider(cfg.provider);
   let steps: TranscriptStep[];
   let stoppedReason: string;
@@ -88,7 +92,7 @@ export async function runHunt(
       tools,
       logger,
       cwd: workspaceCwd,
-      fileManifest: renderFileManifest(source),
+      fileManifest,
       ...(scopeNote ? { scopeNote } : {}),
       ...(memoryHint ? { memoryHint } : {}),
     });
@@ -106,7 +110,7 @@ export async function runHunt(
       ctx,
       logger,
       maxSteps: Math.max(1, Math.floor(cfg.huntMaxSteps)),
-      fileManifest: renderFileManifest(source),
+      fileManifest,
       ...(scopeNote ? { scopeNote } : {}),
       ...(memoryHint ? { memoryHint } : {}),
     });
@@ -249,10 +253,30 @@ function renderMemoryHint(notes: { kind: string; note: string; sourceRef?: strin
   return notes.map((note) => `- [${note.kind}] ${note.note}${note.sourceRef ? ` (ref: ${note.sourceRef})` : ""}`).join("\n");
 }
 
-function renderFileManifest(source: Doc[]): string {
+function renderFileManifest(source: Doc[], corpusEntries: string[] = []): string {
   const lines = source.slice(0, 600).map((doc) => `- ${doc.path} (${doc.content ? doc.content.split("\n").length : 0} lines)`);
   const more = source.length > 600 ? `\n…and ${source.length - 600} more files` : "";
-  return `${lines.join("\n")}${more}`;
+  let out = `${lines.join("\n")}${more}`;
+  if (corpusEntries.length > 0) {
+    const shown = corpusEntries.slice(0, 200).map((entry) => `- ${entry}`);
+    const moreCorpus = corpusEntries.length > 200 ? `\n…and ${corpusEntries.length - 200} more` : "";
+    out += `\n\nReference material (specs, papers, books) under corpus/:\n${shown.join("\n")}${moreCorpus}`;
+  }
+  return out;
+}
+
+async function copyCorpusIntoWorkspace(workspace: SandboxWorkspace, corpus: Doc[]): Promise<string[]> {
+  if (corpus.length === 0) return [];
+  const seen = new Set<string>();
+  const files = corpus.map((doc, index) => {
+    const safe = normalizeRelativePath(doc.path) ?? `doc-${index}`;
+    let rel = `corpus/${safe}`;
+    while (seen.has(rel)) rel = `corpus/${index}-${safe}`;
+    seen.add(rel);
+    return { path: rel, content: doc.content };
+  });
+  await writeSandboxFiles(workspace.absolute, files);
+  return files.map((file) => file.path);
 }
 
 function historyLocation(cfg: AuditorConfig): { outputDir: string; targetName: string; historyDir?: string } {

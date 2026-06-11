@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -7,7 +7,7 @@ import { defaultConfig } from "../dist/config.js";
 import { ProjectMemory } from "../dist/agent/memory.js";
 import { buildTools, ingestFindingsFromScratch, newSession } from "../dist/agent/tools.js";
 import { runHunt } from "../dist/agent/hunt.js";
-import { isPiSessionProvider } from "../dist/agent/pi-session.js";
+import { isPiSessionProvider, mapThinkingLevel } from "../dist/agent/pi-session.js";
 import { MockAuditLlmClient } from "../dist/llm/mock.js";
 import { RunLogger } from "../dist/trace/logger.js";
 
@@ -34,6 +34,12 @@ test("driver routing: real pi providers use the continuous session, mock/CLI fal
   assert.equal(isPiSessionProvider("codex-cli"), false);
   assert.equal(isPiSessionProvider("mock"), false);
   assert.equal(isPiSessionProvider("not-a-real-provider"), false);
+});
+
+test("pi session preserves the configured xhigh thinking level", () => {
+  assert.equal(defaultConfig().thinkingLevel, "xhigh");
+  assert.equal(mapThinkingLevel("minimal"), "minimal");
+  assert.equal(mapThinkingLevel("xhigh"), "xhigh");
 });
 
 test("project memory persists notes and recalls by keyword overlap", async () => {
@@ -165,9 +171,12 @@ test("an inspection command cannot forge confirmation by printing a success patt
 test("hunt produces an execution-confirmed finding and banks cross-run memory", async () => {
   const dir = await tempDir();
   try {
+    const corpusFile = path.join(dir, "spec.md");
+    await writeFile(corpusFile, "# Protocol spec\nThe nullifier must be unique per note.\n");
     const cfg = defaultConfig();
     cfg.targetName = "agent-e2e";
     cfg.sourcePaths = [fixtures];
+    cfg.corpusPaths = [corpusFile];
     cfg.outputDir = path.join(dir, "runs");
     cfg.huntMaxSteps = 10;
 
@@ -196,6 +205,10 @@ test("hunt produces an execution-confirmed finding and banks cross-run memory", 
       prepareWritten = false;
     }
     assert.equal(prepareWritten, false, "warm-up must no-op when no manifest is present");
+
+    // Corpus is copied into the workspace so the agent can read/grep it.
+    const corpusEntries = await readdir(path.join(runDir, "hunt", "workspace", "corpus"));
+    assert.ok(corpusEntries.length >= 1, "corpus material must be copied into the workspace");
 
     const transcript = JSON.parse(await readFile(path.join(runDir, "hunt_transcript.json"), "utf8"));
     assert.equal(transcript.stoppedReason, "finished");

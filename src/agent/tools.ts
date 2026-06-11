@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { AuditorConfig } from "../config.js";
 import { analyzeAgentBashCommandSafety, isAgentConfirmCommand } from "../security/policy.js";
+import { prepareWorkspaceToolchain } from "./prepare.js";
 import {
   firstBlockedSandboxFile,
   matchSuccessPatterns,
@@ -56,6 +57,8 @@ export interface AgentSession {
   counters: { command: number; finding: number };
   workspace?: SandboxWorkspace;
   scratchFiles: Map<string, string>;
+  /** Whether the toolchain warm-up has run for this session's workspace. */
+  prepared?: boolean;
 }
 
 export function newSession(): AgentSession {
@@ -256,6 +259,10 @@ const bashTool: AgentTool = {
 
     const workspace = await ensureWorkspace(ctx);
     if (!workspace) return { observation: "error: bash needs on-disk source roots (sourcePaths); none are configured for this run." };
+    // Lazy warm-up: only a real test/build command needs dependencies, so prepare
+    // the toolchain on first use rather than eagerly for every (possibly
+    // read-only or unauthenticated) run.
+    if (isAgentConfirmCommand(normalized.command)) await ensurePrepared(ctx, workspace);
     ctx.session.counters.command += 1;
     const runId = `cmd${ctx.session.counters.command}`;
     const result = await runSandboxCommand(normalized.command, workspace.absolute, ctx.cfg.reproductionMaxLogBytes, ctx.cfg.sourcePaths);
@@ -317,6 +324,12 @@ function confirmFailureReason(
   if (normalized.successPatterns.length === 0) return "purpose=confirm requires success_patterns describing the invariant break or patched regression";
   if (!exitMatched) return `exit=${result.exitCode} expected=${result.expectedExitCode} timedOut=${result.timedOut}`;
   return `missing success patterns: ${patternCheck.missing.join(" | ")}`;
+}
+
+async function ensurePrepared(ctx: ToolContext, workspace: SandboxWorkspace): Promise<void> {
+  if (!ctx.cfg.huntPrepare || ctx.session.prepared) return;
+  ctx.session.prepared = true; // set before awaiting so a second test command does not re-trigger
+  await prepareWorkspaceToolchain({ workspace, cfg: ctx.cfg, logger: ctx.logger });
 }
 
 async function ensureWorkspace(ctx: ToolContext): Promise<SandboxWorkspace | undefined> {
