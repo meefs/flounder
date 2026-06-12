@@ -514,6 +514,41 @@ test("map → dig is resumable: a second run skips map and audits the next pendi
   }
 });
 
+test("map → dig: --scope picks a specific inventory item to deep-audit (human-in-the-loop)", async () => {
+  const dir = await tempDir();
+  try {
+    const base = {
+      targetName: "pick-e2e",
+      sourcePaths: [fixtures],
+      corpusPaths: [fixtures],
+      outputDir: path.join(dir, "runs"),
+      huntDeep: true,
+      huntMapSteps: 6,
+      huntDigSteps: 8,
+      huntMaxScopes: 1,
+    };
+
+    // Run 1 enumerates S1+S2 and audits S1 (top score); S2 left pending.
+    await runHunt({ ...defaultConfig(), ...base }, { llm: new MockAuditLlmClient() });
+
+    // Pick S2 explicitly — skip map, ignore score order, deep-audit exactly S2.
+    const picked = await runHunt({ ...defaultConfig(), ...base, huntScopeIds: ["S2"] }, { llm: new MockAuditLlmClient() });
+    const events = (await readFile(path.join(picked.runDir, "events.jsonl"), "utf8")).trim().split("\n").map((l) => JSON.parse(l));
+    assert.ok(!events.some((e) => e.kind === "hunt_map_done"), "picking must not re-map");
+    assert.ok(events.some((e) => e.kind === "hunt_scope_picked" && e.ids.includes("S2")), "the named scope is audited");
+    const findings = JSON.parse(await readFile(path.join(picked.runDir, "hunt_findings.json"), "utf8"));
+    assert.equal(findings[0]?.scopeId, "S2", "the finding is tagged with the picked scope");
+
+    // An unknown id is reported, not silently ignored.
+    await assert.rejects(
+      runHunt({ ...defaultConfig(), ...base, huntScopeIds: ["S99"] }, { llm: new MockAuditLlmClient() }),
+      /none of the requested scope ids exist/,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("hunt run directories are unique to the millisecond so rapid same-target runs do not collide", () => {
   // Regression for the resumable flow running back-to-back within one second.
   const t = new Date("2026-06-12T01:22:54.123Z");

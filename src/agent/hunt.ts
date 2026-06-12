@@ -147,8 +147,12 @@ export async function runHunt(
     // re-digging. --remap discards the persisted inventory and enumerates afresh.
     const inventoryDir = projectHistoryDir(historyLocation(cfg));
     const aggregatedSteps: TranscriptStep[] = [];
+    const picked = cfg.huntScopeIds ?? [];
     scopeInventory = cfg.huntRemap ? [] : await loadScopeInventory(inventoryDir);
     const resuming = scopeInventory.length > 0;
+    if (picked.length > 0 && !resuming) {
+      throw new Error("--scope needs an existing scope inventory; run `fsa hunt --deep` first to enumerate scopes, then pick from hunt_scopes.json.");
+    }
     if (!resuming) {
       const mapPhase = await runPhase(withRole(cfg, "map"), { mode: "map", maxSteps: cfg.huntMapSteps });
       scopeInventory = readScratchScopes(session);
@@ -161,12 +165,24 @@ export async function runHunt(
     for (const scope of scopeInventory) if (!scope.status) scope.status = "pending";
 
     const digCfg = withRole(cfg, "dig");
-    // Audit the highest-scored scopes not yet audited; the rest stay pending for
-    // a future run (visible, never silently dropped).
-    const toDig = scopeInventory
-      .filter((scope) => scope.status !== "audited")
-      .sort((a, b) => b.score - a.score)
-      .slice(0, Math.max(1, cfg.huntMaxScopes));
+    let toDig: AuditScope[];
+    if (picked.length > 0) {
+      // Human-in-the-loop: deep-audit exactly the named scopes (re-auditing an
+      // already-audited one is allowed), regardless of score order.
+      const wanted = new Set(picked);
+      toDig = scopeInventory.filter((scope) => wanted.has(scope.id));
+      const missing = picked.filter((id) => !toDig.some((scope) => scope.id === id));
+      if (missing.length > 0) await logger.event("hunt_scope_unknown", { ids: missing });
+      if (toDig.length === 0) throw new Error(`none of the requested scope ids exist in the inventory: ${picked.join(", ")}`);
+      await logger.event("hunt_scope_picked", { ids: toDig.map((scope) => scope.id) });
+    } else {
+      // Audit the highest-scored scopes not yet audited; the rest stay pending for
+      // a future run (visible, never silently dropped).
+      toDig = scopeInventory
+        .filter((scope) => scope.status !== "audited")
+        .sort((a, b) => b.score - a.score)
+        .slice(0, Math.max(1, cfg.huntMaxScopes));
+    }
     const aggregated: AgentFinding[] = [];
     for (const scope of toDig) {
       clearScratchFindings(session);

@@ -34,6 +34,9 @@ export interface AuditorConfig {
   // Re-enumerate the scope inventory from scratch instead of resuming the
   // persisted one (which would otherwise continue with the next un-audited scopes).
   huntRemap: boolean;
+  // Manually pick specific scope ids from the persisted inventory to deep-audit
+  // (the human-in-the-loop seam), instead of the automatic top-by-score selection.
+  huntScopeIds?: string[];
   // Per-role model assignment. A role (map/dig/refute) resolves to its own entry,
   // else `default`, else the top-level provider/auditModel/thinkingLevel. Nothing
   // is auto-downgraded: an unspecified role inherits the main model.

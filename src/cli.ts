@@ -65,6 +65,14 @@ async function parseConfig(args: string[]): Promise<{ cfg: AuditorConfig }> {
   cfg.huntMapSteps = readIntFlag(args, "--map-steps") ?? cfg.huntMapSteps;
   cfg.huntDigSteps = readIntFlag(args, "--dig-steps") ?? cfg.huntDigSteps;
   if (args.includes("--remap")) cfg.huntRemap = true;
+  const scopeSel = readFlag(args, "--scope");
+  if (scopeSel) {
+    const ids = scopeSel.split(",").map((id) => id.trim()).filter(Boolean);
+    if (ids.length > 0) {
+      cfg.huntScopeIds = ids;
+      cfg.huntDeep = true; // picking a scope is a deep (map → dig) operation
+    }
+  }
   const deepFocus = readFlag(args, "--deep-focus");
   if (deepFocus !== undefined) {
     cfg.huntDeep = true;
@@ -217,6 +225,7 @@ Options:
   --map-steps <n>         hunt: action budget for the map phase, default 20
   --dig-steps <n>         hunt: per-scope action budget for the dig phase, default 30
   --remap                 hunt: re-enumerate scopes from scratch (default resumes the persisted inventory)
+  --scope <id[,id...]>    hunt: deep-audit specific scope id(s) from the inventory (implies --deep; run --deep once first to enumerate)
   --mock-llm              run with the deterministic mock model
 `);
 }
