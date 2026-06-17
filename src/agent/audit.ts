@@ -35,7 +35,7 @@ export interface AuditRunResult {
 
 export async function runAudit(
   cfg: AuditorConfig,
-  options: { llm?: LlmClient; streamEvents?: boolean; kind?: RunKind; signal?: AbortSignal; onRun?: (runId: number) => void } = {},
+  options: { llm?: LlmClient; streamEvents?: boolean; kind?: RunKind; signal?: AbortSignal; onRun?: (runId: number) => void; onActivity?: (event: { kind: string; delta?: string; tool?: string; step?: number }) => void } = {},
 ): Promise<AuditRunResult> {
   const startedAt = new Date();
   const logger = new RunLogger(cfg.outputDir, cfg.targetName, startedAt, { streamEvents: options.streamEvents ?? false });
@@ -127,6 +127,7 @@ export async function runAudit(
         ...(scopeNote ? { scopeNote } : {}),
         ...(memoryHint ? { memoryHint } : {}),
         ...(options.signal ? { signal: options.signal } : {}),
+        ...(options.onActivity ? { onActivity: options.onActivity } : {}),
         ...flags,
       });
     }

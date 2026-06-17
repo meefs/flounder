@@ -37,7 +37,7 @@ interface ConfirmProvenance {
 
 export async function runConfirm(
   cfg: AuditorConfig,
-  options: { inputRunDir: string; maxSteps?: number; fresh?: boolean; streamEvents?: boolean; signal?: AbortSignal; onRun?: (runId: number) => void },
+  options: { inputRunDir: string; maxSteps?: number; fresh?: boolean; streamEvents?: boolean; signal?: AbortSignal; onRun?: (runId: number) => void; onActivity?: (event: { kind: string; delta?: string; tool?: string; step?: number }) => void },
 ): Promise<ConfirmRunResult> {
   // Confirm needs a real agent that can fork a live network and run real nodes; the
   // mock/CLI fallbacks cannot, so this mode requires a pi-session provider.
@@ -125,6 +125,7 @@ export async function runConfirm(
     // progress (reproduced X / N) during the run, not only at the end.
     onConfirmCheckpoint: (raw) => recorder.confirmDecisions(toLiveConfirmRows(raw)),
     ...(options.signal ? { signal: options.signal } : {}),
+    ...(options.onActivity ? { onActivity: options.onActivity } : {}),
   });
 
   // 5. Read the model's decision rows, then CONSOLIDATE by execution: run the

@@ -10,7 +10,7 @@ import { readFileSync, createReadStream, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { MetadataStore, type RunKind } from "../db/store.js";
-import { RunManager, type LaunchSpec } from "./run-manager.js";
+import { RunManager, type LaunchSpec, type ActivityBus } from "./run-manager.js";
 
 const UI_HTML_PATH = fileURLToPath(new URL("./public/index.html", import.meta.url));
 function loadUiHtml(): string {
@@ -189,6 +189,9 @@ export function startUiServer(options: UiServerOptions = {}): ReturnType<typeof 
   const port = options.port ?? 4500;
   const host = options.host ?? "127.0.0.1"; // localhost only — this endpoint can spawn processes
   const store = MetadataStore.openForOutput(out);
+  // Runs execute in this process, so any row left `running` is orphaned by a prior restart.
+  const orphans = store.reconcileOrphanedRuns();
+  if (orphans > 0) console.log(`[fsa ui] reconciled ${orphans} interrupted run(s) from a previous session`);
   const manager = new RunManager(store, out); // runs the library in-process (not the CLI)
 
   const server = createServer((req, res) => {
@@ -296,9 +299,27 @@ function runStop(c: Ctx): void {
 }
 
 function runLog(c: Ctx): void {
-  const run = c.store.getRun(Number(c.params.id));
-  if (!run || typeof run.run_dir !== "string") return sendJson(c.res, 404, { error: "no such run (or it has no run dir)" });
-  streamRunLog(c.res, run.run_dir);
+  const id = Number(c.params.id);
+  const run = c.store.getRun(id);
+  if (!run) return sendJson(c.res, 404, { error: "no such run" });
+  // A run launched this session streams token-level activity from the in-memory bus; any
+  // other run (e.g. historical, or after a restart) tails its persisted event log.
+  const bus = c.manager.activityFor(id);
+  if (bus) {
+    streamFromBus(c.res, bus);
+    return;
+  }
+  if (typeof run.run_dir === "string") {
+    streamRunLog(c.res, run.run_dir);
+    return;
+  }
+  sendJson(c.res, 404, { error: "run has no activity or event log" });
+}
+
+function streamFromBus(res: ServerResponse, bus: ActivityBus): void {
+  res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+  const unsubscribe = bus.subscribe((ev) => res.write(`data: ${JSON.stringify(ev)}\n\n`));
+  res.on("close", unsubscribe);
 }
 
 // Tail a run's events.jsonl over SSE: send existing lines, then poll for appended bytes and

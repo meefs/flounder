@@ -3,8 +3,22 @@ import test from "node:test";
 import { mkdtemp } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { buildArgs, specToConfig } from "../dist/server/run-manager.js";
+import { buildArgs, specToConfig, ActivityBus } from "../dist/server/run-manager.js";
 import { MetadataStore } from "../dist/db/store.js";
+
+test("ActivityBus: a subscriber replays backlog then receives live events", () => {
+  const bus = new ActivityBus();
+  bus.push({ kind: "thinking_delta", delta: "The " });
+  bus.push({ kind: "thinking_delta", delta: "decoder" });
+  const seen = [];
+  const unsub = bus.subscribe((ev) => seen.push(ev.delta ?? ev.tool ?? ev.kind));
+  assert.deepEqual(seen, ["The ", "decoder"]); // backlog replayed on subscribe
+  bus.push({ kind: "step", tool: "bash" });
+  assert.deepEqual(seen, ["The ", "decoder", "bash"]); // live event delivered
+  unsub();
+  bus.push({ kind: "thinking_delta", delta: "x" });
+  assert.equal(seen.length, 3); // no events after unsubscribe
+});
 
 // buildArgs is the pure core of launching: spec -> fsa CLI argv. The run-manager shells out
 // to the same CLI, and continue/restart map to the kernel's resume / --remap behavior.

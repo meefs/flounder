@@ -302,6 +302,14 @@ export class MetadataStore {
     this.db.prepare("UPDATE run SET pid = ? WHERE id = ?").run(pid, runId);
   }
 
+  /** Mark every still-`running` run as ended. Runs execute in the server process, so a
+   * server restart ends them all — call this on startup so orphaned rows do not show as
+   * running forever. Returns rows changed. */
+  reconcileOrphanedRuns(status: RunStatus = "killed"): number {
+    const info = this.db.prepare("UPDATE run SET status = ?, ended_at = ? WHERE status = 'running'").run(status, now());
+    return Number(info.changes);
+  }
+
   /** Mark a still-running run for this OS pid as ended (a supervisor saw the process exit
    * without the run reaching `done`). No-op if it already finished. Returns rows changed. */
   reconcileRunByPid(pid: number, status: RunStatus): number {

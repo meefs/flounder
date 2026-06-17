@@ -53,6 +53,10 @@ export async function runAuditSession(input: {
   onConfirmCheckpoint?: (rows: unknown[]) => void;
   /** Abort the run cooperatively (e.g. a UI "stop"): aborts the underlying agent session. */
   signal?: AbortSignal;
+  /** Live activity for a UI: fired per streaming delta (thinking_delta / text_delta — token
+   * level) and per tool call (step). Best-effort, must not throw. Separate from the
+   * block-level events.jsonl logging, which persists the same content for later review. */
+  onActivity?: (event: { kind: string; delta?: string; tool?: string; step?: number }) => void;
 }): Promise<SessionDriverResult> {
   const model = getModelSafe(input.cfg.provider, input.cfg.auditModel);
   if (!model) throw new Error(`audit session: unknown provider/model ${input.cfg.provider}/${input.cfg.auditModel}`);
@@ -135,12 +139,13 @@ export async function runAuditSession(input: {
   const unsubscribe = session.subscribe((event) => {
     if (event.type === "message_update") {
       const ame = event.assistantMessageEvent;
-      if (ame.type === "thinking_delta") thinkingBuf += ame.delta;
+      if (ame.type === "thinking_delta") { thinkingBuf += ame.delta; try { input.onActivity?.({ kind: "thinking_delta", delta: ame.delta }); } catch {} }
       else if (ame.type === "thinking_end") { if (thinkingBuf.trim()) void input.logger.event("audit_thinking", { text: thinkingBuf.trim() }); thinkingBuf = ""; }
-      else if (ame.type === "text_delta") textBuf += ame.delta;
+      else if (ame.type === "text_delta") { textBuf += ame.delta; try { input.onActivity?.({ kind: "text_delta", delta: ame.delta }); } catch {} }
       else if (ame.type === "text_end") { if (textBuf.trim()) void input.logger.event("audit_text", { text: textBuf.trim() }); textBuf = ""; }
     } else if (event.type === "tool_execution_start") {
       void input.logger.event("audit_step", { step: stepNo + 1, tool: event.toolName });
+      try { input.onActivity?.({ kind: "step", tool: event.toolName, step: stepNo + 1 }); } catch {}
     } else if (event.type === "tool_execution_end" && event.isError) {
       void input.logger.event("audit_tool_error", { tool: event.toolName });
     } else if (event.type === "turn_end") {

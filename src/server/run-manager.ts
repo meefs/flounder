@@ -14,6 +14,32 @@ import type { MetadataStore, RunKind, RunStatus } from "../db/store.js";
 const DEFAULT_OUT = "runs";
 const THINKING = new Set(["minimal", "low", "medium", "high", "xhigh"]);
 
+export type Activity = { kind: string; delta?: string; tool?: string; step?: number };
+
+// In-memory per-run feed of the model's streaming activity (token-level thinking/output +
+// tool calls), for live UI streaming without per-token disk writes. Keeps a recent ring
+// buffer so a late subscriber gets backlog, then live events.
+export class ActivityBus {
+  private readonly buffer: Activity[] = [];
+  private readonly listeners = new Set<(ev: Activity) => void>();
+  push(ev: Activity): void {
+    this.buffer.push(ev);
+    if (this.buffer.length > 2000) this.buffer.shift();
+    for (const listener of this.listeners) {
+      try {
+        listener(ev);
+      } catch {
+        // a broken listener must not stop the run
+      }
+    }
+  }
+  subscribe(fn: (ev: Activity) => void): () => void {
+    for (const ev of this.buffer) fn(ev); // replay backlog
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+}
+
 export interface LaunchSpec {
   verb: RunKind; // run | map | audit | confirm (verify is an audit selector)
   target: string;
@@ -54,6 +80,7 @@ interface RunHandle {
   runId?: number;
   result?: AuditRunResult | ConfirmRunResult;
   error?: string;
+  activity: ActivityBus;
 }
 
 // Translate a launch spec into an AuditorConfig — the in-process equivalent of the CLI's
@@ -108,14 +135,15 @@ export class RunManager {
   launch(spec: LaunchSpec): { launchId: number; verb: RunKind } {
     const launchId = this.nextLaunchId++;
     const abort = new AbortController();
-    const handle: RunHandle = { spec, abort, startedAt: new Date().toISOString(), status: "running" };
+    const handle: RunHandle = { spec, abort, startedAt: new Date().toISOString(), status: "running", activity: new ActivityBus() };
     this.runs.set(launchId, handle);
     const onRun = (runId: number): void => {
       handle.runId = runId;
     };
+    const onActivity = (ev: Activity): void => handle.activity.push(ev);
     // Promise.resolve().then(...) so a synchronous build error becomes a rejection, not a throw.
     void Promise.resolve()
-      .then(() => this.execute(spec, abort.signal, onRun))
+      .then(() => this.execute(spec, abort.signal, onRun, onActivity))
       .then(
         (result) => {
           handle.result = result;
@@ -131,7 +159,7 @@ export class RunManager {
     return { launchId, verb: spec.verb };
   }
 
-  private execute(spec: LaunchSpec, signal: AbortSignal, onRun: (runId: number) => void): Promise<AuditRunResult | ConfirmRunResult> {
+  private execute(spec: LaunchSpec, signal: AbortSignal, onRun: (runId: number) => void, onActivity: (ev: Activity) => void): Promise<AuditRunResult | ConfirmRunResult> {
     const cfg = specToConfig(spec, spec.out ?? this.out);
     if (spec.verb === "confirm") {
       if (!spec.inputRunDir) throw new Error("confirm requires inputRunDir (the finished run directory)");
@@ -139,6 +167,7 @@ export class RunManager {
         inputRunDir: spec.inputRunDir,
         signal,
         onRun,
+        onActivity,
         ...(spec.maxSteps !== undefined ? { maxSteps: spec.maxSteps } : {}),
         ...(spec.fresh ? { fresh: true } : {}),
       });
@@ -147,8 +176,16 @@ export class RunManager {
       kind: spec.verb,
       signal,
       onRun,
+      onActivity,
       ...(spec.mockLlm ? { llm: new MockAuditLlmClient() } : {}),
     });
+  }
+
+  /** The live activity bus for a run launched this session (token-level thinking/output +
+   * tool calls), or undefined for runs not in this session (use the persisted event log). */
+  activityFor(runId: number): ActivityBus | undefined {
+    for (const handle of this.runs.values()) if (handle.runId === runId) return handle.activity;
+    return undefined;
   }
 
   /** Request a cooperative stop of a running run (by its DB run id). */

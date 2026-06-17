@@ -108,6 +108,17 @@ test("store: finding aggregates + pagination + filter scale to many findings", a
   db.close();
 });
 
+test("store: startup reconciles orphaned running runs (in-process runs don't survive a restart)", async () => {
+  const db = await tempDb();
+  const projectId = db.upsertProject({ name: "p" });
+  db.startRun({ projectId, kind: "run", runDir: "/runs/p-1" }); // left running
+  db.finishRun(db.startRun({ projectId, kind: "run", runDir: "/runs/p-2" }), "done");
+  assert.equal(db.reconcileOrphanedRuns(), 1); // only the still-running one
+  assert.equal(db.listRuns(projectId).filter((r) => r.status === "running").length, 0);
+  assert.equal(db.reconcileOrphanedRuns(), 0); // idempotent
+  db.close();
+});
+
 test("store: confirm decisions are replaced per run, not duplicated", async () => {
   const db = await tempDb();
   const projectId = db.upsertProject({ name: "p" });
