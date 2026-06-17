@@ -60,25 +60,56 @@ async function handle(req: IncomingMessage, res: ServerResponse, store: Metadata
     return;
   }
 
-  if (method === "GET" && path.startsWith("/api/projects/")) {
-    const name = decodeURIComponent(path.slice("/api/projects/".length));
+  if (path.startsWith("/api/projects/")) {
+    const tail = path.slice("/api/projects/".length);
+    const slash = tail.indexOf("/");
+    const name = decodeURIComponent(slash === -1 ? tail : tail.slice(0, slash));
+    const sub = slash === -1 ? "" : tail.slice(slash + 1);
     const project = store.listProjects().find((row) => row.name === name);
     if (!project) {
       sendJson(res, 404, { error: `no project named ${name}` });
       return;
     }
     const id = Number(project.id);
-    const findings = store.listFindings(id).map((finding) => ({
-      ...finding,
-      timeline: store.findingTimeline(Number(finding.id)),
-    }));
-    sendJson(res, 200, {
-      project,
-      progress: store.scopeProgress(id),
-      runs: store.listRuns(id),
-      findings,
-      confirmDecisions: store.listConfirmDecisions(id),
-    });
+
+    // Project detail: meta + counts + a bounded slice of runs (NOT every finding row, so
+    // it stays fast with many findings — findings are paged via the endpoint below).
+    if (method === "GET" && sub === "") {
+      sendJson(res, 200, {
+        project,
+        progress: store.scopeProgress(id),
+        statusCounts: store.findingStatusCounts(id),
+        findingsTotal: store.countFindings(id),
+        runs: store.listRuns(id, 50),
+        runsTotal: store.countRuns(id),
+        confirmDecisions: store.listConfirmDecisions(id),
+      });
+      return;
+    }
+
+    // Paginated + filtered findings (status / text search) with their status timeline.
+    if (method === "GET" && sub === "findings") {
+      const status = url.searchParams.get("status") ?? undefined;
+      const search = url.searchParams.get("q") ?? undefined;
+      const limit = clampInt(url.searchParams.get("limit"), 50, 1, 500);
+      const offset = clampInt(url.searchParams.get("offset"), 0, 0, 1_000_000);
+      const findings = store.queryFindings(id, { status, search, limit, offset }).map((finding) => ({
+        ...finding,
+        timeline: store.findingTimeline(Number(finding.id)),
+      }));
+      sendJson(res, 200, { findings, total: store.countFindings(id, { status, search }), limit, offset });
+      return;
+    }
+
+    // Edit per-project config (model/thinking/budgets) + materials, without a run.
+    if (method === "POST" && sub === "config") {
+      const body = (await readBody(req)) as { sourcePaths?: string[]; buildRoot?: string; corpusPaths?: string[]; config?: unknown };
+      store.upsertProject({ name, sourcePaths: body.sourcePaths, buildRoot: body.buildRoot, corpusPaths: body.corpusPaths, config: body.config });
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+
+    sendJson(res, 404, { error: "not found" });
     return;
   }
 
@@ -131,18 +162,16 @@ function projectSnapshots(store: MetadataStore, manager: RunManager): Array<Reco
   for (const run of manager.active()) activeByTarget.set(run.target, (activeByTarget.get(run.target) ?? 0) + 1);
   return store.listProjects().map((project) => {
     const id = Number(project.id);
-    const runs = store.listRuns(id);
-    const findings = store.listFindings(id);
-    const counts: Record<string, number> = {};
-    for (const finding of findings) counts[String(finding.status)] = (counts[String(finding.status)] ?? 0) + 1;
+    // Aggregates only (GROUP BY / COUNT / latest) — O(1)-ish per project, so the SSE tick
+    // does not reload every finding/run row each second when there are many.
     return {
       name: project.name,
       config: safeParse(project.config_json),
       progress: store.scopeProgress(id),
-      findingCounts: counts,
-      findingsTotal: findings.length,
-      runCount: runs.length,
-      latestRun: runs[0] ?? null,
+      findingCounts: store.findingStatusCounts(id),
+      findingsTotal: store.countFindings(id),
+      runCount: store.countRuns(id),
+      latestRun: store.latestRun(id) ?? null,
       activeRuns: activeByTarget.get(String(project.name)) ?? 0,
     };
   });
@@ -179,4 +208,10 @@ function safeParse(value: unknown): unknown {
   } catch {
     return null;
   }
+}
+
+function clampInt(raw: string | null, fallback: number, min: number, max: number): number {
+  const n = raw === null ? NaN : Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(n)));
 }

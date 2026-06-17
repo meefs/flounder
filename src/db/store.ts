@@ -75,6 +75,16 @@ export interface Coverage {
   pending: number;
 }
 
+export interface FindingFilter {
+  status?: string | undefined; // exact status, e.g. "confirmed-differential"
+  search?: string | undefined; // substring match on title or location
+}
+
+export interface FindingQuery extends FindingFilter {
+  limit?: number | undefined;
+  offset?: number | undefined;
+}
+
 const SCHEMA_VERSION = 1;
 
 const SCHEMA = `
@@ -287,10 +297,21 @@ export class MetadataStore {
       .run(coverage.total, coverage.audited, coverage.pending, runId);
   }
 
-  listRuns(projectId?: number): Array<Record<string, unknown>> {
+  listRuns(projectId?: number, limit?: number): Array<Record<string, unknown>> {
+    const tail = typeof limit === "number" ? " LIMIT " + Math.max(1, Math.floor(limit)) : "";
     return projectId === undefined
-      ? (this.db.prepare("SELECT * FROM run ORDER BY started_at DESC").all() as Array<Record<string, unknown>>)
-      : (this.db.prepare("SELECT * FROM run WHERE project_id = ? ORDER BY started_at DESC").all(projectId) as Array<Record<string, unknown>>);
+      ? (this.db.prepare("SELECT * FROM run ORDER BY started_at DESC" + tail).all() as Array<Record<string, unknown>>)
+      : (this.db.prepare("SELECT * FROM run WHERE project_id = ? ORDER BY started_at DESC" + tail).all(projectId) as Array<Record<string, unknown>>);
+  }
+
+  // Aggregates for the dashboard snapshot — cheap regardless of how many runs/findings a
+  // project has, so the live SSE tick does not reload every row each second.
+  countRuns(projectId: number): number {
+    return Number((this.db.prepare("SELECT COUNT(*) AS n FROM run WHERE project_id = ?").get(projectId) as { n: number }).n);
+  }
+
+  latestRun(projectId: number): Record<string, unknown> | undefined {
+    return this.db.prepare("SELECT * FROM run WHERE project_id = ? ORDER BY started_at DESC LIMIT 1").get(projectId) as Record<string, unknown> | undefined;
   }
 
   // --- scopes ---------------------------------------------------------------
@@ -368,6 +389,30 @@ export class MetadataStore {
     return this.db.prepare("SELECT * FROM finding WHERE project_id = ? ORDER BY updated_at DESC").all(projectId) as Array<Record<string, unknown>>;
   }
 
+  /** Finding counts per status — one GROUP BY, for the dashboard + filter chips. */
+  findingStatusCounts(projectId: number): Record<string, number> {
+    const rows = this.db.prepare("SELECT status, COUNT(*) AS n FROM finding WHERE project_id = ? GROUP BY status").all(projectId) as Array<{ status: string; n: number }>;
+    const counts: Record<string, number> = {};
+    for (const row of rows) counts[row.status] = Number(row.n);
+    return counts;
+  }
+
+  countFindings(projectId: number, filter: FindingFilter = {}): number {
+    const where = findingWhere(projectId, filter);
+    return Number((this.db.prepare("SELECT COUNT(*) AS n FROM finding " + where.sql).get(...where.params) as { n: number }).n);
+  }
+
+  /** Paginated + filtered findings (status / text search), newest first — so the detail
+   * view stays responsive when a project has hundreds of findings. */
+  queryFindings(projectId: number, opts: FindingQuery = {}): Array<Record<string, unknown>> {
+    const where = findingWhere(projectId, opts);
+    const limit = Math.max(1, Math.floor(opts.limit ?? 50));
+    const offset = Math.max(0, Math.floor(opts.offset ?? 0));
+    return this.db
+      .prepare("SELECT * FROM finding " + where.sql + " ORDER BY updated_at DESC LIMIT ? OFFSET ?")
+      .all(...where.params, limit, offset) as Array<Record<string, unknown>>;
+  }
+
   findingTimeline(findingId: number): Array<Record<string, unknown>> {
     return this.db.prepare("SELECT * FROM finding_status_event WHERE finding_id = ? ORDER BY ts ASC").all(findingId) as Array<Record<string, unknown>>;
   }
@@ -411,4 +456,20 @@ function jsonOrNull(value: unknown): string | null {
   if (value === undefined || value === null) return null;
   if (Array.isArray(value) && value.length === 0) return null;
   return JSON.stringify(value);
+}
+
+// Build a parameterized WHERE clause for finding queries (status + text search).
+function findingWhere(projectId: number, filter: FindingFilter): { sql: string; params: Array<string | number> } {
+  const clauses = ["project_id = ?"];
+  const params: Array<string | number> = [projectId];
+  if (filter.status) {
+    clauses.push("status = ?");
+    params.push(filter.status);
+  }
+  if (filter.search) {
+    clauses.push("(title LIKE ? OR location LIKE ?)");
+    const like = `%${filter.search}%`;
+    params.push(like, like);
+  }
+  return { sql: "WHERE " + clauses.join(" AND "), params };
 }

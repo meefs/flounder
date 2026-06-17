@@ -81,6 +81,33 @@ test("store: finding status transitions land on a timeline", async () => {
   db.close();
 });
 
+test("store: finding aggregates + pagination + filter scale to many findings", async () => {
+  const db = await tempDb();
+  const projectId = db.upsertProject({ name: "big" });
+  const runId = db.startRun({ projectId, kind: "run", runDir: "/runs/big-1" });
+  const statuses = ["confirmed-differential", "suspected", "refuted"];
+  const rows = [];
+  for (let i = 0; i < 120; i++) rows.push({ findingKey: "f" + i, title: "finding " + i + " in gadget", location: "src/c.rs:" + i, status: statuses[i % 3] });
+  db.upsertFindings(projectId, runId, rows);
+
+  // aggregate counts (one GROUP BY, used by the dashboard snapshot)
+  assert.equal(db.countFindings(projectId), 120);
+  assert.equal(db.findingStatusCounts(projectId)["suspected"], 40);
+
+  // pagination: first page of 50, then the next page
+  assert.equal(db.queryFindings(projectId, { limit: 50, offset: 0 }).length, 50);
+  assert.equal(db.queryFindings(projectId, { limit: 50, offset: 100 }).length, 20);
+
+  // status filter + filtered total
+  assert.equal(db.countFindings(projectId, { status: "refuted" }), 40);
+  assert.ok(db.queryFindings(projectId, { status: "refuted", limit: 10 }).every((r) => r.status === "refuted"));
+
+  // text search over title/location
+  assert.equal(db.countFindings(projectId, { search: "gadget" }), 120);
+  assert.equal(db.countFindings(projectId, { search: "src/c.rs:7" }), 11); // :7, :70..:79
+  db.close();
+});
+
 test("store: confirm decisions are replaced per run, not duplicated", async () => {
   const db = await tempDb();
   const projectId = db.upsertProject({ name: "p" });
