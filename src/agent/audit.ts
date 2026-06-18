@@ -775,10 +775,19 @@ function toRankedFinding(finding: AgentFinding): RankedFinding {
 
 function resolveScopeNote(cfg: AuditorConfig): string {
   const parts: string[] = [];
+  const pc = cfg.projectContext;
   if (cfg.auditScopeNote) parts.push(cfg.auditScopeNote);
-  if (cfg.projectContext.summary) parts.push(cfg.projectContext.summary);
-  if (cfg.projectContext.focusAreas?.length) parts.push(`Focus areas: ${cfg.projectContext.focusAreas.join("; ")}`);
-  if (cfg.projectContext.outOfScope?.length) parts.push(`Out of scope: ${cfg.projectContext.outOfScope.join("; ")}`);
+  if (pc.summary) parts.push(pc.summary);
+  // The richer projectContext fields are scaffold-only no longer: an opted-in `--config`
+  // profile (off by default) gets its whole threat model — assets, attacker model, and
+  // especially TRUST BOUNDARIES — woven into the scope note, not just summary/focus/scope.
+  if (pc.criticalAssets?.length) parts.push(`Critical assets: ${pc.criticalAssets.join("; ")}`);
+  if (pc.attackerCapabilities?.length) parts.push(`Attacker capabilities: ${pc.attackerCapabilities.join("; ")}`);
+  if (pc.trustBoundaries?.length) parts.push(`Trust boundaries: ${pc.trustBoundaries.join("; ")}`);
+  if (pc.securityInvariants?.length) parts.push(`Security invariants: ${pc.securityInvariants.join("; ")}`);
+  if (pc.focusAreas?.length) parts.push(`Focus areas: ${pc.focusAreas.join("; ")}`);
+  if (pc.scenarioGuidance?.length) parts.push(`Scenario guidance: ${pc.scenarioGuidance.join("; ")}`);
+  if (pc.outOfScope?.length) parts.push(`Out of scope: ${pc.outOfScope.join("; ")}`);
   return parts.join("\n");
 }
 

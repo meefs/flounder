@@ -37,9 +37,11 @@
       "signature or cross-chain message to domain, nonce, deadline, chain id, and target contract binding",
       "DAO proposal lifecycle to vote accounting, quorum or threshold checks, validator review, and final execution effects",
       "user-signed bridge limits and route fields to quote results, final send parameters, and settlement receipts",
-      "proxy admin or initializer path to implementation code and storage layout"
+      "proxy admin or initializer path to implementation code and storage layout",
+      "on-chain proof/verifier acceptance (a verifier or precompile staticcall returning success) to whether the off-chain circuit or verification key actually constrains the claimed statement — a validity/zk-proof consumer trusts the proof to guarantee e.g. a withdrawal is backed by a burned note, a settled tx-count matches what was proven, or public inputs bind real private state, yet the contract cannot itself verify the circuit enforces any of this"
     ],
     "securityInvariants": [
+      "A contract that delegates a security check to an external proof, verifier, oracle, or implementation must treat that component's guarantee as an assumption to state, not a fact to rely on — flag the boundary even when the in-scope code uses the component correctly.",
       "Asset movement, share minting, debt changes, rewards, and fee accrual must conserve value under nonstandard ERC20 behavior and rounding boundaries.",
       "Every privileged, upgrade, pause, rescue, keeper, and governance path must enforce the intended caller and lifecycle boundary at the point of mutation.",
       "External calls must not allow callbacks to observe or mutate inconsistent accounting state.",
