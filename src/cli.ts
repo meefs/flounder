@@ -7,10 +7,6 @@ import { defaultConfig, normalizeProjectContext, normalizeRoleModels, type Audit
 import { CLI_CONFIG_KEYS, configFilePath, getCliConfigValue, isCliConfigKey, loadCliConfig, setCliConfigValue, unsetCliConfigValue, type CliConfigKey } from "./config-file.js";
 import { launchViaApi, resolveServer } from "./cli-client.js";
 import type { LaunchSpec } from "./server/run-manager.js";
-import { runAudit } from "./agent/audit.js";
-import { runConfirm } from "./agent/confirm.js";
-import { runPrepare } from "./agent/acquire.js";
-import { MockAuditLlmClient } from "./llm/mock.js";
 import { importRunToProjectHistory, projectHistoryManifestPath } from "./trace/history.js";
 import { MetadataStore } from "./db/store.js";
 import { startUiServer } from "./server/app.js";
@@ -79,37 +75,19 @@ async function main(argv: string[]): Promise<void> {
   if (cmd === "run" || cmd === "map" || cmd === "audit") {
     const { cfg } = await parseConfig(rest);
     if (cfg.sourcePaths.length === 0) throw new Error("--source <paths...> is required");
-    // `audit --verify <file>` reads a LOCAL findings file, so it always runs in-process (the
-    // file can't travel to a remote daemon). --local / --mock-llm also force in-process.
-    const verify = cmd === "audit" && readFlag(rest, "--verify") !== undefined;
-    if (isLocalMode(rest) || verify) {
-      if (cfg.dryRun) throw new Error("agentic mode cannot run in --dry-run; use the mock model with --mock-llm for offline checks");
-      applyAuditPosture(cmd, rest, cfg);
-      // Sealed audit verbs default to UNBOUNDED step budgets (like `flounder confirm`): a real
-      // audit's decisive obligation can surface late, and a fixed budget silently truncates
-      // it. The model finishes early by emitting done; the budget is only a ceiling. Pass
-      // --max-steps / --map-steps / --dig-steps to cap a phase.
-      if (readIntFlag(rest, "--max-steps") === undefined) cfg.auditMaxSteps = Number.POSITIVE_INFINITY;
-      if (readIntFlag(rest, "--map-steps") === undefined) cfg.auditMapSteps = Number.POSITIVE_INFINITY;
-      if (readIntFlag(rest, "--dig-steps") === undefined) cfg.auditDigSteps = Number.POSITIVE_INFINITY;
-      const result = await runAudit(cfg, {
-        streamEvents: true,
-        kind: cmd as "run" | "map" | "audit",
-        ...(hasFlag(rest, "--mock-llm") ? { llm: new MockAuditLlmClient() } : {}),
-      });
-      printCoverage(result.runDir, result.summary.coverage);
-      console.log(`[report] ${result.runDir}/audit_report.md  ← consolidated results (findings, hypotheses, scope coverage)`);
-      if (result.scopeCoverage) {
-        const { total, audited, pending } = result.scopeCoverage;
-        console.log(`[scopes] audited ${audited}/${total}` + (pending > 0 ? `, ${pending} pending — \`flounder audit\` again for the next batch (or --remap to re-enumerate).` : " — inventory fully audited."));
-      }
-      return;
+    if (cfg.dryRun) throw new Error("agentic mode has no --dry-run; use --mock-llm for an offline check (or `npm run mock-audit`)");
+    // The CLI is a pure thin client: build the launch spec and enqueue it on the control plane,
+    // which dispatches it to a daemon that executes and streams it back — so every CLI run is
+    // tracked and visible in the UI exactly like a UI-launched one. No in-process path. No
+    // control plane reachable → a clear error (we never auto-spawn one).
+    const spec = buildAuditSpec(cmd, rest, cfg);
+    // `audit --verify <file>`: read the LOCAL findings file and carry its CONTENTS in the spec
+    // (not a path — the daemon may be on another machine), so verify is a control-plane run too.
+    if (cmd === "audit") {
+      const verifyFile = readFlag(rest, "--verify");
+      if (verifyFile !== undefined) spec.verifyFindings = JSON.parse(await readFile(verifyFile, "utf8"));
     }
-    // Default: the CLI is a thin client. Build the launch spec and enqueue it on the control
-    // plane, which dispatches it to a daemon and streams it back here — so this run is tracked
-    // and visible in the UI like any other. No control plane reachable → a clear error (we
-    // never auto-spawn one); add --local to run in-process instead.
-    const ok = await launchViaApi(resolveServer(readFlag(rest, "--server")), buildAuditSpec(cmd, rest, cfg));
+    const ok = await launchViaApi(resolveServer(readFlag(rest, "--server")), spec);
     if (!ok) process.exitCode = 1;
     return;
   }
@@ -128,18 +106,6 @@ async function main(argv: string[]): Promise<void> {
     // Name the staged project after the clue when --target wasn't given, so each prepare is its
     // own UI project rather than colliding on the default "target".
     if (cfg.targetName === "target") cfg.targetName = `prepare-${slugifyClue(clue)}`;
-    if (isLocalMode(rest)) {
-      const result = await runPrepare(cfg, { clue, posture, matchDeployed, ...(endpoint !== undefined ? { endpoint } : {}), ...(maxSteps !== undefined ? { maxSteps } : {}), streamEvents: true });
-      console.log(`[prepare dir] ${result.workspaceDir}  ← staged, deployment-matched source (next: flounder map --source <this dir> --target <name>)`);
-      console.log(`[manifest] ${result.runDir}/prepare_manifest.json  ← provenance: components, deployment-match, posture, gaps`);
-      const v = result.validation;
-      console.log(`[scope] ${v.components} components — matched:${v.matched} unverified:${v.unverified} source-pinned(no deployment):${v.sourcePinned}`);
-      if (v.issues.length > 0) {
-        console.log(`[constraint issues] ${v.issues.length} (two-tier routing):`);
-        for (const issue of v.issues) console.log(`  - ${issue}`);
-      }
-      return;
-    }
     const spec: LaunchSpec = { verb: "prepare", target: cfg.targetName, sourcePaths: [], provider: cfg.provider, model: cfg.auditModel, thinking: cfg.thinkingLevel, clue, posture, matchDeployed, out: cfg.outputDir };
     if (endpoint !== undefined) spec.endpoint = endpoint;
     if (maxSteps !== undefined) spec.maxSteps = maxSteps;
@@ -161,13 +127,6 @@ async function main(argv: string[]): Promise<void> {
     // It auto-RESUMES a prior interrupted confirm of the same run dir (carries settled rows forward); --fresh ignores that.
     const maxSteps = readIntFlag(rest, "--max-steps");
     const fresh = rest.includes("--fresh");
-    if (isLocalMode(rest)) {
-      const result = await runConfirm(cfg, { inputRunDir, ...(maxSteps !== undefined ? { maxSteps } : {}), ...(fresh ? { fresh: true } : {}), streamEvents: true });
-      console.log(`[confirm dir] ${result.runDir}`);
-      console.log(`[report] ${result.runDir}/confirm_report.md  ← decision sheet (distinct bugs, reproduced?, novelty, recommendation)`);
-      console.log(`[provenance] ${result.runDir}/confirm_provenance.json  ← fingerprints of the findings frozen before any network access`);
-      return;
-    }
     const spec: LaunchSpec = { verb: "confirm", target: cfg.targetName, sourcePaths: cfg.sourcePaths, corpusPaths: cfg.corpusPaths, provider: cfg.provider, model: cfg.auditModel, thinking: cfg.thinkingLevel, inputRunDir, out: cfg.outputDir };
     if (cfg.buildRoot) spec.buildRoot = cfg.buildRoot;
     if (fresh) spec.fresh = true;
@@ -230,42 +189,6 @@ async function parseConfig(args: string[]): Promise<{ cfg: AuditorConfig }> {
     cfg.thinkingLevel = thinking;
   }
   return { cfg };
-}
-
-/** Map a sealed agentic verb (run/map/audit) + its args to the runAudit posture flags. */
-function applyAuditPosture(cmd: string, rest: string[], cfg: AuditorConfig): void {
-  if (cmd === "map") {
-    // Enumerate + persist the scope inventory only; no dig.
-    cfg.auditDeep = true;
-    cfg.auditMapOnly = true;
-    return;
-  }
-  if (cmd === "audit") {
-    // The dig stage. `audit --verify <file>` confirms given claims; `audit <region>`
-    // deep-audits a pinned region; `audit [--scope id,...]` digs the existing inventory
-    // (which requires a prior `flounder map`).
-    const verifyFile = readFlag(rest, "--verify");
-    if (verifyFile !== undefined) {
-      cfg.auditVerify = verifyFile;
-      return;
-    }
-    const region = rest[0] && !rest[0].startsWith("--") ? rest[0] : undefined;
-    if (region) {
-      cfg.auditDeep = true;
-      cfg.auditDeepFocus = region;
-      return;
-    }
-    cfg.auditDeep = true;
-    cfg.auditRequireInventory = true; // dig the existing inventory; never auto-map here
-    const scopeSel = readFlag(rest, "--scope");
-    if (scopeSel) {
-      const ids = scopeSel.split(",").map((id) => id.trim()).filter(Boolean);
-      if (ids.length > 0) cfg.auditScopeIds = ids;
-    }
-    return;
-  }
-  // cmd === "run": map -> audit one-stop, unless --quick (a single breadth pass).
-  if (!rest.includes("--quick")) cfg.auditDeep = true;
 }
 
 function applyConfigOverrides(cfg: AuditorConfig, raw: Record<string, unknown>): void {
@@ -353,20 +276,10 @@ function spawnLocalDaemon(opts: { out: string; url: string; workspace?: string; 
   });
 }
 
-function hasFlag(args: string[], name: string): boolean {
-  return args.includes(name);
-}
-
 /** Resolve --out: flag > persisted config `out` > "runs". Keeps the tracking-store location
  * consistent across the CLI, the control plane, and the daemon when set once via config. */
 function resolveOut(args: string[]): string {
   return readFlag(args, "--out") ?? loadCliConfig().values.out ?? "runs";
-}
-
-/** In-process execution instead of the thin-client path: the offline mock, or an explicit --local
- * (a real run with no control plane). Everything else enqueues on the control plane. */
-function isLocalMode(args: string[]): boolean {
-  return args.includes("--local") || args.includes("--mock-llm");
 }
 
 /** Build the launch spec for a sealed audit verb (run/map/audit). Materials come from cfg
@@ -386,6 +299,7 @@ function buildAuditSpec(cmd: "run" | "map" | "audit", rest: string[], cfg: Audit
   if (cfg.buildRoot) spec.buildRoot = cfg.buildRoot;
   if (cmd === "run" && rest.includes("--quick")) spec.quick = true;
   if (rest.includes("--remap")) spec.remap = true;
+  if (rest.includes("--mock-llm")) spec.mockLlm = true; // offline mock model, executed by the daemon
   if (cmd === "audit") {
     const region = rest[0] && !rest[0].startsWith("--") ? rest[0] : undefined;
     if (region) spec.region = region;
@@ -435,14 +349,6 @@ function readMultiFlag(args: string[], name: string): string[] {
     out.push(value);
   }
   return out;
-}
-
-function printCoverage(runDir: string, coverage: { itemsTotal: number; itemsWithFinding: number; bySeverity: Record<string, number>; itemsNeedingRetry?: number; needsMoreContextTrials?: number; unverifiedFindings?: number }): void {
-  console.log(`[run dir] ${runDir}`);
-  console.log(`[coverage] findings=${coverage.itemsWithFinding}/${coverage.itemsTotal} by_severity=${JSON.stringify(coverage.bySeverity)}`);
-  if ((coverage.itemsNeedingRetry ?? 0) > 0 || (coverage.needsMoreContextTrials ?? 0) > 0 || (coverage.unverifiedFindings ?? 0) > 0) {
-    console.log(`[quality] retry_items=${coverage.itemsNeedingRetry ?? 0} needs_more_context_trials=${coverage.needsMoreContextTrials ?? 0} unverified_findings=${coverage.unverifiedFindings ?? 0}`);
-  }
 }
 
 async function runHistoryCommand(args: string[]): Promise<void> {
@@ -635,8 +541,10 @@ How CLI runs execute (the API is the single entry point):
   launch spec, POSTs it (so the run is tracked + visible in the UI exactly like a UI-launched one),
   and streams the daemon's live log back here. The endpoint resolves --server > FLOUNDER_SERVER >
   config 'server' > http://127.0.0.1:4500. If no control plane is reachable the CLI says so and
-  asks you to start one (flounder ui) — it never auto-spawns a server you can't see. Add --local to
-  run in-process with no control plane (a real run; --mock-llm implies it). Ctrl-C stops the run.
+  asks you to start one (flounder ui) — it never auto-spawns a server you can't see, and there is
+  no in-process path: the CLI does exactly what the UI does. Ctrl-C stops the run. (For an offline
+  check with no server, run the regression harness 'npm run mock-audit', which calls the library
+  directly.)
 
 Sealed vs open world:
   run / map / audit are NETWORK-SEALED — the model finds and proves bugs blind, with no
@@ -665,8 +573,7 @@ Shared options:
   --prepare-timeout-ms <n>  per-command timeout for the warm-up, default 600000
   --no-refute / --no-appeal  skip the independent-refutation / one-appeal passes on confirmed findings
   --server <url>          control plane the CLI drives (default --server > FLOUNDER_SERVER > config 'server' > http://127.0.0.1:4500)
-  --local                 run in-process with no control plane (a real run; the run still records to <out>/flounder.db)
-  --mock-llm              use the deterministic mock model (offline; implies --local)
+  --mock-llm              run with the deterministic mock model (no provider needed); the daemon executes it like any run
 
 run / map / audit deep-phase options:
   --quick                 run only: a single breadth pass instead of map -> audit

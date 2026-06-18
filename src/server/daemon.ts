@@ -5,6 +5,8 @@
 // the server — the server owns the DB; the daemon never touches it.
 
 import path from "node:path";
+import os from "node:os";
+import { writeFile } from "node:fs/promises";
 import { runAudit } from "../agent/audit.js";
 import { runConfirm } from "../agent/confirm.js";
 import { runPrepare } from "../agent/acquire.js";
@@ -76,6 +78,12 @@ export async function runDaemon(opts: DaemonOptions): Promise<void> {
           ...(spec.maxSteps !== undefined ? { maxSteps: spec.maxSteps } : {}),
         });
       } else {
+        if (spec.verb === "audit" && spec.verifyFindings !== undefined) {
+          // verify posture: write the inline findings to a temp file the kernel's verify path reads.
+          const vf = path.join(os.tmpdir(), `flounder-verify-${job.id}.json`);
+          await writeFile(vf, JSON.stringify(spec.verifyFindings), "utf8");
+          cfg.auditVerify = vf;
+        }
         await runAudit(cfg, { kind: spec.verb, signal: abort.signal, makeTracker, onActivity: sink.push, ...(spec.mockLlm ? { llm: new MockAuditLlmClient() } : {}) });
       }
       sink.flush();

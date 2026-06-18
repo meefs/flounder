@@ -220,6 +220,11 @@ function printRunSummary(run: Record<string, unknown> | undefined): void {
   const badge = status === "done" ? "✓ done" : status === "killed" ? "■ stopped" : "✗ error";
   console.log(`[${badge}] run #${run.id} (${String(run.kind)})`);
   if (run.run_dir) console.log(`[run dir] ${String(run.run_dir)}`);
+  if (String(run.kind) === "prepare" && run.run_dir) {
+    // The acquisition stages source under the run dir; that becomes the sealed audit's --source.
+    console.log(`[staged source] ${String(run.run_dir)}/prepare/workspace  ← next: flounder run --source <this> --target <name>`);
+    console.log(`[manifest] ${String(run.run_dir)}/prepare_manifest.json  ← provenance: components, deployment-match, posture, gaps`);
+  }
   if (run.findings_total != null) console.log(`[findings] ${String(run.findings_total)}`);
   if (run.scopes_total != null) console.log(`[scopes] ${run.scopes_audited ?? "-"}/${String(run.scopes_total)}`);
 }

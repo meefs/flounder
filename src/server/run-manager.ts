@@ -57,6 +57,7 @@ export interface LaunchSpec {
   inputRunDir?: string | undefined; // confirm: the finished run dir to reproduce
   region?: string | undefined; // audit: a pinned region
   scope?: string | undefined; // audit: scope id[,id...]
+  verifyFindings?: unknown; // audit: inline suspected finding(s) to confirm-or-refute (the --verify file's contents, carried inline so a remote daemon needs no local file)
   quick?: boolean | undefined; // run: a single breadth pass instead of map -> audit
   mockLlm?: boolean | undefined; // run with the deterministic offline model (no provider needed)
   clue?: string | undefined; // prepare: the tx / address / project / repo / link to acquire from
@@ -100,13 +101,18 @@ export function specToConfig(spec: LaunchSpec, out: string, workspace?: string):
     cfg.auditDeep = true;
     cfg.auditMapOnly = true;
   } else if (spec.verb === "audit") {
-    cfg.auditDeep = true;
-    if (spec.region) {
-      cfg.auditDeepFocus = spec.region;
+    if (spec.verifyFindings !== undefined) {
+      // verify posture: confirm-or-refute given claims by execution. The daemon materializes the
+      // findings to a temp file and sets auditVerify; no map/dig enumeration (auditDeep stays off).
     } else {
-      cfg.auditRequireInventory = true; // dig the existing inventory; never auto-map here
-      const ids = (spec.scope ?? "").split(",").map((s) => s.trim()).filter(Boolean);
-      if (ids.length > 0) cfg.auditScopeIds = ids;
+      cfg.auditDeep = true;
+      if (spec.region) {
+        cfg.auditDeepFocus = spec.region;
+      } else {
+        cfg.auditRequireInventory = true; // dig the existing inventory; never auto-map here
+        const ids = (spec.scope ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+        if (ids.length > 0) cfg.auditScopeIds = ids;
+      }
     }
   } else if (!spec.quick) {
     cfg.auditDeep = true; // run = map -> dig, unless --quick (breadth)
@@ -148,6 +154,7 @@ export function buildArgs(spec: LaunchSpec): string[] {
   if (spec.model) args.push("--model", spec.model);
   if (spec.thinking) args.push("--thinking", spec.thinking);
   if (spec.verb === "audit" && spec.scope) args.push("--scope", spec.scope);
+  if (spec.verb === "audit" && spec.verifyFindings !== undefined) args.push("--verify", "<inline-findings>");
   if (spec.maxScopes !== undefined) args.push("--max-scopes", String(spec.maxScopes));
   if (spec.mapSteps !== undefined) args.push("--map-steps", String(spec.mapSteps));
   if (spec.digSteps !== undefined) args.push("--dig-steps", String(spec.digSteps));
