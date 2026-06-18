@@ -27,10 +27,12 @@ export type FindingStatus = "suspected" | "confirmed-executable" | "confirmed-di
 
 export interface ProjectInput {
   name: string;
-  sourcePaths?: string[] | undefined;
-  buildRoot?: string | undefined;
-  corpusPaths?: string[] | undefined;
-  config?: unknown; // model/provider/thinking/budgets/max_scopes snapshot the UI can edit
+  sourcePaths?: string[] | undefined; // relative to the project dir
+  buildRoot?: string | undefined; // relative to the project dir
+  corpusPaths?: string[] | undefined; // relative to the project dir
+  config?: unknown; // budgets/max_scopes snapshot the UI can edit (provider/model/thinking now live on the provider profile)
+  providerId?: number | undefined; // selected provider profile
+  dir?: string | undefined; // project subdir under the daemon workspace (default = name)
 }
 
 export interface RunInput {
@@ -123,10 +125,12 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS project(
   id INTEGER PRIMARY KEY,
   name TEXT UNIQUE NOT NULL,
-  source_paths TEXT,
-  build_root TEXT,
-  corpus_paths TEXT,
-  config_json TEXT,
+  source_paths TEXT,              -- now RELATIVE to the project dir (was absolute)
+  build_root TEXT,                -- relative to the project dir
+  corpus_paths TEXT,              -- relative to the project dir
+  config_json TEXT,               -- budgets only now (provider/model/thinking moved to provider profiles)
+  provider_id INTEGER,            -- selected provider profile (plain ref; nulled if the profile is deleted)
+  dir TEXT,                       -- project subdir relative to the daemon's workspace root (default = name)
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -210,6 +214,7 @@ CREATE TABLE IF NOT EXISTS daemon(
   name TEXT NOT NULL,
   token TEXT UNIQUE NOT NULL,
   capabilities TEXT,
+  workspace TEXT,                 -- the daemon's workspace root (it resolves project dirs under this)
   last_seen_at TEXT,
   created_at TEXT NOT NULL
 );
@@ -259,6 +264,19 @@ export class MetadataStore {
     this.db.exec("PRAGMA busy_timeout = 5000");
     this.db.exec("PRAGMA foreign_keys = ON");
     this.db.exec(SCHEMA);
+    // Additive migrations for DBs created before these columns existed (CREATE IF NOT EXISTS
+    // won't add them). Each is a no-op if the column is already present.
+    for (const alter of [
+      "ALTER TABLE project ADD COLUMN provider_id INTEGER",
+      "ALTER TABLE project ADD COLUMN dir TEXT",
+      "ALTER TABLE daemon ADD COLUMN workspace TEXT",
+    ]) {
+      try {
+        this.db.exec(alter);
+      } catch {
+        // column already exists
+      }
+    }
     this.db.prepare("INSERT INTO meta(key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO NOTHING").run(String(SCHEMA_VERSION));
   }
 
@@ -278,13 +296,17 @@ export class MetadataStore {
     const ts = now();
     this.db
       .prepare(
-        `INSERT INTO project(name, source_paths, build_root, corpus_paths, config_json, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO project(name, source_paths, build_root, corpus_paths, config_json, provider_id, dir, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(name) DO UPDATE SET
            source_paths = excluded.source_paths,
            build_root   = excluded.build_root,
            corpus_paths = excluded.corpus_paths,
            config_json  = excluded.config_json,
+           -- provider_id / dir are COALESCE-preserved: a run (which upserts with only name+config)
+           -- must not wipe the selection the UI made.
+           provider_id  = COALESCE(excluded.provider_id, project.provider_id),
+           dir          = COALESCE(excluded.dir, project.dir),
            updated_at   = excluded.updated_at`,
       )
       .run(
@@ -293,6 +315,8 @@ export class MetadataStore {
         input.buildRoot ?? null,
         jsonOrNull(input.corpusPaths),
         jsonOrNull(input.config),
+        input.providerId ?? null,
+        input.dir ?? null,
         ts,
         ts,
       );
@@ -588,14 +612,14 @@ export class MetadataStore {
     return this.db.prepare("SELECT * FROM daemon WHERE token = ?").get(token) as Record<string, unknown> | undefined;
   }
 
-  touchDaemon(id: number, capabilities?: unknown): void {
+  touchDaemon(id: number, capabilities?: unknown, workspace?: string): void {
     this.db
-      .prepare("UPDATE daemon SET last_seen_at = ?, capabilities = COALESCE(?, capabilities) WHERE id = ?")
-      .run(now(), capabilities !== undefined ? JSON.stringify(capabilities) : null, id);
+      .prepare("UPDATE daemon SET last_seen_at = ?, capabilities = COALESCE(?, capabilities), workspace = COALESCE(?, workspace) WHERE id = ?")
+      .run(now(), capabilities !== undefined ? JSON.stringify(capabilities) : null, workspace ?? null, id);
   }
 
   listDaemons(): Array<Record<string, unknown>> {
-    return this.db.prepare("SELECT id, name, capabilities, last_seen_at, created_at FROM daemon ORDER BY created_at").all() as Array<Record<string, unknown>>;
+    return this.db.prepare("SELECT id, name, capabilities, workspace, last_seen_at, created_at FROM daemon ORDER BY created_at").all() as Array<Record<string, unknown>>;
   }
 
   enqueueJob(project: string, spec: unknown): number {
@@ -682,7 +706,13 @@ export class MetadataStore {
   }
 
   deleteProvider(id: number): boolean {
-    return Number(this.db.prepare("DELETE FROM provider WHERE id = ?").run(id).changes) > 0;
+    let removed = false;
+    this.transaction(() => {
+      // drop the dangling selection on any project that referenced this profile, then delete
+      this.db.prepare("UPDATE project SET provider_id = NULL WHERE provider_id = ?").run(id);
+      removed = Number(this.db.prepare("DELETE FROM provider WHERE id = ?").run(id).changes) > 0;
+    });
+    return removed;
   }
 
   private getProviderRow(id: number): Record<string, unknown> | undefined {
