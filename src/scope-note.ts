@@ -40,7 +40,7 @@ export function deriveScopeNote(manifest: unknown): string | undefined {
   ];
   if (deps.length > 0) {
     parts.push(
-      "DEPENDENCIES / TRUST BOUNDARIES — staged in the workspace and you MAY read them, but they are NOT the primary target. Audit only the TARGET's USE of them (an unchecked return value, a wrong assumption about their behaviour, a missing bound on what they return); do NOT spend the budget enumerating their internal obligations unless the target's usage of them looks suspect:\n" +
+      "DEPENDENCIES / TRUST BOUNDARIES — staged in the workspace and fully readable, but not the primary target. Start from the TARGET's USE of them (an unchecked return value, a wrong assumption about their behaviour, a missing bound on what they return), and follow the trail INTO a dependency whenever the target relies on a property the dependency does not itself enforce — a forked or modified library, or any dep the target's safety hinges on, is fair game to audit in depth. The only thing to avoid is spending the bulk of the budget auditing well-known third-party code for its own sake; concentrate it on the in-scope target:\n" +
         deps.map((s) => "- " + s).join("\n"),
     );
   }

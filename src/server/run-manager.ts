@@ -87,7 +87,6 @@ export function specToConfig(spec: LaunchSpec, out: string, workspace?: string):
   if (spec.model) cfg.auditModel = spec.model;
   if (spec.thinking && THINKING.has(spec.thinking)) cfg.thinkingLevel = spec.thinking as AuditorConfig["thinkingLevel"];
   if (spec.models) cfg.models = spec.models as NonNullable<AuditorConfig["models"]>;
-  if (spec.scopeNote && spec.scopeNote.trim()) cfg.auditScopeNote = spec.scopeNote.trim(); // map/audit focus prior (from prepare's manifest or --scope-note)
   cfg.outputDir = out;
   cfg.auditMaxSteps = spec.maxSteps ?? Number.POSITIVE_INFINITY;
   cfg.auditMapSteps = spec.mapSteps ?? Number.POSITIVE_INFINITY;
@@ -99,6 +98,9 @@ export function specToConfig(spec: LaunchSpec, out: string, workspace?: string):
   // prepare + confirm derive their own posture from their options (clue / prior run), not from
   // the sealed audit's map/dig flags — return the base cfg (provider/model/out/target) as-is.
   if (spec.verb === "prepare" || spec.verb === "confirm") return cfg;
+  // The scope-focus prior only applies to the map/dig phases (prepare/confirm returned above and
+  // don't consume it). From prepare's manifest or --scope-note.
+  if (spec.scopeNote && spec.scopeNote.trim()) cfg.auditScopeNote = spec.scopeNote.trim();
   if (spec.verb === "map") {
     cfg.auditDeep = true;
     cfg.auditMapOnly = true;
