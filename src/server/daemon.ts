@@ -57,7 +57,7 @@ export async function runDaemon(opts: DaemonOptions): Promise<void> {
     let tracker: RemoteTracker | undefined;
     const sink = activitySink(() => tracker);
     const makeTracker = (cfg: AuditorConfig, runDir: string, kind: string): RunTracker => {
-      tracker = new RemoteTracker(base, headers, { jobId: job.id, project: cfg.targetName, kind, runDir, provider: cfg.provider, model: cfg.auditModel, thinking: cfg.thinkingLevel, budgets: configSnapshot(cfg) });
+      tracker = new RemoteTracker(base, headers, { jobId: job.id, project: cfg.targetName, kind, runDir, provider: cfg.provider, model: cfg.auditModel, thinking: cfg.thinkingLevel, budgets: cfg.auditVerify ? { ...configSnapshot(cfg), verify: true } : configSnapshot(cfg) });
       return tracker;
     };
     try {

@@ -3,7 +3,7 @@ import type { LlmClient } from "../types.js";
 import type { RunLogger } from "../trace/logger.js";
 import { extractJsonArray, extractJsonObject } from "../util/json.js";
 import { buildConfirmKickoff, buildDeepKickoff, buildAuditKickoff, buildMapKickoff, buildVerifyKickoff, AUDIT_CONFIRM_SYSTEM, AUDIT_DEEP_SYSTEM, AUDIT_SYSTEM, AUDIT_VERIFY_SYSTEM, MAP_SYSTEM, renderTranscript, type TranscriptStep } from "./prompts.js";
-import type { AgentTool, ToolContext } from "./tools.js";
+import { describeAction, type AgentTool, type ToolContext } from "./tools.js";
 
 // Provider-agnostic ReAct driver. It runs on top of the plain text-in/text-out
 // LlmClient.complete, so it works identically for pi-ai, the CLI fallbacks, and
@@ -203,7 +203,8 @@ export async function runAuditLoop(input: {
       observation = `error: tool "${action.tool}" failed: ${error instanceof Error ? error.message : String(error)}`;
     }
     steps.push({ n, thought: action.thought, tool: action.tool, args: action.args, observation });
-    await input.logger.event("audit_step", { step: n, tool: action.tool });
+    const a = describeAction(action.tool, action.args, observation);
+    await input.logger.event("audit_action", { step: n, tool: action.tool, detail: a.detail, ok: a.ok, result: a.result });
 
     if (input.ctx.session.finished) {
       await finalizeFindings();

@@ -64,6 +64,17 @@ export interface FindingRow {
   status: FindingStatus;
   reportPath?: string | undefined;
   scopeId?: string | undefined;
+  // The rich content the kernel produces (previously only in the run dir's audit_hypotheses /
+  // audit_findings artifacts). Persisted so findings are self-contained in the DB — the UI shows
+  // full detail and the verify/confirm pipeline feeds on them without scraping run dirs.
+  description?: string | undefined;
+  evidence?: string | undefined;
+  exploitSketch?: string | undefined;
+  fix?: string | undefined;
+  confidence?: number | undefined;
+  // VERIFY: the DB id of the original suspected finding this row's verdict resolves. When set,
+  // upsertFindings UPDATES that existing row in place (cross-run) instead of inserting a new one.
+  originId?: number | undefined;
 }
 
 export interface ConfirmRow {
@@ -187,6 +198,11 @@ CREATE TABLE IF NOT EXISTS finding(
   confirm_status TEXT,            -- per-finding real-target confirm state: NULL=not confirmed yet | confirming | reproduced | not-reproduced
   report_path TEXT,
   scope_id TEXT,
+  description TEXT,               -- the kernel's rich finding content (was only in run-dir artifacts)
+  evidence TEXT,
+  exploit_sketch TEXT,
+  fix TEXT,
+  confidence REAL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE(run_id, finding_key)
@@ -285,6 +301,11 @@ export class MetadataStore {
       "ALTER TABLE scope ADD COLUMN priority INTEGER DEFAULT 0", // manual dig-queue ordering, separate from score
       "ALTER TABLE finding ADD COLUMN tracking_status TEXT", // submission tracking: open|triaging|submitted|accepted|fixed|duplicate|rejected
       "ALTER TABLE finding ADD COLUMN confirm_status TEXT", // per-finding real-target confirm state
+      "ALTER TABLE finding ADD COLUMN description TEXT", // rich finding content, previously only in run-dir artifacts
+      "ALTER TABLE finding ADD COLUMN evidence TEXT",
+      "ALTER TABLE finding ADD COLUMN exploit_sketch TEXT",
+      "ALTER TABLE finding ADD COLUMN fix TEXT",
+      "ALTER TABLE finding ADD COLUMN confidence REAL",
     ]) {
       try {
         this.db.exec(alter);
@@ -552,24 +573,52 @@ export class MetadataStore {
   upsertFindings(projectId: number, runId: number, findings: FindingRow[], reason?: string): void {
     this.transaction(() => {
       for (const f of findings) {
+        const ts = now();
+        // VERIFY verdict: flip the ORIGINAL suspected finding in place (cross-run). The link is
+        // carried (originId = that finding's DB id), so a verify session that renamed the title still
+        // updates the right row — status + the PoC writeup — instead of inserting a duplicate.
+        if (f.originId != null) {
+          const orig = this.db.prepare("SELECT id, status FROM finding WHERE id = ?").get(f.originId) as { id: number; status: string } | undefined;
+          if (orig) {
+            this.db
+              .prepare(
+                `UPDATE finding SET status = ?, report_path = COALESCE(?, report_path),
+                   description = COALESCE(NULLIF(?, ''), description), evidence = COALESCE(NULLIF(?, ''), evidence),
+                   exploit_sketch = COALESCE(NULLIF(?, ''), exploit_sketch), fix = COALESCE(NULLIF(?, ''), fix),
+                   confidence = COALESCE(?, confidence), updated_at = ? WHERE id = ?`,
+              )
+              .run(f.status, f.reportPath ?? null, f.description ?? null, f.evidence ?? null, f.exploitSketch ?? null, f.fix ?? null, f.confidence ?? null, ts, orig.id);
+            if (orig.status !== f.status) this.recordStatusEvent(orig.id, orig.status, f.status, reason, runId, ts);
+            continue;
+          }
+          // stale origin id (the row was deleted) -> fall through and capture the verdict as its own row
+        }
         const existing = this.db
           .prepare("SELECT id, status FROM finding WHERE run_id = ? AND finding_key = ?")
           .get(runId, f.findingKey) as { id: number; status: string } | undefined;
-        const ts = now();
         if (!existing) {
           const info = this.db
             .prepare(
-              `INSERT INTO finding(project_id, run_id, finding_key, title, location, severity, status, report_path, scope_id, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              `INSERT INTO finding(project_id, run_id, finding_key, title, location, severity, status, report_path, scope_id, description, evidence, exploit_sketch, fix, confidence, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             )
-            .run(projectId, runId, f.findingKey, f.title ?? null, f.location ?? null, f.severity ?? null, f.status, f.reportPath ?? null, f.scopeId ?? null, ts, ts);
+            .run(projectId, runId, f.findingKey, f.title ?? null, f.location ?? null, f.severity ?? null, f.status, f.reportPath ?? null, f.scopeId ?? null, f.description ?? null, f.evidence ?? null, f.exploitSketch ?? null, f.fix ?? null, f.confidence ?? null, ts, ts);
           this.recordStatusEvent(Number(info.lastInsertRowid), null, f.status, reason, runId, ts);
         } else {
+          // COALESCE(NULLIF(?, ''), col): keep the stored content when a later re-persist (a status
+          // flip through differential / refutation / appeal) carries an empty value, so detail is
+          // never wiped — mirrors the dig_seconds keep-on-omit rule.
           this.db
             .prepare(
-              `UPDATE finding SET title = ?, location = ?, severity = ?, status = ?, report_path = ?, scope_id = ?, updated_at = ? WHERE id = ?`,
+              `UPDATE finding SET title = ?, location = ?, severity = ?, status = ?, report_path = ?, scope_id = ?,
+                 description = COALESCE(NULLIF(?, ''), description),
+                 evidence = COALESCE(NULLIF(?, ''), evidence),
+                 exploit_sketch = COALESCE(NULLIF(?, ''), exploit_sketch),
+                 fix = COALESCE(NULLIF(?, ''), fix),
+                 confidence = COALESCE(?, confidence),
+                 updated_at = ? WHERE id = ?`,
             )
-            .run(f.title ?? null, f.location ?? null, f.severity ?? null, f.status, f.reportPath ?? null, f.scopeId ?? null, ts, existing.id);
+            .run(f.title ?? null, f.location ?? null, f.severity ?? null, f.status, f.reportPath ?? null, f.scopeId ?? null, f.description ?? null, f.evidence ?? null, f.exploitSketch ?? null, f.fix ?? null, f.confidence ?? null, ts, existing.id);
           if (existing.status !== f.status) {
             this.recordStatusEvent(existing.id, existing.status, f.status, reason, runId, ts);
           }

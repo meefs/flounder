@@ -118,7 +118,7 @@ export async function runAudit(
   // per-step loop), specialized to a role's model and a mode (breadth/map/dig).
   const runPhase = async (
     phaseCfg: AuditorConfig,
-    opts: { mode: "breadth" | "map" | "dig" | "verify"; deepFocus?: string; verifySeed?: string; maxSteps: number },
+    opts: { mode: "breadth" | "map" | "dig" | "verify" | "synthesize"; deepFocus?: string; verifySeed?: string; synthSeed?: string; maxSteps: number },
     over?: { ctx: ToolContext; cwd: string },
   ): Promise<{ steps: TranscriptStep[]; stoppedReason: string }> => {
     const phaseCtx = over?.ctx ?? ctx;
@@ -128,6 +128,7 @@ export async function runAudit(
       ...(opts.mode === "map" ? { map: true } : {}),
       ...(opts.deepFocus ? { deepFocus: opts.deepFocus } : {}),
       ...(opts.verifySeed ? { verify: opts.verifySeed } : {}),
+      ...(opts.synthSeed ? { synthesize: opts.synthSeed } : {}),
     };
     if (!options.llm && isPiSessionProvider(phaseCfg.provider)) {
       return runAuditSession({
@@ -186,12 +187,22 @@ export async function runAudit(
     const verifyCfg = withRole(cfg, "dig");
     const aggregated: AgentFinding[] = [];
     const aggregatedSteps: TranscriptStep[] = [];
+    recorder.runScopes(0, toVerify.length); // surface "verifying 0/N" before the first verdict lands
     for (const [idx, finding] of toVerify.entries()) {
       clearScratchFindings(session);
       const phase = await runPhase(verifyCfg, { mode: "verify", verifySeed: buildVerifySeed(finding), maxSteps: cfg.auditDigSteps });
       aggregatedSteps.push(...phase.steps);
       ingestFindingsFromScratch(session);
+      // Carry the original suspected finding's identity onto THIS claim's verdict so it flips that
+      // row (status + PoC) rather than inserting a duplicate. The link is positional — claim N is
+      // seeded from input finding N — so it survives the verify session renaming the title. Only the
+      // primary verdict inherits it; any extra finding the session split out stays its own new row.
+      const originId = typeof finding.originId === "number" ? finding.originId : typeof finding.origin_id === "number" ? finding.origin_id : undefined;
+      const primaryVerdict = session.findings[0];
+      if (originId !== undefined && primaryVerdict) primaryVerdict.originId = originId;
       for (const produced of session.findings) aggregated.push(produced);
+      recorder.findings(session.findings, logger.runDir, `verify ${idx + 1}/${toVerify.length}`); // persist this verdict live (flips the original when originId is set)
+      recorder.runScopes(idx + 1, toVerify.length); // live progress for the UI
       await logger.event("audit_verify_done", { index: idx + 1, of: toVerify.length, claim: String(finding.title ?? "").slice(0, 90), produced: session.findings.length });
     }
     aggregated.forEach((produced, i) => {
@@ -387,6 +398,21 @@ export async function runAudit(
         recorder.scopes(scopeInventory);
         recorder.runScopes(++digDone, toDig.length);
       }
+    }
+    // G2 — cross-scope synthesis. Each per-scope dig saw ONE region in isolation, so a bug that
+    // exists only in the COMPOSITION of components (an input left unbound in one region that reaches
+    // a security-critical sink in another) is invisible to them. Run one sink-driven composition
+    // pass over the union of scopes + findings, then fold its chains into the finding set so they go
+    // through the same differential/refutation/finalize. General method, no per-target special case.
+    if (cfg.auditSynthesize !== false && scopeInventory.length > 1 && aggregated.length > 0 && !options.signal?.aborted) {
+      clearScratchFindings(session);
+      await logger.event("audit_synthesis_start", { scopes: scopeInventory.length, findings: aggregated.length });
+      const synthPhase = await runPhase(withRole(cfg, "dig"), { mode: "synthesize", synthSeed: buildSynthesisSeed(aggregated, scopeInventory), maxSteps: cfg.auditDigSteps });
+      aggregatedSteps.push(...synthPhase.steps);
+      ingestFindingsFromScratch(session);
+      for (const composed of session.findings) aggregated.push(composed);
+      await logger.event("audit_synthesis_done", { produced: session.findings.length });
+      recorder.findings(aggregated, logger.runDir, "synthesis");
     }
     // Each scope/dig session numbered its findings independently (f1, f2, …), so
     // aggregating across scopes collides. Re-id uniquely so every finding gets its
@@ -757,6 +783,32 @@ function buildVerifySeed(finding: Record<string, unknown>): string {
   const fixPatch = finding["fix_patch"] ?? finding["fixPatch"];
   if (fixPatch) lines.push(`Proposed fix_patch: ${JSON.stringify(fixPatch).slice(0, 800)}`);
   return lines.join("\n");
+}
+
+// Format the per-scope audit (scopes + findings) into the material the synthesis pass composes
+// across components: the scope inventory (candidate sinks / gates / inputs) and the findings
+// (especially the suspected unbound-input / missing-constraint ones — exactly the links that may
+// complete a cross-scope chain). Compact; leads to CHAIN, not ground truth.
+function buildSynthesisSeed(findings: AgentFinding[], scopes: AuditScope[]): string {
+  const scopeLines = [...scopes]
+    .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+    .slice(0, 50)
+    .map((s) => `- [${s.id}] ${s.obligation} @ ${s.region}`)
+    .join("\n");
+  const rank = (s: string): number => (s === "confirmed-differential" ? 0 : s === "confirmed-executable" ? 1 : s === "suspected" ? 2 : 3);
+  const findLines = [...findings]
+    .sort((a, b) => rank(a.confirmationStatus) - rank(b.confirmationStatus))
+    .slice(0, 80)
+    .map((f) => {
+      const lead = (f.exploitSketch || f.description || "").replace(/\s+/g, " ").slice(0, 180);
+      return `- (${f.confirmationStatus}) ${f.title} @ ${f.location}${lead ? ` — ${lead}` : ""}`;
+    })
+    .join("\n");
+  return `SCOPES (each a region + the obligation the per-scope dig checked there — candidate sinks, gates, and inputs):
+${scopeLines || "(none)"}
+
+PER-SCOPE FINDINGS (each found in ONE scope in isolation; a 'suspected unbound input' is exactly the kind of link that may complete a cross-scope chain to a sink):
+${findLines || "(none)"}`;
 }
 
 // Seed for the ONE appeal a refuted finding may make. Same claim the verify session

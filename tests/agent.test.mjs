@@ -456,6 +456,7 @@ test("map → dig: --deep enumerates scopes then deep-audits each, tagging findi
     cfg.corpusPaths = [fixtures];
     cfg.outputDir = path.join(dir, "runs");
     cfg.auditDeep = true; // map → dig flow (no pinned focus)
+    cfg.auditSynthesize = false; // this test pins the per-scope dig output; the synthesis pass is exercised elsewhere
     cfg.auditMapSteps = 6;
     cfg.auditDigSteps = 8;
     cfg.auditMaxScopes = 1; // audit only the top scope this run; the rest stay pending
@@ -490,6 +491,7 @@ test("map → dig --dig-concurrency audits scopes in parallel, isolated per-scop
     cfg.corpusPaths = [fixtures];
     cfg.outputDir = path.join(dir, "runs");
     cfg.auditDeep = true;
+    cfg.auditSynthesize = false; // pins the per-scope dig output; synthesis is a separate pass
     cfg.auditMapSteps = 6;
     cfg.auditDigSteps = 8;
     cfg.auditMaxScopes = 2;
@@ -637,6 +639,7 @@ test("map → dig: --dig-samples runs a scope K times and unions findings (recal
     cfg.corpusPaths = [fixtures];
     cfg.outputDir = path.join(dir, "runs");
     cfg.auditDeep = true;
+    cfg.auditSynthesize = false; // pins the per-scope dig output; synthesis is a separate pass
     cfg.auditMapSteps = 6;
     cfg.auditDigSteps = 8;
     cfg.auditMaxScopes = 1;

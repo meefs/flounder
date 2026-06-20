@@ -55,6 +55,11 @@ export interface AgentFinding {
   appeal?: { attempted: boolean; upheld: boolean; reason: string };
   /** The map-phase scope this finding came from (when the map → dig flow produced it). */
   scopeId?: string;
+  /** Provenance for the VERIFY posture: the DB id of the pre-existing suspected finding this
+   * verdict resolves. Carried from the --verify input so the verdict UPDATES that original row
+   * (flips its status + attaches the PoC) instead of being recorded as a new finding. The link is
+   * known by construction (claim N is seeded from input finding N), never re-matched by content. */
+  originId?: number;
 }
 
 export interface CommandRunRecord {
@@ -124,6 +129,22 @@ export interface AgentTool {
 
 export function buildTools(): AgentTool[] {
   return [readTool, writeTool, editTool, bashTool];
+}
+
+/** A one-line, human-readable summary of a tool call for the live activity feed: the actual
+ * command / file the agent acted on (not just the tool name) + whether it succeeded. Used by both
+ * session backends so the feed reads like a Codex transcript ("$ forge test …", "read Foo.sol:20-60")
+ * instead of "bash step 36". */
+export function describeAction(tool: string, args: Record<string, unknown>, observation?: string): { detail: string; ok: boolean; result: string } {
+  const s = (v: unknown): string => (v == null ? "" : String(v));
+  let detail = "";
+  if (tool === "bash") detail = s(args.cmd ?? args.command).replace(/\s+/g, " ").trim();
+  else if (tool === "read") detail = s(args.path) + (args.start ? ":" + s(args.start) + (args.end ? "-" + s(args.end) : "") : "");
+  else if (tool === "write" || tool === "edit") detail = s(args.path);
+  else { const k = Object.keys(args)[0]; detail = k ? k + "=" + s(args[k]).replace(/\s+/g, " ").slice(0, 48) : ""; }
+  const obs = s(observation).trim();
+  const firstLine = obs.split("\n").find((l) => l.trim()) ?? "";
+  return { detail: detail.slice(0, 200), ok: !/^error\b/i.test(obs), result: firstLine.slice(0, 100) };
 }
 
 /** Render the tool catalogue for the system prompt. */

@@ -5,7 +5,7 @@ import type { AuditorConfig } from "../config.js";
 import type { RunLogger } from "../trace/logger.js";
 import type { LlmClient } from "../types.js";
 import { AUDIT_CONFIRM_SYSTEM, AUDIT_PREPARE_SYSTEM, type TranscriptStep } from "./prompts.js";
-import { readScratchScopes, scratchHasFindings, type AgentTool, type ToolContext } from "./tools.js";
+import { describeAction, readScratchScopes, scratchHasFindings, type AgentTool, type ToolContext } from "./tools.js";
 
 // Continuous-session driver (point 5). Instead of re-driving a stateless
 // complete() once per step — which re-sends the whole transcript every turn and
@@ -46,6 +46,8 @@ export async function runAuditSession(input: {
   deepFocus?: string;
   map?: boolean;
   verify?: string;
+  /** Synthesis mode: cross-scope composition pass after dig — carries the per-scope findings/scopes to compose. */
+  synthesize?: string;
   /** Confirm mode: the open-world reproduce/consolidate/decide pass over a prior run's findings. */
   confirm?: string;
   /** Prepare mode: the open-world acquire + mainnet-match phase (runs before map). Carries the clue + posture + match-mainnet constraint. */
@@ -65,7 +67,7 @@ export async function runAuditSession(input: {
 
   const steps: TranscriptStep[] = [];
   let stepNo = 0;
-  const customTools = input.tools.map((tool) => toPiTool(tool, input.ctx, () => (stepNo += 1), steps));
+  const customTools = input.tools.map((tool) => toPiTool(tool, input.ctx, () => (stepNo += 1), steps, input.logger));
 
   const { session } = await createAgentSession({
     model,
@@ -146,7 +148,7 @@ export async function runAuditSession(input: {
       else if (ame.type === "text_delta") { textBuf += ame.delta; try { input.onActivity?.({ kind: "text_delta", delta: ame.delta }); } catch {} }
       else if (ame.type === "text_end") { if (textBuf.trim()) void input.logger.event("audit_text", { text: textBuf.trim() }); textBuf = ""; }
     } else if (event.type === "tool_execution_start") {
-      void input.logger.event("audit_step", { step: stepNo + 1, tool: event.toolName });
+      // The rich per-tool line (command/file + result) is logged from toPiTool, where the args are.
       try { input.onActivity?.({ kind: "step", tool: event.toolName, step: stepNo + 1 }); } catch {}
     } else if (event.type === "tool_execution_end" && event.isError) {
       void input.logger.event("audit_tool_error", { tool: event.toolName });
@@ -240,6 +242,7 @@ export async function runAuditSession(input: {
         ...(input.deepFocus ? { deepFocus: input.deepFocus } : {}),
         ...(input.map ? { map: true } : {}),
         ...(input.verify ? { verify: input.verify } : {}),
+        ...(input.synthesize ? { synthesize: input.synthesize } : {}),
         ...(input.confirm ? { confirm: input.confirm } : {}),
         ...(input.prepare ? { prepare: input.prepare } : {}),
       }));
@@ -271,7 +274,7 @@ function looksLikeAuthError(message: string): boolean {
   return /no api key|not logged in|unauthorized|authenticate|\/login|oauth|credential/i.test(message);
 }
 
-function toPiTool(tool: AgentTool, ctx: ToolContext, nextStep: () => number, steps: TranscriptStep[]): ToolDefinition {
+function toPiTool(tool: AgentTool, ctx: ToolContext, nextStep: () => number, steps: TranscriptStep[], logger: RunLogger): ToolDefinition {
   return defineTool({
     name: tool.name,
     label: tool.name,
@@ -289,6 +292,9 @@ function toPiTool(tool: AgentTool, ctx: ToolContext, nextStep: () => number, ste
         observation = `error: tool "${tool.name}" failed: ${error instanceof Error ? error.message : String(error)}`;
       }
       steps.push({ n, thought: "", tool: tool.name, args, observation });
+      // Rich live-activity line: the actual command/file the agent ran + its outcome.
+      const a = describeAction(tool.name, args, observation);
+      void logger.event("audit_action", { step: n, tool: tool.name, detail: a.detail, ok: a.ok, result: a.result });
       return { content: [{ type: "text", text: observation }], details: {} };
     },
   });
@@ -320,12 +326,12 @@ const toolSchemas: Record<string, ReturnType<typeof Type.Object>> = {
   }),
 };
 
-function buildSessionPrompt(input: { cfg: AuditorConfig; scopeNote?: string; fileManifest: string; memoryHint?: string; deep?: boolean; deepFocus?: string; map?: boolean; verify?: string; confirm?: string; prepare?: string }): string {
+function buildSessionPrompt(input: { cfg: AuditorConfig; scopeNote?: string; fileManifest: string; memoryHint?: string; deep?: boolean; deepFocus?: string; map?: boolean; verify?: string; synthesize?: string; confirm?: string; prepare?: string }): string {
   // Confirm is the open-world mode: it has its own white-hat line (fork/read live
   // networks OK, never broadcast), so it does NOT share the local-only scaffold below.
   if (input.prepare) return buildPrepareSessionPrompt({ prepare: input.prepare, fileManifest: input.fileManifest, ...(input.memoryHint ? { memoryHint: input.memoryHint } : {}) });
   if (input.confirm) return buildConfirmSessionPrompt({ confirm: input.confirm, fileManifest: input.fileManifest, ...(input.scopeNote ? { scopeNote: input.scopeNote } : {}), ...(input.memoryHint ? { memoryHint: input.memoryHint } : {}) });
-  const intro = input.verify ? verifyIntro(input.verify) : input.map ? mapIntro() : input.deep ? deepIntro(input.deepFocus) : breadthIntro();
+  const intro = input.synthesize ? synthesizeIntro(input.synthesize) : input.verify ? verifyIntro(input.verify) : input.map ? mapIntro() : input.deep ? deepIntro(input.deepFocus) : breadthIntro();
   return `${intro}
 
 Use the provided tools to investigate:
@@ -358,9 +364,11 @@ ${input.fileManifest}
 
 ${input.map
     ? "Apply the three lenses and write scopes.json — the COMPLETE scope inventory (each: id, obligation, region, lenses, exposure, difficulty, score, why) — then stop. Do not deep-dive or prove bugs in this phase; coverage over depth."
-    : input.deep
-      ? "Begin the obligation-driven method: model the system, rank and commit to the most soundness-critical region (unless one is pinned above), then enumerate its obligations from design intent and discharge each by naming the enforcing line or flagging its absence. Record every obligation and its status to findings.json. Do not wrap up while obligations remain unchecked."
-      : "Begin the audit. When you have investigated thoroughly and written findings.json, stop."}`;
+    : input.synthesize
+      ? "Begin the sink-driven synthesis: enumerate the security-critical sinks, trace each backward across components for an input that arrives un-bound to a legitimate authority, compose the cross-component chains, and write findings.json (each composed exploit with its entry → unbound input → sink links and confirmation). Do not just re-list the per-scope findings."
+      : input.deep
+        ? "Begin the obligation-driven method: model the system, rank and commit to the most soundness-critical region (unless one is pinned above), then enumerate its obligations from design intent and discharge each by naming the enforcing line or flagging its absence. Record every obligation and its status to findings.json. Do not wrap up while obligations remain unchecked."
+        : "Begin the audit. When you have investigated thoroughly and written findings.json, stop."}`;
 }
 
 const MAP_FINALIZE_PROMPT = `Your exploration budget is spent. Do NOT read, grep, or run anything else. Based ONLY on what you have already examined, WRITE scopes.json now at the workspace root as your very next action — call the write tool once with a JSON array of objects {"id","obligation","region":"file:lines","lenses":[...],"exposure","difficulty","score","why"} covering the most soundness-critical regions you saw (entrypoints that move value, accounting/share math, authorization, liquidation/swap invariants, oracle binding). Partial but concrete beats empty. After writing, emit {"done": true}. Output only the write tool call.`;
@@ -452,6 +460,21 @@ Obligation-driven method (general, not a hint about this target):
 - DISCHARGE each obligation one at a time. Finding that "a constraint exists" is NOT discharge: state exactly what the constraint binds the value to and confirm that referent is the value the obligation actually requires — not merely an adjacent/internal value, and not merely a relationship among witnessed values when the property names a specific trusted source. A value bound to the wrong referent leaves the obligation UNMET.
 - A MISSING enforcing constraint is the finding. Missing-constraint bugs look like ordinary assignment/witnessing on every line — reason from the obligation, never from whether the code "looks standard", "matches upstream", or is "the canonical implementation" (the reference can carry the same bug; some bugs live in the canonical code itself).
 - Record every obligation and its status (discharged-with-line / UNMET / uncertain) to findings.json as you go; an UNMET obligation is a finding (or a hypothesis with location and the exact missing edge).`;
+}
+
+function synthesizeIntro(seed: string): string {
+  return `You are an autonomous white-hat security auditor in SYNTHESIS mode on AUTHORIZED source code. The per-scope deep audit has finished; each scope was audited IN ISOLATION. Your job is to find exploits that NO single scope could see — bugs that exist only in the COMPOSITION of multiple components, where each part can look acceptable on its own.
+
+Sink-driven method (general, not a hint about this target):
+1. ENUMERATE the security-critical SINKS — every place the system produces an irreversible, privileged effect: value or authority leaves the system (funds out, mint, burn, role/owner/allowance change), or a guarded state transition commits. A sink is critical wherever it lives, in any component or language.
+2. For EACH sink, trace BACKWARD across components every value that decides the effect — recipient, amount, asset, the caller, and whatever is supposed to AUTHORIZE it (a proof, a signature, a balance, on-chain state). Follow each to where it is established and ask: is it bound to a LEGITIMATE authority along the WHOLE path to the sink? A value constrained inside one component but arriving UN-bound at the sink — or a sink reachable by a caller/path that never proves the authority the effect requires — is the bug, even when every individual component looked correct in its own scope.
+3. A "by-design" / emergency / escape / admin / fallback / privileged path is itself a trust boundary, never a discharge: ask what effect it grants and whether each effect is bound to a legitimate authority. "This path is intended to exist" is NOT a reason it is safe; "this parameter cannot be forged" does NOT clear the path if the path still authorizes the effect.
+4. COMPOSE the chain: who can reach the sink (entry + authorization) + the unbound or under-constrained input it carries + the sink effect = ONE concrete attacker action. The links may come from DIFFERENT scopes below; assembling them across scope boundaries is the entire point of this phase.
+
+Confirm at the SINK, not the link: a composition finding is confirmed-executable only when a PoC demonstrates the END effect — funds move, an invariant breaks, or an unauthorized state change commits — not when one intermediate constraint is shown missing. Where the full chain genuinely cannot be built locally (e.g. it needs a real proof/circuit/oracle), record a "suspected" finding that names the exact chain (entry → unbound input → sink), each link's file:line, and the attacker impact — a surfaced cross-component chain beats a silently dropped one.
+
+Prior per-scope audit (the material to compose — do NOT just re-list it; find what its pieces ENABLE together):
+${seed}`;
 }
 
 // One-shot completion over a codex/pi AgentSession (OAuth-authed). Needed for code

@@ -49,6 +49,9 @@ export interface AuditorConfig {
   // Re-enumerate the scope inventory from scratch instead of resuming the
   // persisted one (which would otherwise continue with the next un-audited scopes).
   auditRemap: boolean;
+  // After the per-scope dig, run one cross-scope SYNTHESIS pass (sink-driven composition) to find
+  // bugs that only exist in the COMPOSITION of components. Default on for map→dig; set false to skip.
+  auditSynthesize?: boolean;
   // `flounder map`: run only the MAP phase (enumerate + persist the scope inventory) and
   // stop — no dig. The resumable `flounder audit` then digs from the persisted inventory.
   auditMapOnly: boolean;

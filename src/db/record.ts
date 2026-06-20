@@ -67,7 +67,9 @@ export class RunRecorder implements RunTracker {
         provider: cfg.provider,
         model: cfg.auditModel,
         thinking: cfg.thinkingLevel,
-        budgets: configSnapshot(cfg),
+        // Mark a verify run (in the run's budgets only, not the project config) so the dashboard can
+        // show "verifying N/M findings" instead of mislabeling it as a dig.
+        budgets: cfg.auditVerify ? { ...configSnapshot(cfg), verify: true } : configSnapshot(cfg),
         // The OS pid lets a supervising run-manager correlate this DB row to the process
         // it spawned (and reconcile status if the process dies before finalize).
         pid: process.pid,
@@ -183,6 +185,15 @@ export function toFindingRow(finding: AgentFinding, runDir: string): FindingRow 
     // Only confirmed findings get a disclosure report artifact (written at finalize under the final id).
     reportPath: finding.id && isConfirmedLike(finding.confirmationStatus) ? path.join(runDir, reportArtifactName(finding.id)) : undefined,
     scopeId: finding.scopeId,
+    // The rich content, so the DB holds the finding in full (the verify/confirm pipeline + UI read
+    // it from here instead of scraping the run dir's audit_hypotheses / audit_findings artifacts).
+    description: finding.description,
+    evidence: finding.evidence,
+    exploitSketch: finding.exploitSketch,
+    fix: finding.fix,
+    confidence: finding.confidence,
+    // VERIFY provenance: when set, the verdict flips the original suspected row instead of inserting.
+    originId: finding.originId,
   };
 }
 
