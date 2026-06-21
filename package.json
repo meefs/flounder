@@ -4,6 +4,14 @@
   "description": "Autonomous white-hat security auditor for AI-driven code review, exploit construction, and execution-grounded verification.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/adshao/flounder.git"
+  },
+  "bugs": {
+    "url": "https://github.com/adshao/flounder/issues"
+  },
+  "homepage": "https://github.com/adshao/flounder#readme",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
