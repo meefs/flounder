@@ -381,7 +381,7 @@ function runKindLabel(kind: string, run?: RunRow): string {
   return {
     prepare: "Prepare target",
     run: "Map + dig audit",
-    map: "Map scopes",
+    map: "Map",
     audit: "Dig scopes",
     confirm: "Confirm findings",
   }[kind] ?? kind;
