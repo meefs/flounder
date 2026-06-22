@@ -901,13 +901,27 @@ test("api: run log supports a bounded JSON tail for agents", async () => {
     } finally {
       store.close();
     }
+    await writeFile(path.join(runDir, "events.jsonl"), `${JSON.stringify({
+      ts: "2026-06-22T08:12:50.000Z",
+      kind: "audit_command_run",
+      runId: "cmd23",
+      purpose: "confirm",
+      passed: false,
+      exitCode: 127,
+      output: "docker: Error response from daemon: exec: \"forge\": executable file not found in $PATH.",
+    })}\n`);
 
     const res = await fetch(base + `/api/runs/${runId}/log?tail=50`);
     assert.equal(res.status, 200);
     assert.match(res.headers.get("content-type") ?? "", /application\/json/);
     const body = await res.json();
     assert.equal(body.runId, runId);
-    assert.deepEqual(body.events, []);
+    assert.equal(body.events.length, 1);
+    assert.equal(body.events[0].kind, "audit_command_run");
+    assert.equal(body.events[0].runId, "cmd23");
+    assert.equal(body.events[0].passed, false);
+    assert.equal(body.events[0].exitCode, 127);
+    assert.match(body.events[0].output, /forge/);
     assert.equal(body.limit, 50);
   });
 });

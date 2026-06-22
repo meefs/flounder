@@ -1705,14 +1705,19 @@ function persistedRunActivity(run: Record<string, unknown>, limit: number): Arra
 
 function persistedEventToActivity(rec: Record<string, unknown>): Record<string, unknown> {
   const kind = typeof rec.kind === "string" ? rec.kind : "event";
+  const payload = omitKeys(rec, ["ts", "kind"]);
   const detail =
     typeof rec.error === "string" ? rec.error :
     typeof rec.detail === "string" ? rec.detail :
     typeof rec.text === "string" ? rec.text :
     typeof rec.result === "string" ? rec.result :
     typeof rec.name === "string" ? `wrote ${rec.name}` :
-    compactJson(omitKeys(rec, ["ts", "kind"]));
-  return { kind, ts: rec.ts, detail, ok: !/error|failed|refuted/i.test(kind) };
+    compactJson(payload);
+  const ok =
+    typeof rec.ok === "boolean" ? rec.ok :
+    typeof rec.passed === "boolean" ? rec.passed :
+    !/error|failed|refuted/i.test(kind);
+  return { kind, ts: rec.ts, ...payload, detail, ok };
 }
 
 function omitKeys(input: Record<string, unknown>, keys: string[]): Record<string, unknown> {
