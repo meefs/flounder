@@ -304,10 +304,19 @@ function formatConfidence(value: number | null | undefined): string {
   return `${pct}%`;
 }
 
+function confidenceTone(value: number | null | undefined): { className: string; label: string } {
+  if (value == null || !Number.isFinite(value)) return { className: "confidence-low", label: "low" };
+  const pct = value <= 1 ? Math.round(value * 100) : Math.round(value);
+  if (pct >= 85) return { className: "confidence-high", label: "high" };
+  if (pct >= 70) return { className: "confidence-medium", label: "medium" };
+  return { className: "confidence-low", label: "low" };
+}
+
 function ConfidenceBadge({ value }: { value: number | null | undefined }) {
   const label = formatConfidence(value);
   if (!label) return null;
-  return <span className="label confidence-label" title={`Model confidence: ${label}`}>{label}</span>;
+  const tone = confidenceTone(value);
+  return <span className={`label confidence-label ${tone.className}`} title={`Model confidence: ${label} (${tone.label})`}>{label}</span>;
 }
 
 function coverageModeFromConfig(cfg: { scopeCoverageMode?: string; maxScopes?: number }): CoverageMode {

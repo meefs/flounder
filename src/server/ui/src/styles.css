@@ -1578,10 +1578,26 @@ small {
 }
 
 .confidence-label {
-  color: var(--fg-muted);
-  background: var(--canvas-subtle);
   font-family: var(--mono);
   font-size: 11px;
+}
+
+.confidence-high {
+  color: var(--success);
+  background: color-mix(in srgb, var(--success) 12%, transparent);
+  border-color: color-mix(in srgb, var(--success) 36%, transparent);
+}
+
+.confidence-medium {
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+  border-color: color-mix(in srgb, var(--warning) 34%, transparent);
+}
+
+.confidence-low {
+  color: var(--fg-muted);
+  background: var(--canvas-subtle);
+  border-color: var(--border);
 }
 
 .run-log-head {
