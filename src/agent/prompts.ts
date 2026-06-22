@@ -389,48 +389,7 @@ Write confirm_decision.json INCREMENTALLY — add or update each bug's row as so
 If the task lists ALREADY-SETTLED rows (a prior interrupted run), copy each into confirm_decision.json UNCHANGED and do NOT re-reproduce that bug — work only the findings not yet settled. This is how an interrupted confirm resumes.
 Supply repro_command_id + fix_patch + patched_success_patterns whenever a row's PoC is a source-level test with a fix: the framework then runs a fix-equivalence matrix over your rows — it applies one row's fix to the pristine source and re-runs another row's PoC — and MERGES any rows a single fix neutralizes, so "distinct bugs" is decided by execution, not by your grouping alone. Rows without these fields are left exactly as you wrote them (the framework cannot machine-verify their separation).
 
-Formal submission reports — for every row with "reproduced":"yes" and recommendation "submit-candidate" or "needs-human", also write ONE Markdown report at the workspace root named report_<first member id>.md, where <first member id> is the first value in members lowercased and sanitized to [a-z0-9_.-]. This file is the user-facing, submission-ready report for that single distinct bug. Do not emit done until confirm_decision.json and the required report_*.md files are written.
-
-Report accuracy rule: the report is not a place to smooth over missing evidence. Every concrete detail must come from the reproduced decision row, the passing command/artifact, source/corpus you inspected, or bounded public corroboration/novelty checks. Before writing each report, verify title/root cause/location, attacker capability, impact, affected version/deployment, fix guidance, and novelty/disclosure state against that evidence. If a detail is missing or ambiguous, do targeted source/corpus/artifact inspection; if it still is not established, say "Not established by the available evidence" or list it as a human gate. Do not invent impact, versions, exploitability, affected deployments, novelty, fix validation, or proof details.
-
-Use this report template exactly, but fill it with target-specific content and concise evidence:
-# <clear vulnerability title>
-
-## Summary
-One short paragraph explaining the bug and affected security property.
-
-## Evidence Basis
-Bullet list of the reproduced decision row, command/artifact ids, source/corpus paths, and report-run inspections that support the report. If an expected item is unavailable, say so here.
-
-## Severity
-Severity, rationale, and affected asset or trust boundary. Do not invent CVSS; include it only if you can justify every vector.
-
-## Affected Component
-Repository/package/component, version/commit/deployment if known, and code locations. Use relative paths, contract names, package names, command ids, or public URLs. Do not include local absolute paths.
-
-## Root Cause
-The exact missing check, invalid assumption, state transition, proof constraint, verifier binding, or authorization error that makes the bug possible.
-
-## Attack Scenario
-Step-by-step attacker capabilities and exploit path. Keep it actionable for maintainers without adding live-network abuse instructions.
-
-## Impact
-Concrete effect and who can be harmed. Tie the impact to the reproduced observable, not speculation.
-
-## Reproduction Evidence
-The real-target reproduction result, observed effect, command_id, and any local fork/test artifacts. State whether reproduction used a fork, published package, real verifier, real deployed bytecode, or another real-world ground truth.
-
-## Proof of Concept
-Minimal local-only reproduction steps or code pointers sufficient for the maintainer to reproduce. Never include commands that broadcast to or write to live systems.
-
-## Recommended Fix
-Specific remediation guidance and any tested patch result. If you used fix_patch, explain why it blocks the PoC.
-
-## Validation
-How to verify the fix and what regression test should be added.
-
-## Novelty and Disclosure Notes
-Corroboration, novelty check result, remaining human gates, scope/venue notes, and recommended next action.
+Do NOT write report_*.md files in CONFIRM mode. Confirm's output is the decision sheet only: confirm_decision.json plus the framework-generated confirm_report.md summary. Formal, submission-ready Markdown reports are a separate REPORT phase that runs after confirmed/reproduced decisions exist; that phase will use your decision rows, evidence, and artifacts to write one report per bug.
 
 White-hat boundaries (non-negotiable):
 - You MAY read from and fork live networks/data to reproduce LOCALLY. You MUST NOT broadcast/submit/relay/publish any transaction, move funds, or write to any live network or third-party system. Fork and read; replay only against a LOCAL fork; never push to a live system.
@@ -446,7 +405,7 @@ export function buildConfirmKickoff(input: {
   confirm: string;
 }): string {
   return `Target: ${input.target}
-Mode: CONFIRM — take the prior audit's confirmed findings to a real-world standard by EXECUTION, then write the decision sheet and one formal report per reproduced submit candidate. ${actionBudgetText(input.maxSteps)}. The network is available; reproduce on real ground truth, never broadcast.
+Mode: CONFIRM — take the prior audit's confirmed findings to a real-world standard by EXECUTION, then write only the decision sheet. ${actionBudgetText(input.maxSteps)}. The network is available; reproduce on real ground truth, never broadcast.
 
 The prior audit's confirmed findings (frozen; reproduce/consolidate these — do NOT discover new ones):
 ${input.confirm}
@@ -465,7 +424,7 @@ ${input.memoryHint && input.memoryHint.trim().length > 0 ? input.memoryHint.trim
 Loaded source files:
 ${input.fileManifest}
 
-Consolidate the findings into distinct bugs, reproduce each distinct bug against real ground truth, check novelty/corroboration online (leads only), then write confirm_decision.json plus the required report_*.md files before emitting done. Respond with one JSON tool action or done object.`;
+Consolidate the findings into distinct bugs, reproduce each distinct bug against real ground truth, check novelty/corroboration online (leads only), then write confirm_decision.json before emitting done. Do not write report_*.md in this phase; formal reports are generated by the later Report phase. Respond with one JSON tool action or done object.`;
 }
 
 export function buildAuditKickoff(input: {

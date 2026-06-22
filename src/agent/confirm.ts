@@ -215,7 +215,6 @@ export async function runConfirm(
       humanGates: row.humanGates,
       mergedFrom: row.mergedFrom,
       reproCommandId: row.reproCommandId,
-      reportMarkdown: reportMarkdownForDecision(row, session.scratchFiles),
     })),
     path.join(logger.runDir, "confirm_report.md"),
   );
@@ -434,31 +433,6 @@ function readConfirmDecision(session: AgentSession): ConfirmDecisionRow[] {
       ? ((raw as Record<string, unknown>).decisions as unknown[])
       : [];
   return items.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item)).map(normalizeDecisionRow);
-}
-
-function reportMarkdownForDecision(row: ConfirmDecisionRow, scratchFiles: Map<string, string>): string | undefined {
-  const names = new Set<string>();
-  for (const member of [...(row.members ?? []), ...(row.mergedFrom ?? [])]) {
-    const key = safeReportFileId(member);
-    if (key) names.add(`report_${key}.md`);
-  }
-  if (names.size === 0) names.add(`report_${safeReportFileId(row.bug)}.md`);
-  for (const wanted of names) {
-    const direct = scratchFiles.get(wanted);
-    if (direct?.trim()) return direct;
-    for (const [file, content] of scratchFiles) {
-      if (path.posix.basename(file) === wanted && content.trim()) return content;
-    }
-  }
-  return undefined;
-}
-
-function safeReportFileId(input: string): string {
-  return input
-    .toLowerCase()
-    .replace(/[^a-z0-9_.-]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 100) || "finding";
 }
 
 function normalizeDecisionRow(raw: Record<string, unknown>): ConfirmDecisionRow {

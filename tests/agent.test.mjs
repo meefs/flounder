@@ -9,7 +9,7 @@ import { buildTools, describeAction, ingestFindingsFromScratch, newSession, dedu
 import { runAudit } from "../dist/agent/audit.js";
 import { normalizePrepareManifest } from "../dist/agent/acquire.js";
 import { runAuditLoop, isTransientError } from "../dist/agent/loop.js";
-import { buildDeepKickoff, buildMapKickoff, AUDIT_CONFIRM_SYSTEM, AUDIT_DEEP_SYSTEM, AUDIT_SYSTEM, AUDIT_VERIFY_SYSTEM, MAP_GRANULARITY_RULES, MAP_SYSTEM, POC_TRUST_RULE } from "../dist/agent/prompts.js";
+import { buildConfirmKickoff, buildDeepKickoff, buildMapKickoff, AUDIT_CONFIRM_SYSTEM, AUDIT_DEEP_SYSTEM, AUDIT_SYSTEM, AUDIT_VERIFY_SYSTEM, MAP_GRANULARITY_RULES, MAP_SYSTEM, POC_TRUST_RULE } from "../dist/agent/prompts.js";
 import { runDifferentialConfirmation } from "../dist/agent/differential.js";
 import { runRefutation } from "../dist/agent/refutation.js";
 import { renderReportFileManifest } from "../dist/agent/report.js";
@@ -109,9 +109,12 @@ test("prompt contract keeps attacker-faithful PoC rule on legacy and pi-session 
   assert.ok(reportPrompt.includes("source, corpus, PoC files, or artifacts"), "report mode should inspect missing details instead of guessing");
   assert.ok(reportPrompt.includes("If a detail is not established"), "report mode should surface evidence gaps instead of inventing details");
 
-  assert.ok(AUDIT_CONFIRM_SYSTEM.includes("Report accuracy rule"), "confirm-generated reports should carry the no-fabrication contract");
-  assert.ok(AUDIT_CONFIRM_SYSTEM.includes("## Evidence Basis"), "confirm-generated reports should expose the evidence base");
-  assert.ok(AUDIT_CONFIRM_SYSTEM.includes("Not established by the available evidence"), "confirm-generated reports should preserve uncertainty");
+  assert.ok(AUDIT_CONFIRM_SYSTEM.includes("Do NOT write report_*.md files in CONFIRM mode"), "confirm should not generate formal reports");
+  assert.ok(!AUDIT_CONFIRM_SYSTEM.includes("Formal submission reports"), "formal reports belong to the Report phase, not Confirm");
+  assert.ok(!AUDIT_CONFIRM_SYSTEM.includes("## Evidence Basis"), "confirm should not embed the formal report template");
+  const confirmKickoff = buildConfirmKickoff({ target: "t", tools: [], fileManifest: "x.rs", maxSteps: Number.POSITIVE_INFINITY, confirm: "[]" });
+  assert.ok(confirmKickoff.includes("write only the decision sheet"), "confirm kickoff should frame Confirm as decision-only");
+  assert.ok(confirmKickoff.includes("Do not write report_*.md"), "confirm kickoff should reserve formal reports for Report");
 });
 
 test("prepare manifest normalization turns ended in-progress manifests into terminal states", () => {
