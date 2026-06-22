@@ -20,7 +20,7 @@ import { fileURLToPath } from "node:url";
 import { defaultOutputDir } from "../config.js";
 import { MetadataStore, type RunKind, type Coverage, type ProviderInput, type ProviderProfile, type ProjectInput, type ProviderRoles, type RoleOverride } from "../db/store.js";
 import { getProviders, getModels, getSupportedThinkingLevels, type ModelThinkingLevel } from "@earendil-works/pi-ai";
-import { type LaunchSpec, ActivityBus } from "./run-manager.js";
+import { type LaunchSpec, ActivityBus, type Activity } from "./run-manager.js";
 import { THINKING_LEVELS } from "../config.js";
 import { projectHistoryDir } from "../trace/history.js";
 import { loadScopeInventory, saveScopeInventory } from "../agent/scope-store.js";
@@ -1641,10 +1641,40 @@ function streamFromBus(res: ServerResponse, bus: ActivityBus, replay: Array<Reco
 }
 
 function combinedRunActivity(run: Record<string, unknown>, bus: ActivityBus, limit: number): Array<Record<string, unknown>> {
-  const events = [...persistedRunActivity(run, limit), ...bus.snapshot(limit).map((ev) => ({ ts: new Date().toISOString(), ...ev }))];
+  const events = [...persistedRunActivity(run, limit), ...compactLiveActivity(bus.snapshot(2000))];
   return events
     .sort((a, b) => String(a.ts ?? "").localeCompare(String(b.ts ?? "")))
     .slice(-limit);
+}
+
+function compactLiveActivity(events: Activity[]): Array<Record<string, unknown>> {
+  const out: Array<Record<string, unknown>> = [];
+  let streamKind: "audit_thinking" | "audit_text" | undefined;
+  let streamBody = "";
+  let streamTs: string | undefined;
+
+  const flush = (): void => {
+    const body = streamBody.trim();
+    if (streamKind && body) out.push({ kind: streamKind, ts: streamTs, detail: body, ok: true });
+    streamKind = undefined;
+    streamBody = "";
+    streamTs = undefined;
+  };
+
+  for (const ev of events) {
+    const nextKind = ev.kind === "thinking_delta" ? "audit_thinking" : ev.kind === "text_delta" ? "audit_text" : undefined;
+    if (!nextKind) {
+      flush();
+      out.push({ ts: ev.ts, ...ev });
+      continue;
+    }
+    if (streamKind && streamKind !== nextKind) flush();
+    streamKind = nextKind;
+    streamBody += ev.delta ?? "";
+    streamTs = ev.ts ?? streamTs;
+  }
+  flush();
+  return out;
 }
 
 function persistedRunActivity(run: Record<string, unknown>, limit: number): Array<Record<string, unknown>> {

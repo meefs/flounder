@@ -228,6 +228,32 @@ test("daemon: activity POSTs surface on the run's live SSE log", async () => {
   });
 });
 
+test("daemon: JSON run log compacts token deltas for history views", async () => {
+  await withServerAndToken(async ({ base, token }) => {
+    await asDaemon(base, token, "POST", "/api/daemon/register", { name: "d1" });
+    const created = await j(await ui(base, "POST", "/api/projects", { name: "p", sourcePaths: ["./src"] }));
+    const { jobId } = await j(await ui(base, "POST", `/api/projects/${created.uuid}/runs`, { verb: "run", mockLlm: true }));
+    await asDaemon(base, token, "POST", "/api/daemon/claim");
+    const { runId } = await j(await asDaemon(base, token, "POST", "/api/daemon/runs", { jobId, project: "p", kind: "run", runDir: "/tmp/p-1", budgets: {} }));
+
+    await asDaemon(base, token, "POST", `/api/daemon/runs/${runId}/activity`, {
+      events: [
+        { kind: "thinking_delta", delta: "checking " },
+        { kind: "thinking_delta", delta: "the invariant" },
+        { kind: "text_delta", delta: "Confirmed " },
+        { kind: "text_delta", delta: "candidate" },
+        { kind: "step", tool: "bash", step: 1 },
+      ],
+    });
+
+    const body = await j(await ui(base, "GET", `/api/runs/${runId}/log?tail=50&format=json`));
+    assert.equal(body.events.some((ev) => ev.kind === "thinking_delta" || ev.kind === "text_delta"), false);
+    assert.equal(body.events.find((ev) => ev.kind === "audit_thinking")?.detail, "checking the invariant");
+    assert.equal(body.events.find((ev) => ev.kind === "audit_text")?.detail, "Confirmed candidate");
+    assert.ok(body.events.find((ev) => ev.kind === "step"));
+  });
+});
+
 test("daemon: stopping a run immediately kills it and ignores stale daemon completion", async () => {
   await withServerAndToken(async ({ base, token, out }) => {
     await asDaemon(base, token, "POST", "/api/daemon/register", { name: "d1" });
