@@ -21,6 +21,7 @@ import {
   pct,
   phaseState,
   projectConfig,
+  parseJson,
   PHASE_DESC,
   rankCandidates,
   runProgress,
@@ -407,10 +408,27 @@ function activityPreviewLimit(kind: ActivityLine["kind"]): number {
   return kind === "thinking" ? 900 : kind === "text" ? 1400 : 900;
 }
 
-function basename(pathLike: string): string {
-  const trimmed = pathLike.trim();
-  const parts = trimmed.split(/[\\/]/);
-  return parts[parts.length - 1] || trimmed;
+function displayPath(pathLike: string, parts = 3): string {
+  const normalized = pathLike.trim().replaceAll("\\", "/");
+  if (!normalized) return "";
+  return tailPath(normalized, parts);
+}
+
+function commandLabel(command: string): string {
+  const cmd = command.trim();
+  if (/^(rg|grep|find)\b/.test(cmd)) return "Search source";
+  if (/^(ls|cat|sed|awk|head|tail|tree)\b/.test(cmd)) return "Inspect workspace";
+  if (/^(npm|pnpm|yarn|bun)\s+(install|ci)\b/.test(cmd) || /^(cargo|go)\s+(fetch|mod download)\b/.test(cmd)) return "Prepare dependencies";
+  if (/^(forge|cargo|go|npm|pnpm|yarn|bun|node|python\d*|pytest|uv)\b/.test(cmd)) return "Run check";
+  if (/^git\b/.test(cmd)) return "Inspect repository";
+  if (/^jq\b/.test(cmd)) return "Parse data";
+  return "Run command";
+}
+
+function shortCommand(command: string): string {
+  const normalized = command.trim().replace(/\s+/g, " ");
+  const head = normalized.split(/\s+/).slice(0, 8).join(" ");
+  return head.length < normalized.length ? `${head} ...\n${normalized}` : normalized;
 }
 
 function actionSummary(detail: string): { label: string; body: string } {
@@ -422,14 +440,95 @@ function actionSummary(detail: string): { label: string; body: string } {
     const end = readMatch[3];
     return {
       label: "Reading source",
-      body: `${basename(file)}:${start}${end ? `-${end}` : ""}\n${file}`,
+      body: `${displayPath(file)}:${start}${end ? `-${end}` : ""}`,
     };
   }
-  const commandHead = value.split(/\s+/).slice(0, 4).join(" ");
-  if (/^(rg|grep|find|ls|cat|sed|awk|npm|pnpm|yarn|forge|cargo|go|python|node|git|jq)\b/.test(value)) {
-    return { label: "Running command", body: commandHead.length < value.length ? `${commandHead} ...\n${value}` : value };
+  if (/^(rg|grep|find|ls|cat|sed|awk|head|tail|tree|npm|pnpm|yarn|bun|npx|forge|cargo|go|python\d*|pytest|uv|node|git|jq)\b/.test(value)) {
+    return { label: commandLabel(value), body: shortCommand(value) };
   }
   return { label: "Working", body: value };
+}
+
+function eventPayload(event: ActivityRecord): Record<string, unknown> {
+  const detail = parseJson<Record<string, unknown>>(event.detail, {});
+  const payload = { ...detail };
+  for (const key of ["path", "bytes", "produced", "total", "audited", "pending", "deferred", "scopes", "findings", "hypotheses", "confirmedExecutable", "commandRuns", "steps", "stoppedReason", "resumed", "target", "runs", "toolchain", "command", "exitCode", "timedOut", "ok"] as const) {
+    if (event[key] !== undefined) payload[key] = event[key];
+  }
+  return payload;
+}
+
+function payloadNumber(payload: Record<string, unknown>, key: string): number | undefined {
+  const value = payload[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function payloadString(payload: Record<string, unknown>, key: string): string | undefined {
+  const value = payload[key];
+  return typeof value === "string" && value ? value : undefined;
+}
+
+function writeSummary(event: ActivityRecord, verb: "Wrote" | "Edited"): { label: string; body: string } {
+  const payload = eventPayload(event);
+  const file = payloadString(payload, "path");
+  const bytes = payloadNumber(payload, "bytes");
+  return {
+    label: `${verb} file`,
+    body: [file ? displayPath(file) : undefined, bytes !== undefined ? `${bytes.toLocaleString()} bytes` : undefined].filter(Boolean).join(" · ") || "Sandbox file updated",
+  };
+}
+
+function eventSummary(event: ActivityRecord, fallbackBody: string): { label: string; body: string } | undefined {
+  const payload = eventPayload(event);
+  switch (event.kind) {
+    case "audit_write":
+      return writeSummary(event, "Wrote");
+    case "audit_edit":
+      return writeSummary(event, "Edited");
+    case "artifact": {
+      const body = fallbackBody.replace(/^wrote\s+/i, "").trim();
+      return { label: "Saved artifact", body: body || fallbackBody };
+    }
+    case "audit_scope_progress": {
+      const total = payloadNumber(payload, "total");
+      const audited = payloadNumber(payload, "audited");
+      const pending = payloadNumber(payload, "pending");
+      const deferred = payloadNumber(payload, "deferred");
+      const pieces = [
+        total !== undefined && audited !== undefined ? `${audited}/${total} scopes audited` : undefined,
+        pending !== undefined ? `${pending} pending` : undefined,
+        deferred ? `${deferred} deferred` : undefined,
+        payload.resumed ? "resumed" : undefined,
+      ].filter(Boolean);
+      return { label: "Scope progress", body: pieces.join(" · ") || fallbackBody };
+    }
+    case "audit_synthesis_start":
+      return { label: "Synthesis started", body: `${payloadNumber(payload, "findings") ?? 0} findings across ${payloadNumber(payload, "scopes") ?? 0} scopes` };
+    case "audit_synthesis_done":
+      return { label: "Synthesis finished", body: `${payloadNumber(payload, "produced") ?? 0} project-level candidates produced` };
+    case "audit_done": {
+      const pieces = [
+        payloadString(payload, "stoppedReason") ?? "finished",
+        payloadNumber(payload, "findings") !== undefined ? `${payloadNumber(payload, "findings")} findings` : undefined,
+        payloadNumber(payload, "hypotheses") !== undefined ? `${payloadNumber(payload, "hypotheses")} hypotheses` : undefined,
+        payloadNumber(payload, "commandRuns") !== undefined ? `${payloadNumber(payload, "commandRuns")} command runs` : undefined,
+      ].filter(Boolean);
+      return { label: "Run finished", body: pieces.join(" · ") || fallbackBody };
+    }
+    case "project_history_updated": {
+      const target = payloadString(payload, "target");
+      const runs = payloadNumber(payload, "runs");
+      return { label: "Project updated", body: [target, runs !== undefined ? `${runs} runs stored` : undefined].filter(Boolean).join(" · ") || fallbackBody };
+    }
+    case "audit_prepare_command": {
+      const toolchain = payloadString(payload, "toolchain");
+      const command = payloadString(payload, "command");
+      const exitCode = payloadNumber(payload, "exitCode");
+      return { label: "Prepare command", body: [toolchain, command ? shortCommand(command) : undefined, exitCode !== undefined ? `exit ${exitCode}` : undefined].filter(Boolean).join(" · ") || fallbackBody };
+    }
+    default:
+      return undefined;
+  }
 }
 
 function formatActivityTime(time: number): string {
@@ -548,6 +647,26 @@ function appendStreamLine(next: ActivityLine[], now: number, kind: ActivityLine[
   }
 }
 
+function appendFinalStreamLine(next: ActivityLine[], now: number, kind: ActivityLine["kind"], label: string, body: string): void {
+  const normalized = normalizeActivityBody(body);
+  const recentStreamIndex = [...next]
+    .reverse()
+    .findIndex((line) => line.kind === kind && line.label === label && now - line.time <= STREAM_MERGE_WINDOW_MS);
+  if (recentStreamIndex < 0) {
+    next.push({ id: now + next.length, kind, label, body: normalized, time: now });
+    return;
+  }
+  const index = next.length - 1 - recentStreamIndex;
+  const line = next[index];
+  const current = normalizeActivityBody(line.body);
+  const merged = normalized.startsWith(current) || current.startsWith(normalized)
+    ? (normalized.length >= current.length ? normalized : current)
+    : `${current}${normalized}`.includes(`${normalized}${normalized}`)
+      ? current
+      : normalized;
+  next[index] = { ...line, body: normalizeActivityBody(merged), time: now };
+}
+
 function activityEventLabel(kind: string): string {
   switch (kind) {
     case "audit_thinking":
@@ -603,24 +722,25 @@ function appendActivityLine(lines: ActivityLine[], event: ActivityRecord): Activ
           : event.kind;
     const label = activityEventLabel(event.kind);
     const action = event.kind === "audit_action" ? actionSummary(body) : undefined;
+    const summary = event.kind === "audit_action" ? undefined : eventSummary(event, body);
     const actionFailed = event.kind === "audit_action" && event.ok === false;
     const normalizedBody = event.kind === "audit_command_run"
       ? commandRunSummary(body)
       : actionFailed
         ? [action?.body ?? body, typeof event.result === "string" ? event.result : undefined].filter(Boolean).join("\n")
-        : action?.body ?? body;
-    if (event.kind === "audit_thinking" && last?.kind === "thinking" && now - last.time <= STREAM_MERGE_WINDOW_MS) {
-      next[next.length - 1] = { ...last, body: normalizeActivityBody(normalizedBody), time: now };
+        : action?.body ?? summary?.body ?? body;
+    if (event.kind === "audit_thinking") {
+      appendFinalStreamLine(next, now, "thinking", "Thinking", normalizedBody);
       return next.slice(-60);
     }
     if (event.kind === "audit_text") {
-      appendStreamLine(next, now, "text", "Output", normalizedBody);
+      appendFinalStreamLine(next, now, "text", "Output", normalizedBody);
       return next.slice(-60);
     }
     next.push({
       id: now + next.length,
       kind: event.kind === "audit_thinking" ? "thinking" : "event",
-      label: actionFailed ? "Action blocked" : action?.label ?? label,
+      label: actionFailed ? "Action blocked" : action?.label ?? summary?.label ?? label,
       body: normalizeActivityBody(normalizedBody),
       time: now,
     });
