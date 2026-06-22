@@ -201,6 +201,7 @@ export interface PrepareRealTargetSummary {
 export interface PrepareSummary {
   runId?: number;
   status?: string;
+  quality?: "ready" | "preparing" | "needs-review" | "missing" | "invalid" | string;
   manifestStatus?: "present" | "missing" | "invalid" | string;
   manifestState?: string;
   manifestArtifact?: string;

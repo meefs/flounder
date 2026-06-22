@@ -554,6 +554,7 @@ test("api: project detail summarizes the latest prepare manifest and workspace q
 
     const detail = await json(await fetch(base + projectPath));
     assert.equal(detail.prepareSummary.manifestStatus, "present");
+    assert.equal(detail.prepareSummary.quality, "preparing");
     assert.equal(detail.prepareSummary.manifestState, undefined);
     assert.equal(detail.prepareSummary.componentsTotal, 1);
     assert.equal(detail.prepareSummary.inScope, 1);
@@ -741,12 +742,14 @@ test("api: source-only prepare does not require real-target confirm guidance", a
 
     const store = MetadataStore.openForOutput(out);
     try {
-      store.startRun({ projectId: created.id, kind: "prepare", runDir, provider: "openai-codex", model: "gpt-5.5" });
+      const runId = store.startRun({ projectId: created.id, kind: "prepare", runDir, provider: "openai-codex", model: "gpt-5.5" });
+      store.finishRun(runId, "done");
     } finally {
       store.close();
     }
 
     const detail = await json(await fetch(base + `/api/projects/${created.uuid}`));
+    assert.equal(detail.prepareSummary.quality, "ready");
     assert.equal(detail.prepareSummary.realTarget.requiresConfirmation, false);
     assert.equal(detail.prepareSummary.realTarget.guidance.required, false);
     assert.equal(detail.prepareSummary.realTarget.guidance.allowedNetworkActions, "none");
@@ -811,6 +814,7 @@ test("api: unresolved prepare manifest status is surfaced as a review issue", as
     }
 
     const detail = await json(await fetch(base + "/api/projects/" + created.uuid));
+    assert.equal(detail.prepareSummary.quality, "preparing");
     assert.equal(detail.prepareSummary.manifestState, "in_progress");
     assert.deepEqual(detail.prepareSummary.gaps, ["deployment-artifacts-unresolved: Live deployment artifacts are still being resolved."]);
     assert.match(detail.prepareSummary.issues.join("\n"), /prepare manifest status is in_progress/);
@@ -973,6 +977,7 @@ test("api: terminal prepare runs display stale in-progress manifests as partial"
     }
 
     const detail = await json(await fetch(base + "/api/projects/" + created.uuid));
+    assert.equal(detail.prepareSummary.quality, "needs-review");
     assert.equal(detail.prepareSummary.manifestState, "partial");
     assert.deepEqual(detail.prepareSummary.gaps, ["deployment-artifacts-unresolved: Live deployment artifacts are still being resolved."]);
     assert.match(detail.prepareSummary.issues.join("\n"), /staged materials are usable but partial/);
@@ -1031,6 +1036,7 @@ test("api: terminal prepare manifests with unresolved placeholders display as pa
     }
 
     const detail = await json(await fetch(base + "/api/projects/" + created.uuid));
+    assert.equal(detail.prepareSummary.quality, "needs-review");
     assert.equal(detail.prepareSummary.manifestState, "partial");
     assert.equal(detail.prepareSummary.sourcePinned, 0);
     assert.match(detail.prepareSummary.issues.join("\n"), /unresolved prepare placeholder/);

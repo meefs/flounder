@@ -1824,6 +1824,10 @@ function ProjectDetailView(props: {
 
 function prepareMaterialsAttention(summary?: PrepareSummary | null): { tone: "warn" | "pending"; label: string } | null {
   if (!summary) return null;
+  if (summary.quality === "ready") return null;
+  if (summary.quality === "preparing") {
+    return { tone: "pending", label: "Prepared materials are still being resolved" };
+  }
   const issues = summary.issues?.length ?? 0;
   const gaps = summary.gaps?.length ?? 0;
   const manifestMissing = summary.manifestStatus && summary.manifestStatus !== "present" ? 1 : 0;
@@ -1832,7 +1836,7 @@ function prepareMaterialsAttention(summary?: PrepareSummary | null): { tone: "wa
   const count = issues + gaps + manifestMissing + manifestPartial;
   if (count <= 0) return null;
   return {
-    tone: manifestMissing ? "pending" : "warn",
+    tone: summary.quality === "missing" ? "pending" : "warn",
     label: `Prepared materials need review: ${plural(count, "issue")}`,
   };
 }
@@ -2102,8 +2106,21 @@ function PrepareMaterialsCard({ summary }: { summary: PrepareSummary }) {
   const gaps = summary.gaps ?? [];
   const realTarget = summary.realTarget;
   const manifestReady = summary.manifestStatus === "present";
-  const needsReview = issues.length > 0 || gaps.length > 0;
-  const quality = needsReview ? "warn" : manifestReady ? "ok" : "pending";
+  const needsReview = summary.quality === "needs-review" || issues.length > 0 || gaps.length > 0;
+  const quality = summary.quality === "ready" ? "ok" : summary.quality === "preparing" || summary.quality === "missing" ? "pending" : "warn";
+  const qualityLabel = summary.quality === "ready"
+    ? "Ready for sealed audit"
+    : summary.quality === "preparing"
+      ? "Preparing materials"
+      : summary.quality === "missing"
+        ? "Prepare output missing"
+        : summary.quality === "invalid"
+          ? "Prepare output invalid"
+          : needsReview
+            ? "Needs review"
+            : manifestReady
+              ? "Ready for sealed audit"
+              : "Preparing materials";
   const workspace = summary.workspace ?? {};
   const filesLabel = workspace.filesTruncated ? `${(workspace.files ?? 0).toLocaleString()}+` : (workspace.files ?? 0).toLocaleString();
   const scopeDeclaration = readableScopeDeclaration(summary.scopeDeclaration);
@@ -2114,7 +2131,7 @@ function PrepareMaterialsCard({ summary }: { summary: PrepareSummary }) {
           <div className={`prepare-quality ${quality}`}>
             <span className="dot" />
             <span>
-              <strong>{needsReview ? "Needs review" : manifestReady ? "Ready for sealed audit" : "Preparing materials"}</strong>
+              <strong>{qualityLabel}</strong>
               <small>
                 Run #{summary.runId ?? "-"} · {summary.status ?? "unknown"} · manifest {summary.manifestStatus ?? "unknown"}{summary.manifestState ? ` · ${summary.manifestState}` : ""}
               </small>

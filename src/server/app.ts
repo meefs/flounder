@@ -935,9 +935,20 @@ function readPrepareSummary(run: Record<string, unknown>): Record<string, unknow
     }
   }
 
+  const summaryIssues = uniqueStrings(issues).slice(0, 12);
+  const summaryGaps = summarizePrepareGaps(manifest?.gaps);
+  const quality = prepareSummaryQuality({
+    runStatus,
+    manifestStatus,
+    manifestState,
+    issues: summaryIssues,
+    gaps: summaryGaps,
+  });
+
   return {
     runId: run.id,
     status: run.status,
+    quality,
     manifestStatus,
     manifestState: manifestState || undefined,
     manifestArtifact: manifestPath ? "prepare_manifest.json" : undefined,
@@ -951,12 +962,28 @@ function readPrepareSummary(run: Record<string, unknown>): Record<string, unknow
     matched,
     unverified,
     sourcePinned,
-    gaps: summarizePrepareGaps(manifest?.gaps),
+    gaps: summaryGaps,
     offscope: summarizePrepareGaps(manifest?.offscope),
     realTarget,
-    issues: uniqueStrings(issues).slice(0, 12),
+    issues: summaryIssues,
     workspace,
   };
+}
+
+function prepareSummaryQuality(input: {
+  runStatus: string;
+  manifestStatus: "present" | "missing" | "invalid";
+  manifestState: string;
+  issues: string[];
+  gaps: string[];
+}): "ready" | "preparing" | "needs-review" | "missing" | "invalid" {
+  if (input.manifestStatus === "invalid") return "invalid";
+  if (input.manifestStatus === "missing") return input.runStatus === "running" ? "preparing" : "missing";
+  if (input.runStatus === "running") return "preparing";
+  const state = input.manifestState.trim().toLowerCase();
+  if (state && !["ready", "done", "complete", "completed", "verified"].includes(state)) return "needs-review";
+  if (input.issues.length > 0 || input.gaps.length > 0) return "needs-review";
+  return "ready";
 }
 
 function summarizePrepareComponent(component: Record<string, unknown>): Record<string, unknown> {
