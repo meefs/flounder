@@ -129,7 +129,7 @@ export function pct(a: number | null | undefined, t: number | null | undefined):
 }
 
 interface RunStages {
-  synthesis?: { scopes?: number; produced?: number; pool?: number; at?: string };
+  synthesis?: { scopes?: number; produced?: number; pool?: number; status?: string; startedAt?: string; at?: string };
 }
 
 function stages(run: RunRow | undefined): RunStages {
@@ -156,17 +156,18 @@ export function phaseState(detail: ProjectDetail, progress: Coverage): PhaseStat
   const audit = runs.find((r) => r.status === "running" && ["run", "audit", "map"].includes(r.kind));
   const auditLatest = latest("run", "audit", "map");
   const verifyLatest = runs.find((run) => isVerifyRun(run));
+  const activeScope = (detail.activeScopeCount ?? 0) > 0 || Boolean((detail.scopes ?? []).some((scope) => scope.status === "auditing"));
   const digStarted = Boolean(audit && audit.run_scopes_target != null);
   const mapRunning = Boolean(audit && audit.kind !== "audit" && !digStarted);
-  const digRunning = Boolean(audit && (audit.kind === "audit" || digStarted));
   const batchDone = runScopeBatchComplete(audit);
-  const finalizingAudit = Boolean(batchDone && audit && !isVerifyRun(audit));
+  const isVerify = isVerifyRun(audit);
+  const finalizingAudit = Boolean(batchDone && audit && !isVerify && !activeScope);
+  const digRunning = Boolean(audit && !isVerify && (audit.kind === "audit" || digStarted) && !finalizingAudit);
   const thisRun = audit && audit.run_scopes_target != null
     ? batchDone
       ? " · finalizing"
       : ` · current run ${audit.run_scopes_done ?? 0}/${audit.run_scopes_target}`
     : "";
-  const isVerify = isVerifyRun(audit);
   const verifyStat = isVerify
     ? `Verifying ${audit?.run_scopes_done ?? 0}/${audit?.run_scopes_target ?? "?"} findings${detail.findingsTotal ? ` · ${detail.findingsTotal} in project` : ""}`
     : "";
@@ -183,6 +184,13 @@ export function phaseState(detail: ProjectDetail, progress: Coverage): PhaseStat
       ? boundMs && endMs > boundMs
         ? fmtDur(endMs - boundMs)
         : runDur(auditLatest, false)
+      : "";
+  const synthesisStartMs = synthesis?.startedAt ? new Date(synthesis.startedAt).getTime() : 0;
+  const synthesisEndMs = synthesis?.at ? new Date(synthesis.at).getTime() : 0;
+  const synthesisDur = finalizingAudit && synthesisStartMs
+    ? fmtDur(Date.now() - synthesisStartMs)
+    : synthesisStartMs && synthesisEndMs > synthesisStartMs
+      ? fmtDur(synthesisEndMs - synthesisStartMs)
       : "";
   const reportable = detail.confirmDecisions.filter((row) => row.reproduced === "yes");
   const submitCandidates = reportable.filter((row) => row.recommendation === "submit-candidate").length;
@@ -216,7 +224,7 @@ export function phaseState(detail: ProjectDetail, progress: Coverage): PhaseStat
           : progress.audited > 0
             ? "No cross-scope candidate"
             : "Not started",
-      dur: "",
+      dur: synthesisDur,
     },
     verify: {
       status: isVerify

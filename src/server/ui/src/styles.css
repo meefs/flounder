@@ -2006,6 +2006,45 @@ small {
   color: var(--fg);
 }
 
+.executor-setup {
+  margin-bottom: 14px;
+}
+
+.executor-setup summary {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.executor-setup summary::-webkit-details-marker {
+  display: none;
+}
+
+.executor-setup summary::before {
+  content: "›";
+  color: var(--fg-subtle);
+  font-size: 16px;
+  line-height: 1;
+  transition: transform .14s ease;
+}
+
+.executor-setup[open] summary {
+  margin-bottom: 6px;
+}
+
+.executor-setup[open] summary::before {
+  transform: rotate(90deg);
+}
+
+.executor-setup summary small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .run-notice {
   margin: 16px 0 0;
   border-color: color-mix(in srgb, var(--accent) 34%, var(--border));
@@ -2077,6 +2116,7 @@ small {
 
 .inline-editor + .resource-list,
 .info-panel + .resource-list,
+.info-panel + .daemon-group,
 .token-panel + .daemon-group {
   margin-top: 14px;
 }

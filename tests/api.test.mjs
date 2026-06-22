@@ -671,6 +671,8 @@ test("api: active jobs keep auditing scopes in flight", async () => {
 
     const scopes = await json(await fetch(base + `/api/projects/${created.uuid}/scopes`));
     assert.deepEqual(scopes.scopes.map((scope) => [scope.scope_id, scope.status]), [["live", "auditing"]]);
+    const detail = await json(await fetch(base + `/api/projects/${created.uuid}`));
+    assert.equal(detail.activeScopeCount, 1);
 
     const inventory = await loadScopeInventory(inventoryDir);
     assert.deepEqual(inventory.map((scope) => [scope.id, scope.status]), [["live", "auditing"]]);

@@ -485,7 +485,7 @@ function findingsSummary(detail: ProjectDetail): string {
 }
 
 interface RunStages {
-  synthesis?: { scopes?: number; produced?: number; pool?: number; at?: string };
+  synthesis?: { scopes?: number; produced?: number; pool?: number; status?: string; startedAt?: string; at?: string };
   differential?: { tested?: number; confirmed?: number; at?: string };
   refutation?: { candidates?: number; refuted?: number; disputed?: number; at?: string };
 }
@@ -2827,8 +2827,12 @@ function ProviderForm({ provider, onCancel, onSaved, onError }: { provider: Prov
 function DaemonsPane({ daemons, onRefresh }: { daemons: DaemonRow[]; onRefresh: () => Promise<void> }) {
   const [creating, setCreating] = useState(false);
   const [created, setCreated] = useState<{ name: string; token: string } | null>(null);
+  const [setupOpen, setSetupOpen] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<number | null>(null);
   const [error, setError] = useState("");
+  useEffect(() => {
+    if (created) setSetupOpen(true);
+  }, [created]);
   const groups = {
     online: daemons.filter((d) => daemonHealth(d) === "online"),
     recent: daemons.filter((d) => daemonHealth(d) === "recent"),
@@ -2853,13 +2857,16 @@ function DaemonsPane({ daemons, onRefresh }: { daemons: DaemonRow[]; onRefresh: 
         </div>
         <Button variant="primary" icon="package" onClick={() => { setCreating(true); setError(""); }}>New Daemon</Button>
       </div>
-      <div className="info-panel">
-        <strong>Local executor setup</strong>
+      <details className="info-panel executor-setup" open={setupOpen} onToggle={(event) => setSetupOpen(event.currentTarget.open)}>
+        <summary>
+          <strong>Setup local executor</strong>
+          <small>{created ? "Token minted. Run the command below on the daemon machine." : "Connection command and provider auth checks"}</small>
+        </summary>
         <span>Click <strong>New Daemon</strong> to mint a token, then run the printed command in another terminal. Before starting work, authenticate the selected providers on that daemon machine with <code>flounder daemon provider login &lt;provider&gt;</code> or provider-specific environment variables.</span>
-        <code>flounder daemon start --server {window.location.origin} --token &lt;token&gt;</code>
+        <code>{created ? daemonCommand : `flounder daemon start --server ${window.location.origin} --token <token>`}</code>
         <code>flounder daemon provider check openai-codex</code>
         <span>Project paths resolve under the daemon workspace. The default is ~/.flounder/workspace; pass --workspace to use another root.</span>
-      </div>
+      </details>
       {error ? <div className="inline-error">{error}</div> : null}
       {creating ? (
         <DaemonCreateForm

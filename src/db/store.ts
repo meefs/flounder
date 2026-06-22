@@ -550,7 +550,11 @@ export class MetadataStore {
     const row = this.db.prepare("SELECT stages_json FROM run WHERE id = ?").get(runId) as { stages_json?: string } | undefined;
     let stages: Record<string, unknown> = {};
     try { if (row?.stages_json) stages = JSON.parse(row.stages_json) as Record<string, unknown>; } catch { /* reset on corruption */ }
-    stages[name] = { ...(stages[name] as Record<string, unknown> | undefined), ...info, at: now() };
+    const ts = now();
+    const previous = stages[name] && typeof stages[name] === "object" ? (stages[name] as Record<string, unknown>) : {};
+    const previousStartedAt = typeof previous.startedAt === "string" ? previous.startedAt : undefined;
+    const startedAt = previousStartedAt ?? (info.status === "running" ? ts : undefined);
+    stages[name] = { ...previous, ...info, ...(startedAt ? { startedAt } : {}), at: ts };
     this.db.prepare("UPDATE run SET stages_json = ? WHERE id = ?").run(JSON.stringify(stages), runId);
   }
 
@@ -623,6 +627,10 @@ export class MetadataStore {
 
   countScopes(projectId: number): number {
     return Number((this.db.prepare("SELECT COUNT(*) AS n FROM scope WHERE project_id = ?").get(projectId) as { n: number }).n);
+  }
+
+  countScopesByStatus(projectId: number, status: string): number {
+    return Number((this.db.prepare("SELECT COUNT(*) AS n FROM scope WHERE project_id = ? AND status = ?").get(projectId, status) as { n: number }).n);
   }
 
   queryScopes(projectId: number, opts: { limit?: number; offset?: number } = {}): Array<Record<string, unknown>> {

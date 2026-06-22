@@ -736,6 +736,7 @@ async function projectGet(c: Ctx): Promise<void> {
       confirmedBugs: reproducedBugs,
       runs,
       runsTotal: c.store.countRuns(id),
+      activeScopeCount: c.store.countScopesByStatus(id, "auditing"),
       confirmDecisions: c.store.listConfirmDecisions(id),
       scopes,
       allFindings: findingSummaries,

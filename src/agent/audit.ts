@@ -471,6 +471,7 @@ export async function runAudit(
     if (cfg.auditSynthesize !== false && scopeInventory.length > 1 && aggregated.length > 0 && !options.signal?.aborted) {
       clearScratchFindings(session);
       await logger.event("audit_synthesis_start", { scopes: scopeInventory.length, findings: aggregated.length });
+      recorder.stage("synthesis", { scopes: scopeInventory.length, pool: aggregated.length, status: "running" });
       const synthPhase = await runPhase(withRole(cfg, "dig"), { mode: "synthesize", synthSeed: buildSynthesisSeed(aggregated, scopeInventory), maxSteps: cfg.auditDigSteps });
       aggregatedSteps.push(...synthPhase.steps);
       ingestFindingsFromScratch(session);
@@ -478,7 +479,7 @@ export async function runAudit(
       const produced = session.findings.length;
       await logger.event("audit_synthesis_done", { produced });
       recorder.findings(aggregated, logger.runDir, "synthesis");
-      recorder.stage("synthesis", { scopes: scopeInventory.length, produced, pool: aggregated.length }); // funnel: cross-scope chains ADDED
+      recorder.stage("synthesis", { scopes: scopeInventory.length, produced, pool: aggregated.length, status: "done" }); // funnel: cross-scope chains ADDED
     }
     // Each scope/dig session numbered its findings independently (f1, f2, …), so
     // aggregating across scopes collides. Re-id uniquely so every finding gets its

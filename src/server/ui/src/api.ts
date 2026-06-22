@@ -134,6 +134,7 @@ export interface ProjectDetail {
   confirmedBugs: number;
   runs: RunRow[];
   runsTotal: number;
+  activeScopeCount?: number;
   confirmDecisions: ConfirmDecision[];
   scopes?: ScopeRow[];
   allFindings?: FindingRow[];

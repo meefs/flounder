@@ -50,12 +50,37 @@ test("store: scope coverage tracks mapped vs audited", async () => {
     { scopeId: "s1", title: "decode", status: "audited" },
     { scopeId: "s2", title: "settle", status: "pending" },
     { scopeId: "s3", title: "withdraw", status: "pending" },
+    { scopeId: "s4", title: "execute", status: "auditing" },
   ]);
-  assert.deepEqual(db.scopeProgress(projectId), { total: 3, audited: 1, pending: 2, deferred: 0 });
+  assert.deepEqual(db.scopeProgress(projectId), { total: 4, audited: 1, pending: 3, deferred: 0 });
+  assert.equal(db.countScopesByStatus(projectId, "auditing"), 1);
 
   // re-mapping the same scope id updates it in place (one row per project+scope)
   db.upsertScopes(projectId, [{ scopeId: "s2", title: "settle", status: "audited" }]);
-  assert.deepEqual(db.scopeProgress(projectId), { total: 3, audited: 2, pending: 1, deferred: 0 });
+  assert.deepEqual(db.scopeProgress(projectId), { total: 4, audited: 2, pending: 2, deferred: 0 });
+  db.close();
+});
+
+test("store: stage timing preserves startedAt across updates", async () => {
+  const db = await tempDb();
+  const projectId = db.upsertProject({ name: "p" });
+  const runId = db.startRun({ projectId, kind: "run", runDir: "/runs/p-1" });
+
+  db.recordStage(runId, "synthesis", { status: "running", scopes: 12, pool: 4 });
+  const running = JSON.parse(String(db.listRuns(projectId)[0].stages_json)).synthesis;
+  assert.equal(running.status, "running");
+  assert.equal(running.scopes, 12);
+  assert.equal(running.pool, 4);
+  assert.ok(running.startedAt);
+
+  db.recordStage(runId, "synthesis", { status: "done", produced: 2 });
+  const done = JSON.parse(String(db.listRuns(projectId)[0].stages_json)).synthesis;
+  assert.equal(done.status, "done");
+  assert.equal(done.produced, 2);
+  assert.equal(done.scopes, 12);
+  assert.equal(done.pool, 4);
+  assert.equal(done.startedAt, running.startedAt);
+  assert.ok(done.at);
   db.close();
 });
 
