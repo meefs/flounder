@@ -94,11 +94,15 @@ test("prompt contract keeps attacker-faithful PoC rule on legacy and pi-session 
   assert.ok(preparePrompt.includes("Write prepare_manifest.json EARLY"), "prepare should persist a usable manifest before chasing long-tail dependencies");
   assert.ok(preparePrompt.includes("early checkpoint"), "prepare should checkpoint a partial manifest before long-tail acquisition");
   assert.ok(preparePrompt.includes("ordinary package-manager dependency"), "prepare should not chase every package dependency when manifests can resolve them");
-  assert.ok(preparePrompt.includes("stop once the sealed audit has enough neutral material"), "prepare needs explicit stop criteria");
+  assert.ok(preparePrompt.includes("stop only after the manifest has nonempty component rows"), "prepare should not stop with staged files but empty components");
+  assert.ok(preparePrompt.includes("source-only not_required_reason"), "prepare needs explicit source-only stop criteria");
+  assert.ok(preparePrompt.includes("A nonempty workspace with an empty components array is not a usable prepare output"), "prepare should reject empty component manifests");
   assert.ok(preparePrompt.includes("Do NOT audit yet"), "prepare should not spend the acquisition phase hunting bugs");
   assert.ok(preparePrompt.includes("leave all bug discovery to map/dig"), "prepare should preserve the blind audit boundary");
   assert.ok(preparePrompt.includes("real_target"), "prepare should require a real-target confirmation plan");
   assert.ok(preparePrompt.includes("requires_confirmation"), "prepare should explicitly decide whether real-target confirmation is required");
+  assert.ok(preparePrompt.includes("real_target.requires_confirmation=true"), "prepare should identify real-target confirmation mode");
+  assert.ok(preparePrompt.includes("ground_truth must list"), "prepare should not leave real-target confirmation unresolved");
   assert.ok(preparePrompt.includes("chain_id"), "prepare should capture chain identifiers for deployed targets");
   assert.ok(preparePrompt.includes("source-only"), "prepare should support source-only audits without forcing chain confirmation");
 
