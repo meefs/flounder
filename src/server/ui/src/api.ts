@@ -33,6 +33,7 @@ export interface ProjectSnapshot {
   confirmPendingFindings?: number;
   confirmDecisionCount?: number;
   activeRuns?: number;
+  currentRunCount?: number;
   latestRun?: RunRow | null;
 }
 
@@ -74,6 +75,9 @@ export interface RunRow {
   last_activity_at?: string | null;
   inactive_seconds?: number | null;
   stale_activity?: boolean | null;
+  material_stale?: boolean | null;
+  stale_since_prepare_run_id?: number | null;
+  stale_since_prepare_started_at?: string | null;
   job_id?: number | null;
   job_status?: string | null;
   job_error?: string | null;
@@ -145,6 +149,7 @@ export interface ProjectDetail {
   confirmedBugs: number;
   runs: RunRow[];
   runsTotal: number;
+  currentRunsTotal?: number;
   activeScopeCount?: number;
   confirmDecisions: ConfirmDecision[];
   scopes?: ScopeRow[];

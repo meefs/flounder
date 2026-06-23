@@ -743,6 +743,7 @@ async function projectGet(c: Ctx): Promise<void> {
       confirmedBugs: reproducedBugs,
       runs,
       runsTotal: c.store.countRuns(id),
+      currentRunsTotal: currentRunsRaw.length,
       activeScopeCount: currentScopeRunExists ? c.store.countScopesByStatus(id, "auditing") : 0,
       confirmDecisions,
       scopes,
@@ -2667,10 +2668,15 @@ function projectSnapshots(store: MetadataStore): Array<Record<string, unknown>> 
   for (const job of store.runningJobs()) activeByTarget.set(String(job.project), (activeByTarget.get(String(job.project)) ?? 0) + 1);
   return store.listProjects().map((project) => {
     const id = Number(project.id);
-    const findings = reportableFindings(store.listFindings(id));
+    const allRuns = store.listRuns(id);
+    const materialBoundary = latestPrepareRun(allRuns);
+    const currentRuns = currentMaterialRuns(allRuns, materialBoundary);
+    const currentRunIds = runIdSet(currentRuns);
+    const currentScopeRunExists = !materialBoundary || currentRuns.some(isScopeInventoryRun);
+    const findings = reportableFindings(store.listFindings(id).filter((row) => rowBelongsToCurrentMaterial(row, currentRunIds, materialBoundary)));
     const counts = findingCounts(findings);
-    const reproducedBugs = store.countConfirmedBugs(id);
-    const confirmDecisions = store.listConfirmDecisions(id);
+    const confirmDecisions = store.listConfirmDecisions(id).filter((row) => rowBelongsToCurrentMaterial(row, currentRunIds, materialBoundary));
+    const reproducedBugs = confirmDecisions.filter((row) => row.reproduced === "yes").length;
     const verifyPendingFindings = (counts.suspected ?? 0) + (counts["confirmed-source"] ?? 0);
     const confirmPendingFindings = findings.filter((finding) => {
       const status = String(finding.status ?? "");
@@ -2684,7 +2690,7 @@ function projectSnapshots(store: MetadataStore): Array<Record<string, unknown>> 
       daemon_id: project.daemon_id ?? null,
       dir: project.dir ?? null,
       config: safeParse(project.config_json),
-      progress: store.scopeProgress(id),
+      progress: currentScopeRunExists ? store.scopeProgress(id) : emptyProgress(),
       findingCounts: counts,
       findingsTotal: findings.length,
       auditConfirmedFindings: countAuditConfirmedFindings(findings),
@@ -2694,7 +2700,8 @@ function projectSnapshots(store: MetadataStore): Array<Record<string, unknown>> 
       confirmPendingFindings,
       confirmDecisionCount: confirmDecisions.length,
       runCount: store.countRuns(id),
-      latestRun: store.latestRun(id) ?? null,
+      currentRunCount: currentRuns.length,
+      latestRun: runApiRows(store, allRuns.slice(0, 1), undefined, materialBoundary)[0] ?? null,
       activeRuns: activeByTarget.get(String(project.name)) ?? 0,
     };
   });

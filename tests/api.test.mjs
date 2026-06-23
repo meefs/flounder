@@ -423,12 +423,21 @@ test("api: project current view ignores downstream data from older prepare mater
     assert.equal(detail.findingsTotal, 0);
     assert.equal(detail.progress.total, 0);
     assert.equal(detail.auditConfirmedFindings, 0);
+    assert.equal(detail.currentRunsTotal, 1);
     assert.equal(detail.material.currentPrepareRunId > 0, true);
     assert.equal(detail.runs.some((run) => run.kind === "audit" && run.material_stale === true), true);
 
     const scopes = await json(await fetch(base + `/api/projects/${created.uuid}/scopes`));
     assert.equal(scopes.total, 0);
     assert.deepEqual(scopes.scopes, []);
+
+    const list = await json(await fetch(base + "/api/projects"));
+    const snapshot = list.projects.find((project) => project.uuid === created.uuid);
+    assert.equal(snapshot.progress.total, 0);
+    assert.equal(snapshot.findingsTotal, 0);
+    assert.equal(snapshot.auditConfirmedFindings, 0);
+    assert.equal(snapshot.reproducedBugs, 0);
+    assert.equal(snapshot.currentRunCount, 1);
   });
 });
 

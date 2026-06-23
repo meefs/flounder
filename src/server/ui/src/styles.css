@@ -601,10 +601,13 @@ small {
 .pipeline {
   position: relative;
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(178px, 1fr));
+  grid-template-columns: repeat(7, minmax(180px, 1fr));
   gap: 8px;
   margin-top: 18px;
-  overflow: visible;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 2px;
+  scroll-padding-inline: 2px;
   border: 0;
   background: transparent;
 }
@@ -613,6 +616,7 @@ small {
   position: relative;
   z-index: 1;
   min-height: 136px;
+  min-width: 180px;
   padding: 13px 16px 14px;
   border: 1px solid var(--border);
   border-radius: 9px;
@@ -780,6 +784,7 @@ small {
   font-weight: 560;
   line-height: 1.3;
   min-height: 38px;
+  margin-bottom: 4px;
   display: -webkit-box;
   overflow: hidden;
   -webkit-line-clamp: 2;
@@ -796,7 +801,8 @@ small {
   flex-direction: column;
   align-items: flex-start;
   gap: 4px;
-  min-height: 48px;
+  flex: 1;
+  min-height: 52px;
   justify-content: flex-start;
   color: var(--fg-muted);
 }
@@ -811,6 +817,7 @@ small {
 
 .phase-time {
   display: block;
+  margin-top: auto;
   color: var(--accent);
   font-weight: 650;
   white-space: nowrap;

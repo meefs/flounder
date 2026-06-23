@@ -141,8 +141,12 @@ function latestRunWithStage(runs: RunRow[], stage: keyof RunStages): RunRow | un
   return runs.find((run) => Boolean(stages(run)[stage]));
 }
 
+export function currentMaterialRuns(runs: RunRow[] | undefined): RunRow[] {
+  return (runs ?? []).filter((run) => !run.material_stale);
+}
+
 export function phaseState(detail: ProjectDetail, progress: Coverage): PhaseState {
-  const runs = detail.runs ?? [];
+  const runs = currentMaterialRuns(detail.runs);
   const latest = (...kinds: string[]) => runs.find((r) => kinds.includes(r.kind));
   const prep = latest("prepare");
   const repro = confirmedDecisions(detail.confirmDecisions).length;

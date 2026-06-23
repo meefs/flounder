@@ -18,6 +18,7 @@ import {
 import { Button, Card, Counter, IconButton, Modal, StateBadge, StatusBadge } from "./components";
 import {
   confirmedDecisions,
+  currentMaterialRuns,
   fmtDur,
   fmtTime,
   isVerifyRun,
@@ -1587,12 +1588,13 @@ function ProjectDetailView(props: {
   const selectedDaemonOnline = selectedDaemon ? daemonHealth(selectedDaemon) === "online" : false;
   const online = selectedDaemonOnline ? [selectedDaemon] : [];
   const phases = phaseState(detail, detail.progress);
+  const currentRuns = currentMaterialRuns(detail.runs);
   const topCandidates = topCandidateFindings(detail.allFindings);
   const verifyCandidates = pendingVerifyFindings(detail.allFindings);
   const overviewCandidates = verifyCandidates.length ? verifyCandidates : topCandidates;
   const confirmed = totalConfirmed(project);
   const reproduced = confirmedDecisions(detail.confirmDecisions).length;
-  const runningRun = detail.runs.find((run) => run.status === "running");
+  const runningRun = currentRuns.find((run) => run.status === "running");
   const runningInactive = runningRun ? runInactiveLabel(runningRun) : null;
   const pendingConfirm = pendingConfirmFindings(detail.allFindings).length;
   const pendingVerify = verifyCandidates.length;
@@ -1798,7 +1800,7 @@ function ProjectDetailView(props: {
           <Stat n={overviewCandidates.length} label={pendingVerify ? "to verify" : "top candidates"} onClick={() => { props.setFindingStatus(""); props.setFindingQuery(""); setTab("overview"); scrollToProjectSection("project-top-candidates"); }} />
           <Stat n={confirmed} label="confirmed" good onClick={() => { props.setFindingStatus("execution-confirmed"); props.setFindingQuery(""); setTab("findings"); }} />
           <Stat n={reproduced} label="reproduced" onClick={() => { setTab("overview"); scrollToProjectSection("project-real-target-decisions"); }} />
-          <Stat n={detail.runsTotal} label="runs" onClick={() => setTab("runs")} />
+          <Stat n={detail.currentRunsTotal ?? currentRuns.length} label="runs" onClick={() => setTab("runs")} />
         </div>
         <RealTargetCallout decisions={detail.confirmDecisions} onOpen={() => { setTab("overview"); scrollToProjectSection("project-real-target-decisions"); }} />
         <ProjectSetupDisclosure items={readyItems} />
@@ -1921,8 +1923,9 @@ function ProjectOverview({
   onVerifyCandidates: () => void;
   onOpenReport: (finding: FindingRow) => void;
 }) {
-  const current = detail.runs.find((run) => run.status === "running") ?? detail.runs[0];
-  const runningRun = detail.runs.find((run) => run.status === "running");
+  const currentRuns = currentMaterialRuns(detail.runs);
+  const current = currentRuns.find((run) => run.status === "running") ?? currentRuns[0];
+  const runningRun = currentRuns.find((run) => run.status === "running");
   const pendingConfirm = pendingConfirmFindings(detail.allFindings).length;
   const sourceConfirmed = detail.statusCounts["confirmed-source"] ?? 0;
   const suspectedLeads = detail.statusCounts.suspected ?? 0;
