@@ -720,11 +720,12 @@ async function projectGet(c: Ctx): Promise<void> {
     const allRunsRaw = c.store.listRuns(id);
     const materialBoundary = latestPrepareRun(allRunsRaw);
     const activePrepareRefresh = activePrepareRefreshStartedAt(c.store, project, materialBoundary);
+    const viewBoundary = materialViewBoundary(materialBoundary, activePrepareRefresh);
     const currentRunsRaw = activePrepareRefresh
       ? allRunsRaw.filter((run) => stringValue(run.started_at) >= activePrepareRefresh)
       : currentMaterialRuns(allRunsRaw, materialBoundary);
     const currentRunIds = runIdSet(currentRunsRaw);
-    const runs = runApiRows(c.store, allRunsRaw.slice(0, 50), c.plane, materialBoundary);
+    const runs = runApiRows(c.store, allRunsRaw.slice(0, 50), c.plane, viewBoundary);
     const currentScopeRunExists = !activePrepareRefresh && (!materialBoundary || currentRunsRaw.some(isScopeInventoryRun));
     const storedProgress = currentScopeRunExists ? c.store.scopeProgress(id) : emptyProgress();
     const storedScopes = currentScopeRunExists ? c.store.queryScopes(id, { limit: 50, offset: 0 }) : [];
@@ -831,6 +832,16 @@ function activePrepareRefreshStartedAt(store: MetadataStore, project: Record<str
   return !boundaryStarted || startedAt >= boundaryStarted ? startedAt : undefined;
 }
 
+function materialViewBoundary(boundary: Record<string, unknown> | undefined, activePrepareRefreshStartedAt?: string): Record<string, unknown> | undefined {
+  if (!activePrepareRefreshStartedAt) return boundary;
+  return {
+    ...(boundary ?? {}),
+    status: "running",
+    started_at: activePrepareRefreshStartedAt,
+    active_prepare_refresh: true,
+  };
+}
+
 function runIdSet(runs: Array<Record<string, unknown>>): Set<number> {
   return new Set(runs.map((run) => Number(run.id)).filter(Number.isFinite));
 }
@@ -875,15 +886,18 @@ async function projectScopesGet(c: Ctx): Promise<void> {
     await reconcileStaleAuditingScopes(c, project);
     const allRuns = c.store.listRuns(id);
     const materialBoundary = latestPrepareRun(allRuns);
-    const currentRuns = currentMaterialRuns(allRuns, materialBoundary);
-    if (materialBoundary && !currentRuns.some(isScopeInventoryRun)) {
+    const activePrepareRefresh = activePrepareRefreshStartedAt(c.store, project, materialBoundary);
+    const currentRuns = activePrepareRefresh
+      ? allRuns.filter((run) => stringValue(run.started_at) >= activePrepareRefresh)
+      : currentMaterialRuns(allRuns, materialBoundary);
+    if (activePrepareRefresh || (materialBoundary && !currentRuns.some(isScopeInventoryRun))) {
       return sendJson(c.res, 200, {
         scopes: [],
         progress: emptyProgress(),
         total: 0,
         limit: clampInt(c.url.searchParams.get("limit"), 50, 1, 500),
         offset: clampInt(c.url.searchParams.get("offset"), 0, 0, 1_000_000),
-        material: materialSummary(allRuns, materialBoundary),
+        material: materialSummary(allRuns, materialBoundary, activePrepareRefresh),
       });
     }
     const limit = clampInt(c.url.searchParams.get("limit"), 50, 1, 500);

@@ -506,6 +506,15 @@ test("api: launching prepare clears the current scope inventory projection", asy
     assert.deepEqual(detail.confirmDecisions, []);
     assert.equal(detail.prepareSummary, null);
     assert.ok(detail.material.activePrepareRefreshStartedAt);
+    assert.equal(detail.currentRunsTotal, 0);
+    assert.equal(detail.runs.filter((run) => !run.material_stale).length, 0);
+    assert.equal(detail.runs.some((run) => run.kind === "audit" && run.material_stale === true), true);
+    assert.equal(detail.runs.some((run) => run.kind === "confirm" && run.material_stale === true), true);
+
+    const scopes = await json(await fetch(`${base}/api/projects/${created.uuid}/scopes`));
+    assert.equal(scopes.total, 0);
+    assert.deepEqual(scopes.scopes, []);
+    assert.equal(scopes.progress.total, 0);
 
     const list = await json(await fetch(`${base}/api/projects`));
     const snapshot = list.projects.find((project) => project.uuid === created.uuid);
@@ -577,6 +586,9 @@ test("api: running prepare resets the project current view to the new material s
     assert.equal(detail.currentRunsTotal, 1);
     assert.equal(detail.runs[0].kind, "prepare");
     assert.equal(detail.runs.some((run) => run.kind === "audit" && run.material_stale === true), true);
+    assert.equal(detail.runs.some((run) => run.kind === "confirm" && run.material_stale === true), true);
+    assert.equal(detail.runs.some((run) => run.kind === "report" && run.material_stale === true), true);
+    assert.equal(detail.runs.filter((run) => !run.material_stale).map((run) => run.kind).join(","), "prepare");
 
     const currentFindings = await json(await fetch(base + `/api/projects/${created.uuid}/findings`));
     assert.equal(currentFindings.total, 0);

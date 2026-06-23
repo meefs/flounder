@@ -615,7 +615,7 @@ small {
 .phase {
   position: relative;
   z-index: 1;
-  min-height: 154px;
+  min-height: 162px;
   min-width: 192px;
   padding: 13px 16px 13px;
   border: 1px solid var(--border);
@@ -808,10 +808,9 @@ small {
 }
 
 .phase-detail > span:first-child {
-  display: -webkit-box;
-  overflow: hidden;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
+  display: block;
+  overflow: visible;
+  overflow-wrap: anywhere;
 }
 
 .phase-time {
