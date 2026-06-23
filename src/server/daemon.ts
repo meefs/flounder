@@ -12,7 +12,8 @@ import { runConfirm } from "../agent/confirm.js";
 import { runReport } from "../agent/report.js";
 import { runPrepare } from "../agent/acquire.js";
 import { MockAuditLlmClient } from "../llm/mock.js";
-import { specToConfig, type LaunchSpec } from "./run-manager.js";
+import { deriveScopeNote } from "../scope-note.js";
+import { specToConfig, type LaunchSpec, type ReportFindingSpec } from "./run-manager.js";
 import { toScopeRow, toFindingRow, configSnapshot, type RunTracker, type ConfirmDecisionInput, type FindingReportInput } from "../db/record.js";
 import { defaultOutputDir, defaultWorkspaceDir, type AuditorConfig } from "../config.js";
 import type { Coverage, RunStatus } from "../db/store.js";
@@ -59,10 +60,16 @@ export async function runDaemon(opts: DaemonOptions): Promise<void> {
     inflight.set(job.id, abort);
     const spec: LaunchSpec = { ...job.spec, out };
     let tracker: RemoteTracker | undefined;
+    let phaseStarts = 0;
     const sink = activitySink(() => tracker);
     const makeTracker = (cfg: AuditorConfig, runDir: string, kind: string): RunTracker => {
-      tracker = new RemoteTracker(base, headers, { jobId: job.id, project: cfg.targetName, kind, runDir, provider: cfg.provider, model: cfg.auditModel, thinking: cfg.thinkingLevel, budgets: cfg.auditVerify ? { ...configSnapshot(cfg), verify: true } : configSnapshot(cfg) });
+      tracker = new RemoteTracker(base, headers, { jobId: job.id, project: cfg.targetName, kind, runDir, provider: cfg.provider, model: cfg.auditModel, thinking: cfg.thinkingLevel, budgets: cfg.auditVerify ? { ...configSnapshot(cfg), verify: true } : configSnapshot(cfg), additional: phaseStarts > 0 });
+      phaseStarts += 1;
       return tracker;
+    };
+    const flushTracker = async (): Promise<void> => {
+      sink.flush();
+      await tracker?.flush();
     };
     try {
       const cfg = specToConfig(spec, out, workspace);
@@ -71,7 +78,9 @@ export async function runDaemon(opts: DaemonOptions): Promise<void> {
         cfg.sandboxAllowHostFallback = true;
       }
       if (!spec.mockLlm) await assertProviderAuthenticated(cfg.provider);
-      if (spec.verb === "report") {
+      if (spec.verb === "run" && spec.pipeline) {
+        await runPipelineJob(base, headers, spec, { out, workspace, signal: abort.signal, makeTracker, flushTracker, onActivity: sink.push, mockLlm: spec.mockLlm === true, runScopeTargets, jobId: job.id });
+      } else if (spec.verb === "report") {
         if (!spec.reportFindings?.length) throw new Error("report requires reproduced finding inputs");
         await runReport(cfg, { findings: spec.reportFindings, signal: abort.signal, makeTracker, onActivity: sink.push, ...(spec.maxSteps !== undefined ? { maxSteps: spec.maxSteps } : {}) });
       } else if (spec.verb === "confirm") {
@@ -111,12 +120,10 @@ export async function runDaemon(opts: DaemonOptions): Promise<void> {
           if (verifyTempDir) await rm(verifyTempDir, { recursive: true, force: true });
         }
       }
-      sink.flush();
-      await tracker?.flush();
+      await flushTracker();
       await post(base, headers, `/api/daemon/jobs/${job.id}/status`, { status: abort.signal.aborted ? "canceled" : "done" });
     } catch (error) {
-      sink.flush();
-      await tracker?.flush();
+      await flushTracker();
       await post(base, headers, `/api/daemon/jobs/${job.id}/status`, { status: abort.signal.aborted ? "canceled" : "error", error: error instanceof Error ? error.message.slice(0, 500) : String(error) });
     } finally {
       inflight.delete(job.id);
@@ -163,6 +170,132 @@ export async function runDaemon(opts: DaemonOptions): Promise<void> {
   }
 }
 
+async function runPipelineJob(
+  base: string,
+  headers: Record<string, string>,
+  spec: LaunchSpec,
+  ctx: {
+    out: string;
+    workspace: string;
+    signal: AbortSignal;
+    makeTracker: (cfg: AuditorConfig, runDir: string, kind: string) => RunTracker;
+    flushTracker: () => Promise<void>;
+    onActivity: (event: Activity) => void;
+    mockLlm: boolean;
+    runScopeTargets: Map<number, number>;
+    jobId: number;
+  },
+): Promise<void> {
+  let staged = spec.buildRoot ?? spec.sourcePaths[0];
+  let derivedScopeNote: string | undefined;
+  if (spec.clue) {
+    const prepareCfg = specToConfig({ ...spec, verb: "prepare", sourcePaths: [], buildRoot: undefined, corpusPaths: [] }, ctx.out, ctx.workspace);
+    const prepare = await runPrepare(prepareCfg, {
+      clue: spec.clue,
+      posture: spec.posture === "informed" ? "informed" : "blind",
+      matchDeployed: spec.matchDeployed !== false,
+      signal: ctx.signal,
+      makeTracker: ctx.makeTracker,
+      onActivity: ctx.onActivity,
+      ...(spec.endpoint !== undefined ? { endpoint: spec.endpoint } : {}),
+      ...(spec.maxSteps !== undefined ? { maxSteps: spec.maxSteps } : {}),
+    });
+    await ctx.flushTracker();
+    staged = prepare.workspaceDir;
+    derivedScopeNote = deriveScopeNote(prepare.manifest);
+  }
+  if (!staged) throw new Error("pipeline run needs a prepared workspace or a clue for Prepare");
+  const scopeNote = [spec.scopeNote, derivedScopeNote].filter((entry): entry is string => Boolean(entry && entry.trim())).join("\n\n") || undefined;
+  const auditSpec: LaunchSpec = {
+    ...spec,
+    verb: "run",
+    dir: undefined,
+    sourcePaths: [staged],
+    buildRoot: staged,
+    ...(scopeNote ? { scopeNote } : {}),
+  };
+  const auditCfg = specToConfig(auditSpec, ctx.out, ctx.workspace);
+  await runAudit(auditCfg, {
+    kind: "run",
+    signal: ctx.signal,
+    makeTracker: ctx.makeTracker,
+    onActivity: ctx.onActivity,
+    control: { getRunScopesTarget: () => ctx.runScopeTargets.get(ctx.jobId) },
+    ...(ctx.mockLlm ? { llm: new MockAuditLlmClient() } : {}),
+  });
+  await ctx.flushTracker();
+
+  const confirm = await pipelineWorklist(base, headers, spec.target, "confirm");
+  if (confirm.inputRunDir && confirm.inputRunDirs.length > 0 && confirm.confirmKeys.length > 0) {
+    const confirmSpec: LaunchSpec = {
+      ...spec,
+      verb: "confirm",
+      dir: undefined,
+      sourcePaths: [staged],
+      buildRoot: staged,
+      inputRunDir: confirm.inputRunDir,
+      inputRunDirs: confirm.inputRunDirs,
+      confirmKeys: confirm.confirmKeys,
+    };
+    const confirmCfg = specToConfig(confirmSpec, ctx.out, ctx.workspace);
+    await runConfirm(confirmCfg, {
+      inputRunDir: confirmSpec.inputRunDir!,
+      signal: ctx.signal,
+      makeTracker: ctx.makeTracker,
+      onActivity: ctx.onActivity,
+      ...(confirmSpec.inputRunDirs ? { inputRunDirs: confirmSpec.inputRunDirs } : {}),
+      ...(confirmSpec.confirmKeys ? { confirmKeys: confirmSpec.confirmKeys } : {}),
+      ...(spec.maxSteps !== undefined ? { maxSteps: spec.maxSteps } : {}),
+      ...(spec.fresh ? { fresh: true } : {}),
+    });
+    await ctx.flushTracker();
+  }
+
+  const report = await pipelineWorklist(base, headers, spec.target, "report");
+  if (report.reportFindings.length > 0) {
+    const reportSpec: LaunchSpec = {
+      ...spec,
+      verb: "report",
+      dir: undefined,
+      sourcePaths: [staged],
+      buildRoot: staged,
+      reportFindings: report.reportFindings,
+    };
+    const reportCfg = specToConfig(reportSpec, ctx.out, ctx.workspace);
+    await runReport(reportCfg, {
+      findings: report.reportFindings,
+      signal: ctx.signal,
+      makeTracker: ctx.makeTracker,
+      onActivity: ctx.onActivity,
+      ...(spec.maxSteps !== undefined ? { maxSteps: spec.maxSteps } : {}),
+    });
+  }
+}
+
+async function pipelineWorklist(base: string, headers: Record<string, string>, project: string, phase: "confirm" | "report"): Promise<{
+  inputRunDir?: string;
+  inputRunDirs: string[];
+  confirmKeys: string[];
+  reportFindings: ReportFindingSpec[];
+}> {
+  const res = await fetch(base + "/api/daemon/pipeline-worklist", { method: "POST", headers, body: JSON.stringify({ project, phase }) });
+  if (!res.ok) throw new Error(`pipeline ${phase} worklist failed (${res.status})`);
+  const body = (await res.json().catch(() => ({}))) as {
+    inputRunDir?: unknown;
+    inputRunDirs?: unknown;
+    confirmKeys?: unknown;
+    reportFindings?: unknown;
+  };
+  const strings = (value: unknown): string[] => Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0) : [];
+  const inputRunDir = typeof body.inputRunDir === "string" ? body.inputRunDir : undefined;
+  return {
+    ...(inputRunDir ? { inputRunDir } : {}),
+    inputRunDirs: strings(body.inputRunDirs),
+    confirmKeys: strings(body.confirmKeys),
+    reportFindings: Array.isArray(body.reportFindings) ? body.reportFindings as ReportFindingSpec[] : [],
+  };
+}
+
 export async function ensureDaemonDirectories(out: string, workspace: string): Promise<void> {
   await mkdir(path.resolve(out), { recursive: true });
   await mkdir(path.resolve(workspace), { recursive: true });
@@ -199,7 +332,7 @@ class RemoteTracker implements RunTracker {
   constructor(
     private readonly base: string,
     private readonly headers: Record<string, string>,
-    start: { jobId: number; project: string; kind: string; runDir: string; provider?: string; model?: string; thinking?: string; budgets: unknown },
+    start: { jobId: number; project: string; kind: string; runDir: string; provider?: string; model?: string; thinking?: string; budgets: unknown; additional?: boolean },
   ) {
     this.targetName = start.project;
     this.chain = this.req("POST", "/api/daemon/runs", start).then((r) => {

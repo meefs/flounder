@@ -50,7 +50,7 @@ CLI naming convention:
 | Verb | What it does |
 | --- | --- |
 | `flounder prepare <clue>` | Open-world acquisition before map: tx/address/project/repo/link -> staged source, corpus, dependency closure, and deployment match |
-| `flounder run <clue>` | One-command pipeline: prepare -> sealed map/dig -> confirm unless disabled |
+| `flounder run <clue>` | One-command pipeline: prepare -> sealed map/dig -> confirm -> report unless disabled |
 | `flounder run --source <paths...> --target <name>` | Source-provided sealed audit: map -> dig |
 | `flounder map --target <name> --source <paths...>` | Enumerate and persist scope inventory only |
 | `flounder audit <region> --source ...` | Deep-audit one region |
@@ -112,10 +112,10 @@ flounder run --source ./src --build-root . --sandbox-backend host --allow-host-e
 Host mode keeps the copied workspace and isolated `HOME` / package caches, but
 it does not provide kernel-level network or filesystem isolation.
 
-Sealed `run`, `map`, and `audit` confirmation commands should not use public
-network access. `prepare` and `confirm` may fetch, fork, search, and read under
-the white-hat command policy, but they must not broadcast or write to live
-systems.
+Sealed `run --source`, `map`, and `audit` inspection/confirmation commands
+should not use public network access. `prepare` and `confirm` may fetch, fork,
+search, and read under the white-hat command policy, but they must not
+broadcast or write to live systems.
 
 ## Provider Profiles
 
@@ -129,6 +129,9 @@ The dashboard stores provider profiles:
 Projects select a default provider profile and may override it per phase:
 prepare, map, dig, confirm. The selected daemon must authenticate every provider
 profile the project can use.
+
+Fresh stores seed starter profiles named `openai-codex · gpt-5.5 · xhigh` and
+`claude-code · opus 4.8 max`.
 
 ## REST API
 
@@ -145,7 +148,8 @@ curl http://127.0.0.1:4500/api/projects
 curl http://127.0.0.1:4500/api/providers
 curl http://127.0.0.1:4500/api/daemons
 curl http://127.0.0.1:4500/api/projects/<uuid>
-curl http://127.0.0.1:4500/api/projects/<uuid>/findings
+curl 'http://127.0.0.1:4500/api/projects/<uuid>/findings?tracking=active'
+curl 'http://127.0.0.1:4500/api/projects/<uuid>/findings?tracking=ignored'
 curl http://127.0.0.1:4500/api/projects/<uuid>/confirm-decisions
 curl http://127.0.0.1:4500/api/runs/<id>/log
 ```
@@ -155,8 +159,11 @@ Creating a project requires both a provider profile and a daemon:
 ```bash
 curl -X POST http://127.0.0.1:4500/api/projects \
   -H 'content-type: application/json' \
-  -d '{"name":"p","providerId":1,"daemonId":1,"dir":"p","sourcePaths":["."],"buildRoot":".","corpusPaths":["docs/specs"],"config":{"maxScopes":30}}'
+  -d '{"name":"p","providerId":1,"daemonId":1,"sourcePaths":["."],"buildRoot":".","corpusPaths":["docs/specs"],"config":{"prepareClue":"audit this project","maxScopes":30}}'
 ```
+
+If `dir` is omitted, the project directory under the selected daemon workspace
+defaults to the project UUID.
 
 Starting a run:
 
@@ -165,6 +172,14 @@ PROJECT_UUID=<uuid-from-project-create-or-list>
 curl -X POST http://127.0.0.1:4500/api/projects/$PROJECT_UUID/runs \
   -H 'content-type: application/json' \
   -d '{"verb":"run"}'
+```
+
+Selected report regeneration:
+
+```bash
+curl -X POST http://127.0.0.1:4500/api/projects/$PROJECT_UUID/runs \
+  -H 'content-type: application/json' \
+  -d '{"verb":"report","findingIds":[123,456]}'
 ```
 
 ## Outputs
@@ -188,6 +203,9 @@ Each confirm run writes:
 - `confirm_equivalence.json`
 - `confirm_transcript.json`
 
+Each report run writes formal finding reports back to the tracking store and may
+also expose allowlisted `report_<finding>.md` artifacts.
+
 The tracking store records metadata and artifact paths; run artifacts remain
 private by default.
 
@@ -201,7 +219,7 @@ only for short-lived scratch.
 When loaded through pi, Flounder registers:
 
 - `flounder_prepare`: open-world target acquisition from a clue
-- `flounder_run`: with a clue, prepare -> sealed map/dig -> confirm; with source paths, sealed map/dig source audit
+- `flounder_run`: with a clue, prepare -> sealed map/dig -> confirm -> report; with source paths, sealed map/dig source audit
 - `flounder_map`: sealed scope inventory only
 - `flounder_audit`: sealed dig, pinned region audit, selected scope audit, or inline finding verification
 - `flounder_confirm`: open-world reproduction for a finished run

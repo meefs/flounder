@@ -29,7 +29,7 @@ test("api: GET /api is a self-describing catalog of every resource + operation",
     assert.deepEqual(cat.resources, ["project", "provider", "daemon", "run", "scope", "finding", "confirm-decision"]);
     const sigs = cat.endpoints.map((e) => e.method + " " + e.path);
     for (const expected of [
-      "GET /api/projects", "POST /api/projects", "GET /api/projects/:uuid",
+      "GET /api/projects", "PATCH /api/projects/order", "POST /api/projects", "GET /api/projects/:uuid",
       "PATCH /api/projects/:uuid", "DELETE /api/projects/:uuid",
       "POST /api/projects/:uuid/runs", "GET /api/projects/:uuid/findings",
       "GET /api/projects/:uuid/scopes", "GET /api/projects/:uuid/confirm-decisions",
@@ -46,6 +46,11 @@ test("api: GET /api is a self-describing catalog of every resource + operation",
     assert.equal(projectCreate.body.daemonId.startsWith("number"), true);
     assert.equal(projectCreate.body.providerId.startsWith("number"), true);
     assert.match(projectCreate.body.config, /phaseProviders/);
+    assert.match(projectCreate.body.config, /prepareClue/);
+    const projectList = cat.endpoints.find((e) => e.method === "GET" && e.path === "/api/projects");
+    assert.match(projectList.query.archived, /archived projects/);
+    const projectOrder = cat.endpoints.find((e) => e.method === "PATCH" && e.path === "/api/projects/order");
+    assert.match(projectOrder.summary, /drag-and-drop/);
     const projectRun = cat.endpoints.find((e) => e.method === "POST" && e.path === "/api/projects/:uuid/runs");
     assert.match(projectRun.body.verb, /report/);
     assert.match(projectRun.body.scopeCoverageMode, /one-off coverage mode/);
@@ -65,9 +70,54 @@ test("api: GET /api is a self-describing catalog of every resource + operation",
     assert.match(projectFindings.query.status, /execution-confirmed/);
     const globalFindings = cat.endpoints.find((e) => e.method === "GET" && e.path === "/api/bugs");
     assert.match(globalFindings.summary, /execution-confirmed/);
+    assert.match(globalFindings.query.project, /project uuid/);
+    assert.match(globalFindings.query.tracking, /active/);
     assert.match(globalFindings.query.limit, /default 200/);
+    const findingTracking = cat.endpoints.find((e) => e.method === "PATCH" && e.path === "/api/findings/:id/tracking");
+    assert.match(findingTracking.body.status, /ignored/);
     const runLog = cat.endpoints.find((e) => e.method === "GET" && e.path === "/api/runs/:id/log");
     assert.match(runLog.query.tail, /JSON/);
+  });
+});
+
+test("api: project list supports archive, unarchive, pin, and manual order", async () => {
+  await withServer(async (base) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const patch = (p, body) => fetch(base + p, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+    const alpha = await json(await post("/api/projects", { name: "alpha", sourcePaths: ["./src"] }));
+    const beta = await json(await post("/api/projects", { name: "beta", sourcePaths: ["./src"] }));
+    const gamma = await json(await post("/api/projects", { name: "gamma", sourcePaths: ["./src"] }));
+
+    let list = await json(await fetch(base + "/api/projects"));
+    assert.deepEqual(list.projects.map((project) => project.name), ["gamma", "beta", "alpha"]);
+
+    await patch(`/api/projects/${beta.uuid}`, { pinned: true });
+    list = await json(await fetch(base + "/api/projects"));
+    assert.equal(list.projects[0].name, "beta");
+    assert.ok(list.projects[0].pinned_at);
+
+    await patch(`/api/projects/${alpha.uuid}`, { pinned: true });
+    await patch(`/api/projects/${alpha.uuid}`, { archived: true });
+    list = await json(await fetch(base + "/api/projects"));
+    assert.deepEqual(list.projects.map((project) => project.name), ["beta", "gamma"]);
+
+    let archived = await json(await fetch(base + "/api/projects?archived=1"));
+    assert.deepEqual(archived.projects.map((project) => project.name), ["alpha"]);
+    assert.ok(archived.projects[0].archived_at);
+    assert.equal(archived.projects[0].pinned_at, null);
+
+    await patch(`/api/projects/${alpha.uuid}`, { archived: false });
+    await patch(`/api/projects/${beta.uuid}`, { pinned: false });
+    await patch("/api/projects/order", { uuids: [alpha.uuid, gamma.uuid, beta.uuid] });
+
+    list = await json(await fetch(base + "/api/projects"));
+    assert.deepEqual(list.projects.map((project) => project.name), ["alpha", "gamma", "beta"]);
+    assert.deepEqual(list.projects.map((project) => project.sort_order), [0, 10, 20]);
+
+    archived = await json(await fetch(base + "/api/projects?archived=1"));
+    assert.deepEqual(archived.projects, []);
   });
 });
 
@@ -86,6 +136,8 @@ test("api: project run defaults leave map/dig turns unbounded while standard cov
     const job = (await json(await fetch(base + "/api/jobs/" + launched.jobId))).job;
     const spec = JSON.parse(job.spec_json);
 
+    assert.equal(spec.pipeline, true);
+    assert.equal(spec.clue, "default-run-budget");
     assert.equal(spec.maxScopes, 30);
     assert.equal(spec.mapSteps, undefined);
     assert.equal(spec.digSteps, undefined);
@@ -118,13 +170,14 @@ test("api: standard coverage fills the project up to 30 audited scopes instead o
     const job = (await json(await fetch(base + "/api/jobs/" + launched.jobId))).job;
     const spec = JSON.parse(job.spec_json);
 
+    assert.equal(spec.pipeline, true);
     assert.equal(spec.coverageMode, "standard");
     assert.equal(spec.coverageTarget, 30);
     assert.equal(spec.maxScopes, 10);
   });
 });
 
-test("api: standard coverage stops default runs after 30 audited scopes but allows explicit scopes", async () => {
+test("api: standard coverage lets pipeline continue after 30 audited scopes but still allows explicit scopes", async () => {
   await withServer(async (base, out) => {
     const json = (r) => r.json();
     const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -144,11 +197,13 @@ test("api: standard coverage stops default runs after 30 audited scopes but allo
       store.close();
     }
 
-    const stopped = await post(`/api/projects/${created.uuid}/runs`, { verb: "run" });
-    assert.equal(stopped.status, 409);
-    const stoppedBody = await json(stopped);
-    assert.match(stoppedBody.error, /Standard coverage is already complete/);
-    assert.equal(stoppedBody.coverageTarget, 30);
+    const continued = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "run" }));
+    assert.equal(continued.queued, true);
+    const continuedJob = (await json(await fetch(base + "/api/jobs/" + continued.jobId))).job;
+    const continuedSpec = JSON.parse(continuedJob.spec_json);
+    assert.equal(continuedSpec.pipeline, true);
+    assert.equal(continuedSpec.coverageTarget, 30);
+    assert.equal(continuedSpec.maxScopes, 0);
 
     const launched = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "audit", scope: "pending-0" }));
     assert.equal(launched.queued, true);
@@ -183,6 +238,68 @@ test("api: project prepare defaults leave prepare turns unbounded", async () => 
     assert.equal(spec.mapSteps, undefined);
     assert.equal(spec.digSteps, undefined);
     assert.equal(spec.maxScopes, 30);
+  });
+});
+
+test("api: project prepare uses stored prepare clue when no launch clue is supplied", async () => {
+  await withServer(async (base) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const created = await json(await post("/api/projects", {
+      name: "stored-prepare-clue",
+      config: {
+        prepareClue: "audit the authorized deployment at 0x123 with official source and docs",
+        projectIntent: "audit the authorized deployment at 0x123 with official source and docs",
+      },
+    }));
+
+    const launched = await json(await post(`/api/projects/${created.uuid}/runs`, {
+      verb: "prepare",
+    }));
+    assert.equal(launched.queued, true);
+    const job = (await json(await fetch(base + "/api/jobs/" + launched.jobId))).job;
+    const spec = JSON.parse(job.spec_json);
+
+    assert.equal(spec.verb, "prepare");
+    assert.equal(spec.clue, "audit the authorized deployment at 0x123 with official source and docs");
+    assert.equal(spec.posture, "blind");
+    assert.equal(spec.matchDeployed, true);
+  });
+});
+
+test("api: daemon pipeline jobs can append phase runs and keep job linked to the active phase", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const headers = { "content-type": "application/json" };
+    const store = MetadataStore.openForOutput(out);
+    let token;
+    let jobId;
+    try {
+      const daemon = store.createDaemonToken("pipeline-daemon");
+      token = daemon.token;
+      const projectId = store.upsertProject({ name: "pipeline-project", config: {} });
+      assert.ok(projectId > 0);
+      jobId = store.enqueueJob("pipeline-project", { verb: "run", pipeline: true }, daemon.id);
+    } finally {
+      store.close();
+    }
+    const authHeaders = { ...headers, authorization: `Bearer ${token}` };
+    const claimed = await json(await fetch(base + "/api/daemon/claim", { method: "POST", headers: authHeaders }));
+    assert.equal(claimed.job.id, jobId);
+
+    const first = await json(await fetch(base + "/api/daemon/runs", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ jobId, project: "pipeline-project", kind: "prepare", runDir: path.join(out, "pipeline-prepare") }),
+    }));
+    const second = await json(await fetch(base + "/api/daemon/runs", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ jobId, project: "pipeline-project", kind: "run", runDir: path.join(out, "pipeline-run"), additional: true }),
+    }));
+    assert.notEqual(second.runId, first.runId);
+    const job = (await json(await fetch(base + "/api/jobs/" + jobId))).job;
+    assert.equal(job.run_id, second.runId);
   });
 });
 
@@ -749,6 +866,13 @@ test("api: report launch queues only reproduced real-target findings that were n
           status: "confirmed-executable",
         },
         {
+          findingKey: "kexisting",
+          title: "Existing report bug",
+          location: "src/Target.sol:45",
+          severity: "medium",
+          status: "confirmed-executable",
+        },
+        {
           findingKey: "knotreproduced",
           title: "Not reproduced bug",
           location: "src/Target.sol:56",
@@ -773,6 +897,15 @@ test("api: report launch queues only reproduced real-target findings that were n
           members: ["kdrop"],
         },
         {
+          bug: "Existing report bug",
+          reproduced: "yes",
+          recommendation: "submit-candidate",
+          members: ["kexisting"],
+          reproEvidence: "purpose=confirm command cmd-existing reproduced the real target effect",
+          reproCommandId: "cmd-existing",
+          reportMarkdown: "# Existing report bug\n\nExisting formal report.",
+        },
+        {
           bug: "Not reproduced bug",
           reproduced: "no",
           recommendation: "drop",
@@ -786,8 +919,11 @@ test("api: report launch queues only reproduced real-target findings that were n
     const detail = await json(await fetch(base + `/api/projects/${created.uuid}`));
     const ready = detail.allFindings.find((finding) => finding.finding_key === "kready");
     const dropped = detail.allFindings.find((finding) => finding.finding_key === "kdrop");
+    const existing = detail.allFindings.find((finding) => finding.finding_key === "kexisting");
     assert.ok(ready);
     assert.ok(dropped);
+    assert.ok(existing);
+    assert.equal(existing.has_report, true);
 
     const launched = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "report" }));
     const job = (await json(await fetch(base + "/api/jobs/" + launched.jobId))).job;
@@ -798,6 +934,15 @@ test("api: report launch queues only reproduced real-target findings that were n
     assert.equal(spec.reportFindings[0].findingKey, "kready");
     assert.equal(spec.reportFindings[0].decisions[0].repro_command_id, "cmd1");
     assert.match(spec.reportFindings[0].decisions[0].repro_evidence, /real target effect/);
+
+    const regenerated = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "report", findingIds: [existing.id] }));
+    const regeneratedJob = (await json(await fetch(base + "/api/jobs/" + regenerated.jobId))).job;
+    const regeneratedSpec = JSON.parse(regeneratedJob.spec_json);
+
+    assert.equal(regeneratedSpec.verb, "report");
+    assert.equal(regeneratedSpec.reportFindings.length, 1);
+    assert.equal(regeneratedSpec.reportFindings[0].findingKey, "kexisting");
+    assert.equal(regeneratedSpec.reportFindings[0].decisions[0].repro_command_id, "cmd-existing");
 
     const rejected = await post(`/api/projects/${created.uuid}/runs`, { verb: "report", findingIds: [dropped.id] });
     assert.equal(rejected.status, 400);
@@ -983,6 +1128,7 @@ test("api: project CRUD round-trip over HTTP", async () => {
     const detail = await json(await fetch(base + projectPath));
     assert.equal(detail.project.name, "项目一");
     assert.equal(detail.project.uuid, created.uuid);
+    assert.equal(detail.project.dir, created.uuid);
     assert.equal(detail.findingsTotal, 0);
     assert.deepEqual(detail.progress, { total: 0, audited: 0, pending: 0, deferred: 0 });
     assert.deepEqual(detail.scopes, []);
@@ -1130,9 +1276,11 @@ test("api: project detail summarizes the latest prepare manifest and workspace q
     assert.equal(launched.queued, true);
     const job = (await json(await fetch(base + "/api/jobs/" + launched.jobId))).job;
     const spec = JSON.parse(job.spec_json);
+    assert.equal(spec.pipeline, true);
     assert.deepEqual(spec.sourcePaths, [workspace]);
     assert.equal(spec.buildRoot, workspace);
     assert.equal(spec.dir, undefined);
+    assert.equal(spec.clue, undefined);
     assert.match(spec.scopeNote, /PRIMARY AUDIT TARGET/);
 
     const auditRunDir = path.join(out, "prepared-target-audit-test");
@@ -2261,6 +2409,49 @@ test("api: project findings endpoint paginates detailed rows", async () => {
   });
 });
 
+test("api: ignored findings are hidden from active filters and can be recovered", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const patch = (p, body) => fetch(base + p, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+    const created = await json(await post("/api/projects", { name: "ignored-findings", sourcePaths: ["./src"] }));
+    const runDir = await mkdtemp(path.join(out, "ignored-findings-run-"));
+    const store = MetadataStore.openForOutput(out);
+    try {
+      const runId = store.startRun({ projectId: created.id, kind: "audit", runDir });
+      store.upsertFindings(created.id, runId, [
+        { findingKey: "keep", title: "Keep visible", location: "src/Keep.sol:1", severity: "medium", status: "suspected" },
+        { findingKey: "ignore", title: "Human ignored", location: "src/Ignore.sol:1", severity: "low", status: "suspected" },
+      ]);
+    } finally {
+      store.close();
+    }
+
+    const all = await json(await fetch(base + `/api/projects/${created.uuid}/findings`));
+    const ignored = all.findings.find((finding) => finding.finding_key === "ignore");
+    assert.ok(ignored);
+
+    await patch(`/api/findings/${ignored.id}/tracking`, { status: "ignored" });
+
+    const projectActive = await json(await fetch(base + `/api/projects/${created.uuid}/findings?tracking=active`));
+    assert.deepEqual(projectActive.findings.map((finding) => finding.finding_key), ["keep"]);
+
+    const projectIgnored = await json(await fetch(base + `/api/projects/${created.uuid}/findings?tracking=ignored`));
+    assert.deepEqual(projectIgnored.findings.map((finding) => finding.finding_key), ["ignore"]);
+
+    const globalActive = await json(await fetch(base + `/api/bugs?project=${encodeURIComponent(created.uuid)}&tracking=active`));
+    assert.equal(globalActive.total, 1);
+    assert.equal(globalActive.stats.total, 2);
+    assert.equal(globalActive.stats.active, 1);
+    assert.equal(globalActive.stats.byTracking.ignored, 1);
+
+    await patch(`/api/findings/${ignored.id}/tracking`, { status: "open" });
+    const restored = await json(await fetch(base + `/api/projects/${created.uuid}/findings?tracking=active`));
+    assert.deepEqual(restored.findings.map((finding) => finding.finding_key).sort(), ["ignore", "keep"]);
+  });
+});
+
 test("api: global findings endpoint paginates without changing global stats", async () => {
   await withServer(async (base, out) => {
     const json = (r) => r.json();
@@ -2292,6 +2483,44 @@ test("api: global findings endpoint paginates without changing global stats", as
     assert.equal(confirmed.findings[0].status, "confirmed-executable");
     assert.equal(confirmed.stats.total, 3, "saved-view stats remain global when the table is filtered");
     assert.equal(confirmed.stats.byStatus.suspected, 2);
+  });
+});
+
+test("api: global findings endpoint filters by project and scopes stats", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+    const alpha = await json(await post("/api/projects", { name: "global-finding-alpha", sourcePaths: ["./src"] }));
+    const beta = await json(await post("/api/projects", { name: "global-finding-beta", sourcePaths: ["./src"] }));
+    const alphaRunDir = await mkdtemp(path.join(out, "global-finding-alpha-run-"));
+    const betaRunDir = await mkdtemp(path.join(out, "global-finding-beta-run-"));
+    const store = MetadataStore.openForOutput(out);
+    try {
+      const alphaRunId = store.startRun({ projectId: alpha.id, kind: "audit", runDir: alphaRunDir });
+      store.upsertFindings(alpha.id, alphaRunId, [
+        { findingKey: "alpha-a", title: "Alpha A", location: "src/A.sol:1", severity: "low", status: "suspected" },
+        { findingKey: "alpha-b", title: "Alpha B", location: "src/B.sol:1", severity: "medium", status: "confirmed-executable" },
+      ]);
+      const betaRunId = store.startRun({ projectId: beta.id, kind: "audit", runDir: betaRunDir });
+      store.upsertFindings(beta.id, betaRunId, [
+        { findingKey: "beta-a", title: "Beta A", location: "src/A.sol:1", severity: "high", status: "suspected" },
+      ]);
+    } finally {
+      store.close();
+    }
+
+    const scoped = await json(await fetch(base + `/api/bugs?project=${encodeURIComponent(alpha.uuid)}`));
+    assert.equal(scoped.total, 2);
+    assert.equal(scoped.stats.total, 2);
+    assert.equal(scoped.stats.byStatus.suspected, 1);
+    assert.equal(scoped.stats.byStatus["confirmed-executable"], 1);
+    assert.deepEqual(scoped.findings.map((finding) => finding.project_uuid), [alpha.uuid, alpha.uuid]);
+
+    const confirmed = await json(await fetch(base + `/api/bugs?project=${encodeURIComponent(alpha.uuid)}&status=execution-confirmed`));
+    assert.equal(confirmed.total, 1);
+    assert.equal(confirmed.findings[0].finding_key, "alpha-b");
+    assert.equal(confirmed.stats.total, 2, "saved-view stats stay scoped to the selected project");
   });
 });
 
@@ -2697,6 +2926,16 @@ test("api: provider profiles — seed + CRUD + per-phase roles; pi discovery", a
     // a fresh store is seeded with starter profiles
     const seeded = (await json(await fetch(base + "/api/providers"))).providers;
     assert.ok(seeded.length >= 1 && seeded.some((p) => p.provider === "openai-codex"), "expected seeded providers");
+    const codexDefault = seeded.find((p) => p.name === "openai-codex · gpt-5.5 · xhigh");
+    assert.ok(codexDefault, "expected codex gpt-5.5 xhigh starter profile");
+    assert.equal(codexDefault.provider, "openai-codex");
+    assert.equal(codexDefault.model, "gpt-5.5");
+    assert.equal(codexDefault.thinking, "xhigh");
+    const opusMax = seeded.find((p) => p.name === "claude-code · opus 4.8 max");
+    assert.ok(opusMax, "expected opus 4.8 max starter profile");
+    assert.equal(opusMax.provider, "claude-code");
+    assert.equal(opusMax.model, "claude-opus-4-8");
+    assert.equal(opusMax.thinking, "xhigh");
 
     // discovery: pi-ai's provider list (+ CLI fallbacks) and a provider's models
     const avail = (await json(await fetch(base + "/api/pi/providers"))).providers;

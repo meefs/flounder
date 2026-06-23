@@ -19,6 +19,7 @@ test("store: project + run lifecycle is recorded and queryable", async () => {
   const projectId = db.upsertProject({ name: "acme", sourcePaths: ["./src"], buildRoot: ".", config: { model: "gpt-5.5", thinking: "xhigh" } });
   const project = db.getProject("acme");
   assert.match(String(project.uuid), /^[0-9a-f-]{36}$/);
+  assert.equal(project.dir, project.uuid);
   assert.equal(db.getProjectByRef(String(project.uuid)).id, projectId);
   assert.equal(db.getProjectByRef("acme"), undefined); // public project refs are UUID-only
   const runId = db.startRun({ projectId, kind: "run", runDir: "/runs/acme-1", provider: "openai-codex", model: "gpt-5.5" });
@@ -39,6 +40,7 @@ test("store: project + run lifecycle is recorded and queryable", async () => {
   const uuid = String(project.uuid);
   assert.equal(db.upsertProject({ name: "acme", config: { model: "opus" } }), projectId);
   assert.equal(db.getProjectById(projectId).uuid, uuid);
+  assert.equal(db.getProjectById(projectId).dir, uuid);
   assert.equal(db.listProjects().length, 1);
   db.close();
 });

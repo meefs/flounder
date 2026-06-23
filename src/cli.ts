@@ -97,7 +97,7 @@ async function main(argv: string[]): Promise<void> {
   if (cmd === "run" || cmd === "map" || cmd === "audit") {
     const { cfg } = await parseConfig(rest);
     // `flounder run <clue>` with no --source = the one-command pipeline: prepare → map → dig →
-    // confirm, end to end (each a separate tracked phase; the sealed dig stays network-sealed).
+    // confirm → report, end to end (each a separate tracked phase; the sealed dig stays network-sealed).
     if (cmd === "run" && cfg.sourcePaths.length === 0) {
       const clue = (rest[0] && !rest[0].startsWith("--")) ? rest[0] : readFlag(rest, "--clue");
       if (clue) { await runPipeline(rest, cfg, clue); return; }
@@ -553,7 +553,16 @@ async function runPipeline(rest: string[], cfg: AuditorConfig, clue: string): Pr
   const matchDeployed = !rest.includes("--no-match-deployed");
   const endpoint = readFlag(rest, "--endpoint") ?? readFlag(rest, "--rpc");
   const noConfirm = rest.includes("--no-confirm");
-  console.log(`=== flounder run pipeline · target "${target}" · prepare → map → dig${noConfirm ? "" : " → confirm"} ===`);
+  if (!noConfirm) {
+    console.log(`=== flounder run pipeline · target "${target}" · prepare → map → dig → confirm → report ===`);
+    const spec: LaunchSpec = { verb: "run", target, sourcePaths: [], provider: cfg.provider, model: cfg.auditModel, thinking: cfg.thinkingLevel, clue, posture, matchDeployed, pipeline: true, out: cfg.outputDir, ...sandboxSpec(cfg) };
+    if (endpoint !== undefined) spec.endpoint = endpoint;
+    const result = await launchViaApi(server, spec);
+    if (!ran(result)) process.exitCode = 1;
+    return;
+  }
+
+  console.log(`=== flounder run pipeline · target "${target}" · prepare → map → dig ===`);
 
   // Phase 1 — prepare (open-world acquisition + deployment match) stages the source.
   console.log("\n── phase 1 · prepare (acquire the target) ──");
@@ -592,7 +601,7 @@ async function runPipeline(rest: string[], cfg: AuditorConfig, clue: string): Pr
     const confSpec: LaunchSpec = { verb: "confirm", target, sourcePaths: [staged], inputRunDir: String(audit!.run_dir), provider: cfg.provider, model: cfg.auditModel, thinking: cfg.thinkingLevel, out: cfg.outputDir, ...sandboxSpec(cfg) };
     if (!ran(await launchViaApi(server, confSpec))) process.exitCode = 1;
   }
-  console.log(`\n=== pipeline done · UI project "${target}" has the full prepare → dig${noConfirm ? "" : " → confirm"} trail ===`);
+  console.log(`\n=== pipeline done · UI project "${target}" has the prepare → dig trail ===`);
 }
 
 function readFlag(args: string[], name: string): string | undefined {
@@ -865,7 +874,7 @@ function printHelp(): void {
 
 Usage:
   flounder prepare <clue> [--posture blind|informed] [--no-match-deployed] [--endpoint <url>]   open-world: clue (tx/address/project/repo/link) -> complete, deployment-matched scope; runs BEFORE map
-  flounder run     <clue>                                                         ONE-COMMAND PIPELINE from a tx/address/link: prepare -> map -> dig -> confirm (--no-confirm to stop after the dig)
+  flounder run     <clue>                                                         ONE-COMMAND PIPELINE from a tx/address/link: prepare -> map -> dig -> confirm -> report (--no-confirm to stop after the dig)
   flounder run     --source <paths...> --target <name> [--corpus <paths...>]      sealed audit only: map -> dig on given source (--quick = one breadth pass)
   flounder map     --target <name> --source <paths...> [--corpus <paths...>]      enumerate the scope inventory only (writes audit_scopes.json)
   flounder audit   [<region> | --scope <id,...> | --verify <file>] --source ...   deep-audit a region, inventory scopes, or given claims

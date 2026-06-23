@@ -33,7 +33,11 @@ export interface ProjectInput {
   config?: unknown; // budgets/max_scopes snapshot the UI can edit (provider/model/thinking now live on the provider profile)
   providerId?: number | undefined; // selected provider profile
   daemonId?: number | undefined; // selected executor daemon; jobs for this project are pinned to it
-  dir?: string | undefined; // project subdir under the daemon workspace (default = name)
+  dir?: string | undefined; // project subdir under the daemon workspace (default = uuid)
+}
+
+export interface ProjectListOptions {
+  archived?: boolean | "all" | undefined;
 }
 
 export interface RunInput {
@@ -155,7 +159,10 @@ CREATE TABLE IF NOT EXISTS project(
   config_json TEXT,               -- budgets only now (provider/model/thinking moved to provider profiles)
   provider_id INTEGER,            -- selected provider profile (plain ref; nulled if the profile is deleted)
   daemon_id INTEGER REFERENCES daemon(id), -- selected executor daemon; null = legacy/unpinned
-  dir TEXT,                       -- project subdir relative to the daemon's workspace root (default = name)
+  dir TEXT,                       -- project subdir relative to the daemon's workspace root (default = uuid)
+  archived_at TEXT,               -- hidden from the normal project rail; reversible from Settings
+  pinned_at TEXT,                 -- pinned projects sort before unpinned projects
+  sort_order INTEGER,             -- user-defined rail order, independent from created_at
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -333,13 +340,16 @@ export class MetadataStore {
       "ALTER TABLE project ADD COLUMN daemon_id INTEGER",
       "ALTER TABLE project ADD COLUMN dir TEXT",
       "ALTER TABLE project ADD COLUMN uuid TEXT",
+      "ALTER TABLE project ADD COLUMN archived_at TEXT",
+      "ALTER TABLE project ADD COLUMN pinned_at TEXT",
+      "ALTER TABLE project ADD COLUMN sort_order INTEGER",
       "ALTER TABLE daemon ADD COLUMN workspace TEXT",
       "ALTER TABLE run ADD COLUMN run_scopes_target INTEGER",
       "ALTER TABLE run ADD COLUMN run_scopes_done INTEGER",
       "ALTER TABLE run ADD COLUMN dig_started_at TEXT", // map->dig boundary for splitting a combined run's elapsed
       "ALTER TABLE scope ADD COLUMN dig_seconds INTEGER", // per-scope deep-audit duration
       "ALTER TABLE scope ADD COLUMN priority INTEGER DEFAULT 0", // manual dig-queue ordering, separate from score
-      "ALTER TABLE finding ADD COLUMN tracking_status TEXT", // submission tracking: open|triaging|submitted|accepted|fixed|duplicate|rejected
+      "ALTER TABLE finding ADD COLUMN tracking_status TEXT", // submission tracking: open|triaging|submitted|accepted|fixed|duplicate|rejected|ignored
       "ALTER TABLE finding ADD COLUMN confirm_status TEXT", // per-finding real-target confirm state
       "ALTER TABLE finding ADD COLUMN report_markdown TEXT", // user-facing per-finding report markdown
       "ALTER TABLE finding ADD COLUMN description TEXT", // rich finding content, previously only in run-dir artifacts
@@ -405,6 +415,8 @@ export class MetadataStore {
   /** Upsert a project by name; refreshes its materials + config snapshot. Returns its id. */
   upsertProject(input: ProjectInput): number {
     const ts = now();
+    const projectUuid = randomUUID();
+    const hasExplicitDir = input.dir !== undefined;
     this.db
       .prepare(
         `INSERT INTO project(uuid, name, source_paths, build_root, corpus_paths, config_json, provider_id, daemon_id, dir, created_at, updated_at)
@@ -414,15 +426,15 @@ export class MetadataStore {
            build_root   = excluded.build_root,
            corpus_paths = excluded.corpus_paths,
            config_json  = excluded.config_json,
-           -- provider_id / daemon_id / dir are COALESCE-preserved: a run (which upserts with only name+config)
-           -- must not wipe the selection the UI made.
+           -- provider_id / daemon_id / dir are preserved unless the caller explicitly updates them.
+           -- A run (which upserts with only name+config) must not wipe the selection the UI made.
            provider_id  = COALESCE(excluded.provider_id, project.provider_id),
            daemon_id    = COALESCE(excluded.daemon_id, project.daemon_id),
-           dir          = COALESCE(excluded.dir, project.dir),
+           dir          = CASE WHEN ? THEN excluded.dir ELSE project.dir END,
            updated_at   = excluded.updated_at`,
       )
       .run(
-        randomUUID(),
+        projectUuid,
         input.name,
         jsonOrNull(input.sourcePaths),
         input.buildRoot ?? null,
@@ -430,16 +442,32 @@ export class MetadataStore {
         jsonOrNull(input.config),
         input.providerId ?? null,
         input.daemonId ?? null,
-        input.dir ?? null,
+        input.dir ?? projectUuid,
         ts,
         ts,
+        hasExplicitDir ? 1 : 0,
       );
     const row = this.db.prepare("SELECT id FROM project WHERE name = ?").get(input.name) as { id: number };
     return row.id;
   }
 
-  listProjects(): Array<Record<string, unknown>> {
-    return this.db.prepare("SELECT * FROM project ORDER BY updated_at DESC").all() as Array<Record<string, unknown>>;
+  listProjects(options: ProjectListOptions = {}): Array<Record<string, unknown>> {
+    const where = options.archived === "all"
+      ? ""
+      : options.archived === true
+        ? "WHERE archived_at IS NOT NULL"
+        : "WHERE archived_at IS NULL";
+    return this.db
+      .prepare(
+        `SELECT * FROM project ${where}
+         ORDER BY
+           CASE WHEN pinned_at IS NULL THEN 1 ELSE 0 END ASC,
+           CASE WHEN sort_order IS NULL THEN 1 ELSE 0 END ASC,
+           sort_order ASC,
+           created_at DESC,
+           id DESC`,
+      )
+      .all() as Array<Record<string, unknown>>;
   }
 
   getProject(name: string): Record<string, unknown> | undefined {
@@ -457,6 +485,48 @@ export class MetadataStore {
   /** Resolve public UI/API project refs. Project URLs are UUID-only; names are display text. */
   getProjectByRef(ref: string): Record<string, unknown> | undefined {
     return this.getProjectByUuid(ref);
+  }
+
+  setProjectArchived(ref: string, archived: boolean): boolean {
+    const project = this.getProjectByRef(ref);
+    if (!project) return false;
+    const ts = now();
+    const info = archived
+      ? this.db.prepare("UPDATE project SET archived_at = ?, pinned_at = NULL, updated_at = ? WHERE id = ?").run(ts, ts, Number(project.id))
+      : this.db.prepare("UPDATE project SET archived_at = NULL, updated_at = ? WHERE id = ?").run(ts, Number(project.id));
+    return Number(info.changes) > 0;
+  }
+
+  setProjectPinned(ref: string, pinned: boolean): boolean {
+    const project = this.getProjectByRef(ref);
+    if (!project) return false;
+    const info = this.db
+      .prepare("UPDATE project SET pinned_at = ?, updated_at = ? WHERE id = ?")
+      .run(pinned ? now() : null, now(), Number(project.id));
+    return Number(info.changes) > 0;
+  }
+
+  setProjectSortOrder(ref: string, sortOrder: number | null): boolean {
+    const project = this.getProjectByRef(ref);
+    if (!project) return false;
+    const value = typeof sortOrder === "number" && Number.isFinite(sortOrder) ? Math.floor(sortOrder) : null;
+    const info = this.db
+      .prepare("UPDATE project SET sort_order = ?, updated_at = ? WHERE id = ?")
+      .run(value, now(), Number(project.id));
+    return Number(info.changes) > 0;
+  }
+
+  reorderProjects(uuids: string[]): number {
+    let changed = 0;
+    const update = this.db.prepare("UPDATE project SET sort_order = ?, updated_at = ? WHERE uuid = ? AND archived_at IS NULL");
+    const ts = now();
+    this.transaction(() => {
+      uuids.forEach((uuid, index) => {
+        if (!uuid) return;
+        changed += Number(update.run(index * 10, ts, uuid).changes);
+      });
+    });
+    return changed;
   }
 
   /** Delete a project and everything under it (runs, scopes, findings + their status
@@ -835,9 +905,10 @@ export class MetadataStore {
   // --- global (cross-project) bug view -------------------------------------
 
   /** Findings across ALL projects (joined with the project name), newest first, optionally
-   * filtered by status and/or tracking state. The "Bugs" dashboard's table. */
-  listGlobalFindings(opts: { status?: string | undefined; tracking?: string | undefined; limit?: number | undefined; offset?: number | undefined } = {}): Array<Record<string, unknown>> {
+   * filtered by project, status, and/or tracking state. The "Bugs" dashboard's table. */
+  listGlobalFindings(opts: { projectUuid?: string | undefined; status?: string | undefined; tracking?: string | undefined; limit?: number | undefined; offset?: number | undefined } = {}): Array<Record<string, unknown>> {
     const cond: string[] = [], params: Array<string | number> = [];
+    if (opts.projectUuid) { cond.push("p.uuid = ?"); params.push(opts.projectUuid); }
     if (opts.status) { cond.push("f.status = ?"); params.push(opts.status); }
     if (opts.tracking) { cond.push("COALESCE(f.tracking_status, 'open') = ?"); params.push(opts.tracking); }
     const where = cond.length ? "WHERE " + cond.join(" AND ") : "";
@@ -882,6 +953,7 @@ export class MetadataStore {
         `SELECT f.finding_key, f.title, f.run_id, r.run_dir
            FROM finding f LEFT JOIN run r ON r.id = f.run_id
           WHERE f.project_id = ? AND f.confirm_status IS NULL
+            AND COALESCE(f.tracking_status, 'open') <> 'ignored'
             AND f.status IN ('confirmed-differential','confirmed-executable','confirmed-source')
           ORDER BY f.status, f.id`,
       )
@@ -895,6 +967,7 @@ export class MetadataStore {
         `SELECT f.finding_key, f.title, f.run_id, r.run_dir
            FROM finding f LEFT JOIN run r ON r.id = f.run_id
           WHERE f.project_id = ? AND f.id = ? AND f.confirm_status IS NULL
+            AND COALESCE(f.tracking_status, 'open') <> 'ignored'
             AND f.status IN ('confirmed-differential','confirmed-executable','confirmed-source')`,
       )
       .get(projectId, findingId) as { finding_key: string; title: string; run_id: number | null; run_dir: string | null } | undefined;
@@ -1201,11 +1274,12 @@ export class MetadataStore {
     return Number((this.db.prepare("SELECT COUNT(*) AS n FROM provider").get() as { n: number }).n);
   }
 
-  /** Insert the given default profiles if the provider table is empty (idempotent). */
+  /** Ensure the given starter profiles exist (idempotent by profile name). */
   seedProviders(defaults: ProviderInput[]): void {
-    if (this.countProviders() > 0) return;
     this.transaction(() => {
-      for (const d of defaults) this.createProvider(d);
+      for (const d of defaults) {
+        if (!this.getProviderByName(d.name)) this.createProvider(d);
+      }
     });
   }
 

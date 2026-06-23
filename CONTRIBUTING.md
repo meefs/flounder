@@ -37,12 +37,13 @@ npm run hooks:install
 
 ## Product Direction
 
-Flounder is an autonomous white-hat security auditor. The product should stay centered on the prepare -> map -> dig -> confirm workflow:
+Flounder is an autonomous white-hat security auditor. The product should stay centered on the prepare -> map -> dig -> confirm -> report workflow:
 
 - prepare authorized source, corpus, dependency closure, and deployment-match evidence;
 - map the audit surface without producing findings;
 - dig selected scopes with local proof tests;
-- confirm reproduced findings against real-world ground truth under the white-hat no-broadcast policy.
+- confirm reproduced findings against real-world ground truth under the white-hat no-broadcast policy;
+- report reproduced or source-provided locally confirmed bugs as private Markdown packages.
 
 Do not position Flounder as a scanner for one technology stack. Solidity/EVM and ZK/proof-system audits are high-signal target classes to document clearly, but they remain optional context examples, not hard-coded product modes. Avoid promoting rare stacks as core product positioning.
 

@@ -46,7 +46,7 @@ import {
 import { Icon, type IconName } from "./icons";
 
 type View = "projects" | "findings" | "settings";
-type SettingsPane = "providers" | "daemons";
+type SettingsPane = "providers" | "daemons" | "archived";
 type ProjectTab = "overview" | "findings" | "scopes" | "runs" | "setup";
 type ModalName = "new-project" | "run" | "edit-project" | "report" | "run-log" | "artifact" | null;
 type ArtifactPreview = { title: string; runId: number; name: string };
@@ -65,6 +65,7 @@ interface Toast {
 
 interface BugStats {
   total: number;
+  active: number;
   byStatus: Record<string, number>;
   byTracking: Record<string, number>;
 }
@@ -97,6 +98,7 @@ function readRoute(): RouteState {
   const projectMatch = pathname.match(/^\/projects\/([^/]+)\/?$/);
   if (projectMatch) return { view: "projects", projectUuid: decodeURIComponent(projectMatch[1] ?? ""), settingsPane: "providers" };
   if (pathname === "/findings" || pathname.startsWith("/findings/")) return { view: "findings", settingsPane: "providers" };
+  if (pathname === "/settings/archived" || pathname.startsWith("/settings/archived/")) return { view: "settings", settingsPane: "archived" };
   if (pathname === "/settings/daemons" || pathname.startsWith("/settings/daemons/")) return { view: "settings", settingsPane: "daemons" };
   if (pathname === "/settings" || pathname.startsWith("/settings/")) return { view: "settings", settingsPane: "providers" };
 
@@ -109,6 +111,10 @@ function readRoute(): RouteState {
   if (hash.startsWith("settings/daemons")) {
     window.history.replaceState(null, "", "/settings/daemons");
     return { view: "settings", settingsPane: "daemons" };
+  }
+  if (hash.startsWith("settings/archived")) {
+    window.history.replaceState(null, "", "/settings/archived");
+    return { view: "settings", settingsPane: "archived" };
   }
   if (hash.startsWith("settings")) {
     window.history.replaceState(null, "", "/settings");
@@ -306,17 +312,66 @@ function providerProfileLabel(provider: ProviderProfile): string {
   return parts.join(" · ");
 }
 
+function defaultProjectProviderId(providers: ProviderProfile[]): string {
+  const preferred = providers.find((provider) =>
+    provider.provider === "openai-codex"
+    && provider.model === "gpt-5.5"
+    && provider.thinking === "xhigh",
+  );
+  return preferred?.id ? String(preferred.id) : providers[0]?.id ? String(providers[0].id) : "";
+}
+
+function findingStatusOptionLabel(status: string): string {
+  return {
+    "confirmed-differential": "Differential confirmed",
+    "confirmed-executable": "Execution confirmed",
+    "confirmed-source": "Source-confirmed lead",
+    suspected: "Needs verification",
+    discharged: "Discharged",
+    refuted: "Refuted",
+  }[status] ?? status;
+}
+
+function findingTrackingOptionLabel(status: string): string {
+  return {
+    open: "Open",
+    triaging: "Triaging",
+    submitted: "Submitted",
+    accepted: "Accepted",
+    fixed: "Fixed",
+    duplicate: "Duplicate",
+    rejected: "Rejected",
+    ignored: "Ignored",
+  }[status] ?? status;
+}
+
 function nextAction(finding: FindingRow): string {
   const tracking = finding.tracking_status ?? "open";
+  if (tracking === "ignored") return "Ignored";
   if (tracking === "submitted") return "Watch vendor response";
   if (tracking === "accepted") return "Track fix";
   if (tracking === "fixed") return "Close";
+  if (finding.status.startsWith("confirmed") && finding.confirm_status === "reproduced" && !finding.has_report) return "Generate report";
   if (finding.status.startsWith("confirmed") && finding.confirm_status === "reproduced") return "Prepare disclosure";
   if (finding.status.startsWith("confirmed") && finding.confirm_status === "not-reproduced") return "Review reproduction";
   if (finding.status.startsWith("confirmed")) return "Confirm real target";
   if (finding.status === "suspected") return "Triage";
   if (finding.status === "refuted" || finding.status === "discharged") return "Archive";
   return "Review";
+}
+
+function findingWorkflow(finding: FindingRow): { label: string; detail: string; className: string } {
+  const tracking = finding.tracking_status ?? "open";
+  if (tracking === "ignored") return { label: "Ignored", detail: "Hidden from active workflow", className: "s-discharged" };
+  if (tracking === "accepted" || tracking === "fixed") return { label: tracking === "accepted" ? "Accepted" : "Fixed", detail: nextAction(finding), className: "s-confirmed-executable" };
+  if (tracking === "submitted") return { label: "Submitted", detail: "Waiting for vendor response", className: "s-confirmed-source" };
+  if (finding.status === "refuted" || finding.status === "discharged") return { label: "Closed", detail: nextAction(finding), className: "s-discharged" };
+  if (finding.confirm_status === "not-reproduced" || finding.confirm_status === "not_reproduced") return { label: "Needs review", detail: "Real-target proof failed", className: "s-refuted" };
+  if (finding.confirm_status === "reproduced" && !finding.has_report) return { label: "Needs report", detail: "Package reproduced bug", className: "s-pending" };
+  if (finding.confirm_status === "reproduced") return { label: "Ready to disclose", detail: "Formal report exists", className: "s-confirmed-executable" };
+  if (isLocallyVerified(finding)) return { label: "Needs confirm", detail: "Reproduce on real target", className: "s-pending" };
+  if (finding.status === "confirmed-source" || finding.status === "suspected") return { label: "Needs verify", detail: "Run local execution check", className: "s-suspected" };
+  return { label: "Review", detail: nextAction(finding), className: "s-discharged" };
 }
 
 function isLocallyVerified(finding: FindingRow): boolean {
@@ -499,7 +554,7 @@ function runKindLabel(kind: string, run?: RunRow): string {
   if (isVerifyRun(run)) return "Verify";
   return {
     prepare: "Prepare target",
-    run: "Map + dig audit",
+    run: "Run pipeline",
     map: "Map",
     audit: "Dig scopes",
     confirm: "Confirm findings",
@@ -511,26 +566,34 @@ function needsRealTargetConfirmation(detail: Pick<ProjectDetail, "prepareSummary
   return detail?.prepareSummary?.realTarget?.requiresConfirmation !== false;
 }
 
+function isIgnoredFinding(finding: FindingRow): boolean {
+  return (finding.tracking_status ?? "open") === "ignored";
+}
+
+function activeFindings(rows: FindingRow[] | undefined): FindingRow[] {
+  return (rows ?? []).filter((finding) => !isIgnoredFinding(finding));
+}
+
 function isExecutionConfirmedFinding(finding: FindingRow): boolean {
   return finding.status === "confirmed-executable" || finding.status === "confirmed-differential";
 }
 
 function pendingConfirmFindings(rows: FindingRow[] | undefined, requiresConfirmation = true): FindingRow[] {
   if (!requiresConfirmation) return [];
-  return (rows ?? []).filter((finding) => isExecutionConfirmedFinding(finding) && !finding.confirm_status);
+  return activeFindings(rows).filter((finding) => isExecutionConfirmedFinding(finding) && !finding.confirm_status);
 }
 
 function localVerifiedFindings(rows: FindingRow[] | undefined): FindingRow[] {
-  return (rows ?? []).filter(isExecutionConfirmedFinding);
+  return activeFindings(rows).filter(isExecutionConfirmedFinding);
 }
 
 function pendingVerifyFindings(rows: FindingRow[] | undefined): FindingRow[] {
-  const unresolved = (rows ?? []).filter((finding) => finding.status === "suspected" || finding.status === "confirmed-source");
+  const unresolved = activeFindings(rows).filter((finding) => finding.status === "suspected" || finding.status === "confirmed-source");
   return topCandidateFindings(unresolved);
 }
 
 function reportableFindings(rows: FindingRow[] | undefined, requiresConfirmation = true): FindingRow[] {
-  return (rows ?? []).filter((finding) => requiresConfirmation ? finding.confirm_status === "reproduced" : isExecutionConfirmedFinding(finding));
+  return activeFindings(rows).filter((finding) => requiresConfirmation ? finding.confirm_status === "reproduced" : isExecutionConfirmedFinding(finding));
 }
 
 function pendingFormalReports(rows: FindingRow[] | undefined, requiresConfirmation = true): FindingRow[] {
@@ -1047,26 +1110,30 @@ function PaginationControls(props: {
 
 function savedBugViews(stats: BugStats): Array<{ id: string; label: string; status?: string; tracking?: string; count: number }> {
   return [
+    { id: "active", label: "Active", tracking: "active", count: stats.active ?? Math.max(0, stats.total - (stats.byTracking.ignored ?? 0)) },
     { id: "all", label: "All", count: stats.total },
     { id: "differential", label: "Differential", status: "confirmed-differential", tracking: "open", count: stats.byStatus["confirmed-differential"] ?? 0 },
     { id: "executable", label: "Executable", status: "confirmed-executable", tracking: "open", count: stats.byStatus["confirmed-executable"] ?? 0 },
     { id: "triage", label: "Needs triage", status: "suspected", tracking: "open", count: stats.byStatus.suspected ?? 0 },
     { id: "submitted", label: "Submitted", tracking: "submitted", count: stats.byTracking.submitted ?? 0 },
     { id: "accepted", label: "Accepted", tracking: "accepted", count: stats.byTracking.accepted ?? 0 },
+    { id: "ignored", label: "Ignored", tracking: "ignored", count: stats.byTracking.ignored ?? 0 },
   ];
 }
 
 export function App() {
   const [route, setRoute] = useState<RouteState>(() => readRoute());
   const [projects, setProjects] = useState<ProjectSnapshot[]>([]);
+  const [archivedProjects, setArchivedProjects] = useState<ProjectSnapshot[]>([]);
   const [detail, setDetail] = useState<ProjectDetail | null>(null);
   const [providers, setProviders] = useState<ProviderProfile[]>([]);
   const [daemons, setDaemons] = useState<DaemonRow[]>([]);
   const [bugs, setBugs] = useState<FindingRow[]>([]);
   const [bugsTotal, setBugsTotal] = useState(0);
-  const [bugStats, setBugStats] = useState<BugStats>({ total: 0, byStatus: {}, byTracking: {} });
+  const [bugStats, setBugStats] = useState<BugStats>({ total: 0, active: 0, byStatus: {}, byTracking: {} });
+  const [bugProject, setBugProject] = useState("");
   const [bugStatus, setBugStatus] = useState("");
-  const [bugTracking, setBugTracking] = useState("");
+  const [bugTracking, setBugTracking] = useState("active");
   const [bugPage, setBugPage] = useState(1);
   const [bugPageSize, setBugPageSize] = useState(DEFAULT_PAGE_SIZE);
   const [bugLoading, setBugLoading] = useState(false);
@@ -1127,8 +1194,9 @@ export function App() {
   }, []);
 
   async function refreshBase() {
-    const [projectRes, providerRes, daemonRes] = await Promise.all([api.projects(), api.providers(), api.daemons()]);
+    const [projectRes, archivedRes, providerRes, daemonRes] = await Promise.all([api.projects(), api.archivedProjects(), api.providers(), api.daemons()]);
     setProjects(projectRes.projects);
+    setArchivedProjects(archivedRes.projects);
     setProviders(providerRes.providers);
     setDaemons(daemonRes.daemons);
   }
@@ -1157,6 +1225,7 @@ export function App() {
       limit: String(bugPageSize),
       offset: String((bugPage - 1) * bugPageSize),
     });
+    if (bugProject) params.set("project", bugProject);
     if (bugStatus) params.set("status", bugStatus);
     if (bugTracking) params.set("tracking", bugTracking);
     setBugLoading(true);
@@ -1173,11 +1242,11 @@ export function App() {
         setBugs([]);
       })
       .finally(() => setBugLoading(false));
-  }, [route.view, bugStatus, bugTracking, bugPage, bugPageSize, bugReloadKey]);
+  }, [route.view, bugProject, bugStatus, bugTracking, bugPage, bugPageSize, bugReloadKey]);
 
   useEffect(() => {
     setBugPage(1);
-  }, [bugStatus, bugTracking]);
+  }, [bugProject, bugStatus, bugTracking]);
 
   const bugPageCount = Math.max(1, Math.ceil(bugsTotal / bugPageSize));
   useEffect(() => {
@@ -1285,7 +1354,7 @@ export function App() {
         }
       }
       if (action === "audit" && (currentDetail.progress.pending ?? 0) === 0) {
-        setToast({ tone: "warning", message: "There are no pending scopes to dig. Run map first or continue audit when new scopes are available." });
+        setToast({ tone: "warning", message: "There are no pending scopes to dig. Run the pipeline first or map new scopes." });
         setModal(null);
         return;
       }
@@ -1379,6 +1448,34 @@ export function App() {
     }
   }
 
+  async function updateProjectDisplay(project: ProjectSnapshot, body: ProjectPayload, message: string) {
+    try {
+      await api.updateProject(project.uuid, body);
+      if (body.archived === true && route.projectUuid === project.uuid) {
+        setDetail(null);
+        go("/");
+      } else if (route.projectUuid === project.uuid) {
+        setDetail(await api.project(project.uuid));
+      }
+      await refreshBase();
+      setToast({ tone: "success", message });
+    } catch (error) {
+      setToast({ tone: "error", message: String(error instanceof Error ? error.message : error) });
+    }
+  }
+
+  async function reorderProjects(uuids: string[]) {
+    const rank = new Map(uuids.map((uuid, index) => [uuid, index]));
+    setProjects((current) => [...current].sort((a, b) => (rank.get(a.uuid) ?? current.length) - (rank.get(b.uuid) ?? current.length)));
+    try {
+      await api.reorderProjects(uuids);
+      await refreshBase();
+    } catch (error) {
+      await refreshBase().catch(() => undefined);
+      setToast({ tone: "error", message: String(error instanceof Error ? error.message : error) });
+    }
+  }
+
   function openRunLog(run: RunRow) {
     setLogRun(run);
     setModal("run-log");
@@ -1409,6 +1506,8 @@ export function App() {
               selected={route.projectUuid}
               onNew={() => setModal("new-project")}
               onSelect={(uuid) => go(projectPath(uuid))}
+              onUpdate={(project, body, message) => void updateProjectDisplay(project, body, message)}
+              onReorder={(uuids) => void reorderProjects(uuids)}
             />
             <main className="workspace">
               {detail && selectedProject ? (
@@ -1456,14 +1555,17 @@ export function App() {
         {route.view === "findings" ? (
           <GlobalFindingsView
             stats={bugStats}
+            projects={[...projects, ...archivedProjects]}
             findings={bugs}
             total={bugsTotal}
             page={Math.min(bugPage, bugPageCount)}
             pageSize={bugPageSize}
             loading={bugLoading}
             error={bugError}
+            projectUuid={bugProject}
             status={bugStatus}
             tracking={bugTracking}
+            setProjectUuid={setBugProject}
             setStatus={setBugStatus}
             setTracking={setBugTracking}
             setPage={setBugPage}
@@ -1476,7 +1578,16 @@ export function App() {
             }}
           />
         ) : null}
-        {route.view === "settings" ? <SettingsView pane={route.settingsPane} providers={providers} daemons={daemons} onRefresh={refreshBase} /> : null}
+        {route.view === "settings" ? (
+          <SettingsView
+            pane={route.settingsPane}
+            providers={providers}
+            daemons={daemons}
+            archivedProjects={archivedProjects}
+            onRefresh={refreshBase}
+            onUnarchive={(project) => void updateProjectDisplay(project, { archived: false }, `${project.name} restored.`)}
+          />
+        ) : null}
       </div>
       {cmdOpen ? <CommandPalette projects={projects} currentProjectUuid={route.projectUuid} onClose={() => setCmdOpen(false)} onNewProject={() => setModal("new-project")} onLaunch={() => requestLaunch("run")} /> : null}
       {modal === "new-project" ? (
@@ -1484,10 +1595,29 @@ export function App() {
           providers={providers}
           daemons={daemons}
           onClose={() => setModal(null)}
-          onCreated={async (uuid) => {
+          onCreated={async (uuid, runAfterCreate) => {
             await refreshBase();
             setModal(null);
             go(projectPath(uuid));
+            if (runAfterCreate) {
+              setBusy(true);
+              try {
+                const result = (await api.launchRun(uuid, { verb: "run" })) as LaunchResult;
+                const waiting = (result.daemons ?? 0) === 0;
+                setToast({
+                  tone: waiting ? "warning" : "success",
+                  message: waiting
+                    ? "run queued, but no online daemon is connected. Start a daemon to claim the job."
+                    : `run queued for ${plural(result.daemons ?? 0, "daemon")}.`,
+                });
+                const [nextDetail] = await Promise.all([api.project(uuid), refreshBase()]);
+                setDetail(nextDetail);
+              } catch (error) {
+                setToast({ tone: "error", message: String(error instanceof Error ? error.message : error) });
+              } finally {
+                setBusy(false);
+              }
+            }
           }}
           onError={(message) => setToast({ tone: "error", message })}
         />
@@ -1565,9 +1695,65 @@ function MobileMenu({ route, running, theme, onClose, onTheme }: { route: RouteS
   );
 }
 
-function ProjectSidebar({ projects, selected, onSelect, onNew }: { projects: ProjectSnapshot[]; selected?: string; onSelect: (uuid: string) => void; onNew: () => void }) {
+function ProjectSidebar({
+  projects,
+  selected,
+  onSelect,
+  onNew,
+  onUpdate,
+  onReorder,
+}: {
+  projects: ProjectSnapshot[];
+  selected?: string;
+  onSelect: (uuid: string) => void;
+  onNew: () => void;
+  onUpdate: (project: ProjectSnapshot, body: ProjectPayload, message: string) => void;
+  onReorder: (uuids: string[]) => void;
+}) {
   const [query, setQuery] = useState("");
+  const [dragging, setDragging] = useState<string | null>(null);
+  const [openMenu, setOpenMenu] = useState<string | null>(null);
   const filtered = projects.filter((project) => project.name.toLowerCase().includes(query.toLowerCase()));
+  const canReorder = !query.trim() && filtered.length > 1;
+  useEffect(() => {
+    if (!openMenu) return undefined;
+    const close = (event: MouseEvent) => {
+      const target = event.target;
+      if (target instanceof Element && target.closest("[data-project-menu]")) return;
+      setOpenMenu(null);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpenMenu(null);
+    };
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [openMenu]);
+  function dropProject(targetUuid: string) {
+    if (!dragging || dragging === targetUuid || !canReorder) {
+      setDragging(null);
+      return;
+    }
+    const uuids = projects.map((project) => project.uuid);
+    const from = uuids.indexOf(dragging);
+    const to = uuids.indexOf(targetUuid);
+    if (from < 0 || to < 0) {
+      setDragging(null);
+      return;
+    }
+    const next = [...uuids];
+    const [moved] = next.splice(from, 1);
+    if (!moved) {
+      setDragging(null);
+      return;
+    }
+    next.splice(to, 0, moved);
+    setDragging(null);
+    onReorder(next);
+  }
   return (
     <aside className="project-rail" aria-label="Projects">
       <div className="rail-head">
@@ -1580,23 +1766,90 @@ function ProjectSidebar({ projects, selected, onSelect, onNew }: { projects: Pro
       <input className="searchbar" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Filter projects..." aria-label="Filter projects" />
       <ul className="project-list" role="list">
         {filtered.map((project) => (
-          <li key={project.uuid}>
+          <li
+            key={project.uuid}
+            onDragOver={(event) => {
+              if (canReorder && dragging && dragging !== project.uuid) event.preventDefault();
+            }}
+            onDrop={(event) => {
+              event.preventDefault();
+              dropProject(project.uuid);
+            }}
+            onDragEnd={() => setDragging(null)}
+          >
+            <div
+              className={`project-row${selected === project.uuid ? " sel" : ""}${dragging === project.uuid ? " dragging" : ""}${(project.progress?.total ?? 0) > 0 ? " has-progress-meter" : ""}`}
+              draggable={canReorder}
+              onDragStart={(event) => {
+                const target = event.target;
+                if (!canReorder || (target instanceof Element && target.closest("[data-project-menu]"))) {
+                  event.preventDefault();
+                  return;
+                }
+                setOpenMenu(null);
+                setDragging(project.uuid);
+                event.dataTransfer.effectAllowed = "move";
+                event.dataTransfer.setData("text/plain", project.uuid);
+              }}
+            >
             <button
               type="button"
-              className={`project-row${selected === project.uuid ? " sel" : ""}`}
+              className="project-row-main"
               aria-current={selected === project.uuid ? "page" : undefined}
               aria-label={`Open project ${project.name}. ${projectStatusTitle(project)}`}
               onClick={() => onSelect(project.uuid)}
             >
               <span className="project-row-top">
                 <span className="project-name">{shortName(project.name, 31)}</span>
+                {project.pinned_at ? <span className="project-pin-indicator" title="Pinned"><Icon name="pin" size={13} /></span> : null}
                 <ProjectStatusIcon project={project} />
               </span>
               <ProjectProgress project={project} />
             </button>
+              <span className="project-row-actions">
+                <span className="project-action-menu" data-project-menu>
+                  <IconButton
+                    className="project-mini-action"
+                    icon="kebab"
+                    title="Project actions"
+                    aria-label={`Project actions for ${project.name}`}
+                    aria-haspopup="menu"
+                    aria-expanded={openMenu === project.uuid}
+                    onClick={() => setOpenMenu(openMenu === project.uuid ? null : project.uuid)}
+                  />
+                  {openMenu === project.uuid ? (
+                    <span className="project-action-popover" role="menu">
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          setOpenMenu(null);
+                          onUpdate(project, { pinned: !project.pinned_at }, project.pinned_at ? `${project.name} unpinned.` : `${project.name} pinned.`);
+                        }}
+                      >
+                        <Icon name="pin" size={14} />
+                        <span>{project.pinned_at ? "Unpin project" : "Pin project"}</span>
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          setOpenMenu(null);
+                          onUpdate(project, { archived: true }, `${project.name} archived.`);
+                        }}
+                      >
+                        <Icon name="archive" size={14} />
+                        <span>Archive project</span>
+                      </button>
+                    </span>
+                  ) : null}
+                </span>
+              </span>
+            </div>
           </li>
         ))}
       </ul>
+      {filtered.length === 0 ? <div className="project-list-empty">No active projects match this filter.</div> : null}
     </aside>
   );
 }
@@ -1674,16 +1927,21 @@ function ProjectDetailView(props: {
   const confirmed = allFindings.filter((finding) => finding.status === "confirmed-executable" || finding.status === "confirmed-differential").length;
   const reproduced = confirmedDecisions(confirmDecisions).length;
   const runningRun = currentRuns.find((run) => run.status === "running");
+  const hasPipelineRun = detail.runs.some((run) => run.kind === "run");
   const runningInactive = runningRun ? runInactiveLabel(runningRun) : null;
   const requiresConfirmation = needsRealTargetConfirmation(detail);
   const pendingConfirm = pendingConfirmFindings(allFindings, requiresConfirmation).length;
   const pendingVerify = verifyCandidates.length;
   const pendingReports = pendingFormalReports(allFindings, requiresConfirmation).length;
   const locallyVerified = localVerifiedFindings(allFindings).length;
+  const reportsReady = reportableFindings(allFindings, requiresConfirmation).filter((finding) => finding.has_report).length;
+  const reportStat = pendingReports > 0 ? pendingReports : reportsReady;
+  const reportLabel = pendingReports > 0 ? "to report" : "reports";
+  const candidateStat = pendingVerify > 0 ? pendingVerify : overviewCandidates.length;
+  const candidateLabel = pendingVerify > 0 ? "to verify" : "candidates";
   const localVerifySummary = verifyStatusSummary(allFindings);
   const setupAttention = prepareMaterialsAttention(detail.prepareSummary);
   const launchLocked = props.busy || Boolean(runningRun);
-  const confirmTitle = confirmButtonTitle(pendingConfirm, locallyVerified, launchLocked);
   const requiredProviders = requiredProviderProfiles(detail, providers);
   const authStatuses = requiredProviders.map((profile) => ({ profile, status: daemonHasProvider(selectedDaemon, profile.provider) }));
   const authUnknown = authStatuses.some((entry) => entry.status === null);
@@ -1692,6 +1950,10 @@ function ProjectDetailView(props: {
     .map((phase) => ({ phase, provider: phaseProvider(detail, providers, phase) }))
     .filter((entry) => entry.provider);
   const currentRunningRuns = currentRuns.filter((run) => run.status === "running").length;
+  const openSetupTab = () => {
+    setTab("setup");
+    window.setTimeout(() => scrollToProjectSection("project-setup-tab"), 0);
+  };
   const currentProject: ProjectSnapshot = {
     ...project,
     progress,
@@ -1713,6 +1975,8 @@ function ProjectDetailView(props: {
       label: "Daemon",
       state: selectedDaemon ? `${selectedDaemon.name ?? `daemon-${selectedDaemon.id}`} · ${relativeAge(selectedDaemon)}` : "No daemon selected",
       ok: selectedDaemonOnline,
+      actionLabel: selectedDaemonOnline ? "View" : "Fix",
+      onClick: selectedDaemon ? () => go("/settings/daemons") : props.onOpenEdit,
     },
     {
       label: "Provider auth",
@@ -1726,10 +1990,19 @@ function ProjectDetailView(props: {
               ? "Daemon has not reported provider auth"
               : `${plural(requiredProviders.length, "provider")} ready on daemon`,
       ok: Boolean(provider && selectedDaemon && authMissing.length === 0 && !authUnknown),
+      actionLabel: provider && selectedDaemon && authMissing.length === 0 && !authUnknown ? "View" : "Fix",
+      onClick: !provider || !selectedDaemon ? props.onOpenEdit : () => go("/settings/daemons"),
     },
-    { label: "Coverage", state: coverageLabel(config.cfg), ok: true },
-    { label: "Source", state: config.sourcePaths.length ? `${plural(config.sourcePaths.length, "path")}` : "No source paths", ok: config.sourcePaths.length > 0 },
-  ];
+    { label: "Coverage", state: coverageLabel(config.cfg), ok: true, actionLabel: "Edit", onClick: props.onOpenEdit },
+    { label: "Source", state: config.sourcePaths.length ? `${plural(config.sourcePaths.length, "path")}` : "No source paths", ok: config.sourcePaths.length > 0, actionLabel: config.sourcePaths.length ? "View" : "Fix", onClick: config.sourcePaths.length ? openSetupTab : props.onOpenEdit },
+    ...(setupAttention ? [{
+      label: "Prepared materials",
+      state: setupAttention.label,
+      ok: false,
+      actionLabel: "Review",
+      onClick: openSetupTab,
+    }] : []),
+  ] satisfies SetupDisclosureItem[];
   const prepareInfo = (() => {
     if (runningRun?.kind === "prepare" && online.length === 0) {
       return {
@@ -1804,39 +2077,11 @@ function ProjectDetailView(props: {
               variant="primary"
               icon="play"
               disabled={launchLocked}
-              title={runningRun ? "A run is already active for this project." : "Map scopes if needed, then dig the next batch."}
+              title={runningRun ? "A run is already active for this project." : "Run the automatic pipeline: prepare if needed, map/dig, confirm, and report."}
               onClick={() => props.onLaunch("run")}
             >
-              {runningRun ? "Audit running" : "Continue audit"}
+              {runningRun ? "Audit running" : hasPipelineRun ? "Continue" : "Run"}
             </Button>
-            <Button
-              icon="search"
-              disabled={launchLocked || pendingVerify === 0}
-              title={verifyButtonTitle(pendingVerify)}
-              aria-label={verifyButtonTitle(pendingVerify)}
-              onClick={() => props.onLaunch("verify")}
-            >
-              {verifyButtonLabel(pendingVerify)}
-            </Button>
-            <Button
-              icon="shieldcheck"
-              disabled={launchLocked || pendingConfirm === 0}
-              title={confirmTitle}
-              aria-label={confirmTitle}
-              onClick={() => props.onLaunch("confirm")}
-            >
-              {pendingConfirm > 0 ? `Confirm (${pendingConfirm})` : "Confirm"}
-            </Button>
-            {pendingReports > 0 ? (
-              <Button
-                icon="file"
-                disabled={launchLocked}
-                title={`Generate ${plural(pendingReports, "formal report")} from reproduced evidence.`}
-                onClick={() => props.onLaunch("report")}
-              >
-                Report ({pendingReports})
-              </Button>
-            ) : null}
             {runningRun ? <Button variant="danger" icon="x" onClick={() => props.onStopRun(runningRun)}>Stop run</Button> : null}
             <IconButton
               icon="kebab"
@@ -1894,12 +2139,12 @@ function ProjectDetailView(props: {
           })}
         </div>
         <div className="stats">
-          <Stat n={progress.total} label="scopes" onClick={() => setTab("scopes")} />
-          <Stat n={allFindings.length} label="findings" onClick={() => { props.setFindingStatus(""); props.setFindingQuery(""); setTab("findings"); }} />
-          <Stat n={overviewCandidates.length} label={pendingVerify ? "to verify" : "top candidates"} onClick={() => { props.setFindingStatus(""); props.setFindingQuery(""); setTab("overview"); scrollToProjectSection("project-top-candidates"); }} />
-          <Stat n={confirmed} label="confirmed" good onClick={() => { props.setFindingStatus("execution-confirmed"); props.setFindingQuery(""); setTab("findings"); }} />
+          <Stat n={progress.total} label="mapped" onClick={() => setTab("scopes")} />
+          <Stat n={progress.audited} label="audited" onClick={() => setTab("scopes")} />
+          <Stat n={candidateStat} label={candidateLabel} onClick={() => { props.setFindingStatus(""); props.setFindingQuery(""); setTab("overview"); scrollToProjectSection("project-top-candidates"); }} />
+          <Stat n={locallyVerified} label="verified" good onClick={() => { props.setFindingStatus("execution-confirmed"); props.setFindingQuery(""); setTab("findings"); }} />
           <Stat n={reproduced} label="reproduced" onClick={() => { setTab("overview"); scrollToProjectSection("project-real-target-decisions"); }} />
-          <Stat n={detail.currentRunsTotal ?? currentRuns.length} label="runs" onClick={() => setTab("runs")} />
+          <Stat n={reportStat} label={reportLabel} onClick={() => { setTab("overview"); scrollToProjectSection("project-real-target-decisions"); }} />
         </div>
         <RealTargetCallout decisions={confirmDecisions} onOpen={() => { setTab("overview"); scrollToProjectSection("project-real-target-decisions"); }} />
         <ProjectSetupDisclosure items={readyItems} />
@@ -2031,7 +2276,15 @@ function realTargetMethodSummary(realTarget: NonNullable<PrepareSummary["realTar
   return compactText(detail, 120);
 }
 
-function ProjectSetupDisclosure({ items }: { items: Array<{ label: string; state: string; ok: boolean }> }) {
+type SetupDisclosureItem = {
+  label: string;
+  state: string;
+  ok: boolean;
+  actionLabel?: string;
+  onClick?: () => void;
+};
+
+function ProjectSetupDisclosure({ items }: { items: SetupDisclosureItem[] }) {
   const warnings = items.filter((item) => !item.ok).length;
   return (
     <details id="project-setup" className="setup-disclosure section-anchor">
@@ -2041,13 +2294,20 @@ function ProjectSetupDisclosure({ items }: { items: Array<{ label: string; state
       </summary>
       <div className="setup-detail-grid">
         {items.map((item) => (
-          <div key={item.label} className={`setup-detail ${item.ok ? "ok" : "warn"}`}>
+          <button
+            key={item.label}
+            type="button"
+            className={`setup-detail ${item.ok ? "ok" : "warn"}`}
+            onClick={item.onClick}
+            title={item.actionLabel ?? `Open ${item.label}`}
+          >
             <span className="dot" />
             <span>
               <strong>{item.label}</strong>
               <small>{item.state}</small>
             </span>
-          </div>
+            <span className="setup-detail-action">{item.actionLabel ?? "Open"}</span>
+          </button>
         ))}
       </div>
     </details>
@@ -2100,10 +2360,10 @@ function ProjectOverview({
   const scopeValue = progress.total > 0 ? `${progress.audited}/${progress.total} scopes audited` : "No scope map yet";
   const scopeDetail = progress.total > 0
     ? `${plural(progress.pending, "pending scope")}${progress.deferred ? ` · ${plural(progress.deferred, "deferred scope")}` : ""}`
-    : "Run Map scopes or Continue audit to create the inventory.";
+    : "Run the pipeline or map scopes to create the inventory.";
   const runLabel = runningRun ? "Current run" : current ? "Latest run" : "Next run";
   const runValue = current ? runKindLabel(current.kind, current) : "No runs yet";
-  const runDetail = current ? overviewRunDetail(current, detail.confirmDecisions) : "Start Continue audit to prepare source, map scopes, and dig.";
+  const runDetail = current ? overviewRunDetail(current, detail.confirmDecisions) : "Start Run to prepare materials, map/dig, confirm impact, and generate reports.";
   const synthesis = runStages(latestRunWithStage(detail, "synthesis")).synthesis;
   const verifyValue = verifyCount ? plural(verifyCount, "candidate") : pendingConfirm ? "Ready for confirm" : "No candidates";
   const verifyDetail = verifyCount
@@ -2624,6 +2884,7 @@ function ProjectFindings(props: {
   const [total, setTotal] = useState(props.detail.findingsTotal ?? 0);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
+  const [tracking, setTracking] = useState("active");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
@@ -2631,7 +2892,7 @@ function ProjectFindings(props: {
 
   useEffect(() => {
     setPage(1);
-  }, [uuid, props.status, props.query]);
+  }, [uuid, props.status, props.query, tracking]);
 
   useEffect(() => {
     if (page > pageCount) setPage(pageCount);
@@ -2644,6 +2905,7 @@ function ProjectFindings(props: {
       offset: String((safePage - 1) * pageSize),
     });
     if (props.status) params.set("status", props.status);
+    if (tracking) params.set("tracking", tracking);
     if (props.query) params.set("q", props.query);
     setLoading(true);
     setError("");
@@ -2665,19 +2927,57 @@ function ProjectFindings(props: {
     return () => {
       alive = false;
     };
-  }, [uuid, props.status, props.query, safePage, pageSize, props.detail.findingsTotal]);
+  }, [uuid, props.status, props.query, tracking, safePage, pageSize, props.detail.findingsTotal]);
 
   const empty = props.detail.findingsTotal
     ? "No findings match the current filters."
     : "No findings yet. Findings appear after dig audits mapped scopes and produces a locally checked claim.";
+  const requiresConfirmation = needsRealTargetConfirmation(props.detail);
+  const allFindings = props.detail.allFindings ?? [];
+  const journey = [
+    {
+      label: "Verify",
+      count: pendingVerifyFindings(allFindings).length,
+      detail: "Candidates that still need local execution proof.",
+    },
+    {
+      label: "Confirm",
+      count: pendingConfirmFindings(allFindings, requiresConfirmation).length,
+      detail: requiresConfirmation ? "Locally verified findings waiting for real-target reproduction." : "Not required for this source-only target.",
+    },
+    {
+      label: "Report",
+      count: pendingFormalReports(allFindings, requiresConfirmation).length,
+      detail: "Reproduced or source-only confirmed bugs missing formal reports.",
+    },
+    {
+      label: "Track",
+      count: allFindings.filter((finding) => finding.has_report && (finding.tracking_status ?? "open") === "open").length,
+      detail: "Reported bugs still open for disclosure tracking.",
+    },
+  ];
   return (
     <Card title={<span>Findings <Counter>{total}</Counter></span>}>
+      <div className="finding-journey" aria-label="Finding workflow summary">
+        {journey.map((item) => (
+          <div key={item.label} className={item.count > 0 ? "needs-work" : ""}>
+            <strong>{item.count}</strong>
+            <span>{item.label}</span>
+            <small>{item.detail}</small>
+          </div>
+        ))}
+      </div>
       <div className="table-tools">
         <input className="searchbar" value={props.query} onChange={(event) => props.setQuery(event.target.value)} placeholder="Search findings..." aria-label="Search findings" />
         <select value={props.status} onChange={(event) => props.setStatus(event.target.value)} aria-label="Filter finding status">
           <option value="">All statuses</option>
           <option value="execution-confirmed">Execution confirmed</option>
-          {STATUSES.map((status) => <option key={status} value={status}>{status}</option>)}
+          {STATUSES.map((status) => <option key={status} value={status}>{findingStatusOptionLabel(status)}</option>)}
+        </select>
+        <select value={tracking} onChange={(event) => setTracking(event.target.value)} aria-label="Filter finding tracking">
+          <option value="active">Active findings</option>
+          <option value="">All tracking states</option>
+          {TRACKING.map((status) => <option key={status} value={status}>{findingTrackingOptionLabel(status)}</option>)}
         </select>
       </div>
       {error ? <EmptyInline>{error}</EmptyInline> : loading && rows.length === 0 ? <EmptyInline>Loading findings...</EmptyInline> : (
@@ -2686,7 +2986,7 @@ function ProjectFindings(props: {
           total={total}
           page={safePage}
           pageSize={pageSize}
-          paginationKey={`${props.status}:${props.query}`}
+          paginationKey={`${props.status}:${tracking}:${props.query}`}
           empty={empty}
           onPage={setPage}
           onPageSize={setPageSize}
@@ -2779,7 +3079,7 @@ function ScopesView({ detail, onPatchScope }: { detail: ProjectDetail; onPatchSc
           />
         </>
       ) : (
-        <EmptyInline>No scopes mapped yet. Run Map scopes or Continue audit to create the scope inventory before digging.</EmptyInline>
+        <EmptyInline>No scopes mapped yet. Run the pipeline or Map scopes to create the scope inventory before digging.</EmptyInline>
       )}
     </Card>
   );
@@ -2808,7 +3108,7 @@ function RunsView({ detail, onStopRun, onOpenLog }: { detail: ProjectDetail; onS
           ))}
         </div>
       ) : (
-        <EmptyInline>No runs yet. Start Continue audit to prepare the target, map scopes, and begin digging.</EmptyInline>
+        <EmptyInline>No runs yet. Start Run to execute the automatic pipeline.</EmptyInline>
       )}
     </Card>
   );
@@ -2816,14 +3116,17 @@ function RunsView({ detail, onStopRun, onOpenLog }: { detail: ProjectDetail; onS
 
 function GlobalFindingsView(props: {
   stats: BugStats;
+  projects: ProjectSnapshot[];
   findings: FindingRow[];
   total: number;
   page: number;
   pageSize: number;
   loading: boolean;
   error: string;
+  projectUuid: string;
   status: string;
   tracking: string;
+  setProjectUuid: (projectUuid: string) => void;
   setStatus: (status: string) => void;
   setTracking: (tracking: string) => void;
   setPage: (page: number) => void;
@@ -2834,19 +3137,20 @@ function GlobalFindingsView(props: {
 }) {
   const views = savedBugViews(props.stats);
   const activeView = views.find((view) => (view.status ?? "") === props.status && (view.tracking ?? "") === props.tracking)?.id ?? "custom";
+  const selectedProject = props.projects.find((project) => project.uuid === props.projectUuid);
   return (
     <main className="full-view findings-view">
       <Card>
         <div className="page-head">
           <div>
-            <h1>Findings across all projects</h1>
+            <h1>{selectedProject ? `Findings for ${selectedProject.name}` : "Findings across all projects"}</h1>
             <p>Submission tracking from discovery through real-target confirmation and vendor disclosure.</p>
           </div>
           <div className="headline-stats">
-            <Stat n={props.stats.total} label="total" />
+            <Stat n={props.stats.active ?? props.stats.total} label="active" />
             <Stat n={(props.stats.byStatus["confirmed-differential"] ?? 0) + (props.stats.byStatus["confirmed-executable"] ?? 0)} label="audit confirmed" good />
             <Stat n={props.stats.byTracking.submitted ?? 0} label="submitted" />
-            <Stat n={props.stats.byTracking.accepted ?? 0} label="accepted" />
+            <Stat n={props.stats.byTracking.ignored ?? 0} label="ignored" />
           </div>
         </div>
         <div className="saved-views">
@@ -2864,13 +3168,20 @@ function GlobalFindingsView(props: {
           ))}
         </div>
         <div className="table-tools">
+          <select value={props.projectUuid} onChange={(event) => props.setProjectUuid(event.target.value)} aria-label="Filter findings by project">
+            <option value="">All projects</option>
+            {props.projects.map((project) => (
+              <option key={project.uuid} value={project.uuid}>{project.name}{project.archived_at ? " (archived)" : ""}</option>
+            ))}
+          </select>
           <select value={props.status} onChange={(event) => props.setStatus(event.target.value)}>
             <option value="">All audit statuses</option>
-            {STATUSES.map((status) => <option key={status} value={status}>{status}</option>)}
+            {STATUSES.map((status) => <option key={status} value={status}>{findingStatusOptionLabel(status)}</option>)}
           </select>
           <select value={props.tracking} onChange={(event) => props.setTracking(event.target.value)}>
+            <option value="active">Active findings</option>
             <option value="">All tracking states</option>
-            {TRACKING.map((status) => <option key={status} value={status}>{status}</option>)}
+            {TRACKING.map((status) => <option key={status} value={status}>{findingTrackingOptionLabel(status)}</option>)}
           </select>
         </div>
       </Card>
@@ -2885,7 +3196,7 @@ function GlobalFindingsView(props: {
             total={props.total}
             page={props.page}
             pageSize={props.pageSize}
-            paginationKey={`${props.status}:${props.tracking}`}
+            paginationKey={`${props.projectUuid}:${props.status}:${props.tracking}`}
             global
             onPage={props.setPage}
             onPageSize={props.setPageSize}
@@ -2976,38 +3287,50 @@ function FindingTable({
           <thead>
             <tr>
               {global ? <th>Project</th> : null}
-              <th>Status</th>
-              <th>Checks</th>
-              <th>Title</th>
-              <th>Location</th>
-              <th>Next action</th>
+              <th>Finding</th>
+              <th>Evidence</th>
+              <th>Workflow</th>
               <th>Tracking</th>
               <th />
             </tr>
           </thead>
           <tbody>
-            {pageRows.map((finding) => (
-              <tr key={finding.id}>
-                {global ? (
-                  <td className="project-cell">
-                    {finding.project_uuid ? (
-                      <button type="button" className="table-link" onClick={() => onOpenProject?.(finding.project_uuid!)}>{finding.project_name}</button>
-                    ) : finding.project_name}
+            {pageRows.map((finding) => {
+              const workflow = findingWorkflow(finding);
+              return (
+                <tr key={finding.id}>
+                  {global ? (
+                    <td className="project-cell">
+                      {finding.project_uuid ? (
+                        <button type="button" className="table-link" onClick={() => onOpenProject?.(finding.project_uuid!)}>{finding.project_name}</button>
+                      ) : finding.project_name}
+                    </td>
+                  ) : null}
+                  <td className="finding-cell">
+                    <strong>{finding.title || "Untitled finding"}</strong>
+                    <small>{finding.location || "No location"}{finding.scope_id ? ` · ${finding.scope_id}` : ""}</small>
                   </td>
-                ) : null}
-                <td><StatusBadge status={finding.status} /></td>
-                <td><FindingChecks finding={finding} /></td>
-                <td className="title-cell">{finding.title}</td>
-                <td><code>{finding.location}</code></td>
-                <td>{nextAction(finding)}</td>
-                <td>
-                  <select value={finding.tracking_status ?? "open"} onChange={(event) => onTracking(finding, event.target.value)} aria-label={`Tracking for ${finding.title ?? "finding"}`}>
-                    {TRACKING.map((status) => <option key={status} value={status}>{status}</option>)}
-                  </select>
-                </td>
-                <td><Button size="sm" icon="file" onClick={() => onOpenReport(finding)}>Report</Button></td>
-              </tr>
-            ))}
+                  <td className="evidence-cell">
+                    <StatusBadge status={finding.status} />
+                    <FindingChecks finding={finding} />
+                    <span className="finding-evidence-meta">
+                      {finding.severity ? <span className={`severity sev-${finding.severity}`}>{finding.severity}</span> : null}
+                      <ConfidenceBadge value={finding.confidence} />
+                    </span>
+                  </td>
+                  <td className="workflow-cell">
+                    <span className={`label ${workflow.className}`}>{workflow.label}</span>
+                    <small>{workflow.detail}</small>
+                  </td>
+                  <td className="tracking-cell">
+                    <select value={finding.tracking_status ?? "open"} onChange={(event) => onTracking(finding, event.target.value)} aria-label={`Tracking for ${finding.title ?? "finding"}`}>
+                      {TRACKING.map((status) => <option key={status} value={status}>{findingTrackingOptionLabel(status)}</option>)}
+                    </select>
+                  </td>
+                  <td className="row-action-cell"><Button size="sm" icon="file" onClick={() => onOpenReport(finding)}>{finding.has_report ? "Open" : "Report"}</Button></td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -3023,18 +3346,69 @@ function FindingTable({
   );
 }
 
-function SettingsView({ pane, providers, daemons, onRefresh }: { pane: SettingsPane; providers: ProviderProfile[]; daemons: DaemonRow[]; onRefresh: () => Promise<void> }) {
+function SettingsView({
+  pane,
+  providers,
+  daemons,
+  archivedProjects,
+  onRefresh,
+  onUnarchive,
+}: {
+  pane: SettingsPane;
+  providers: ProviderProfile[];
+  daemons: DaemonRow[];
+  archivedProjects: ProjectSnapshot[];
+  onRefresh: () => Promise<void>;
+  onUnarchive: (project: ProjectSnapshot) => void;
+}) {
   return (
     <main className="settings-view">
       <aside className="settings-rail">
         <h1>Settings</h1>
         <button className={pane === "providers" ? "sel" : ""} onClick={() => go("/settings")}>Providers</button>
         <button className={pane === "daemons" ? "sel" : ""} onClick={() => go("/settings/daemons")}>Daemons</button>
+        <button className={pane === "archived" ? "sel" : ""} onClick={() => go("/settings/archived")}>Archived Projects</button>
       </aside>
       <section className="settings-content">
-        {pane === "providers" ? <ProvidersPane providers={providers} onRefresh={onRefresh} /> : <DaemonsPane daemons={daemons} onRefresh={onRefresh} />}
+        {pane === "providers" ? <ProvidersPane providers={providers} onRefresh={onRefresh} /> : null}
+        {pane === "daemons" ? <DaemonsPane daemons={daemons} onRefresh={onRefresh} /> : null}
+        {pane === "archived" ? <ArchivedProjectsPane projects={archivedProjects} onUnarchive={onUnarchive} /> : null}
       </section>
     </main>
+  );
+}
+
+function ArchivedProjectsPane({ projects, onUnarchive }: { projects: ProjectSnapshot[]; onUnarchive: (project: ProjectSnapshot) => void }) {
+  return (
+    <Card>
+      <div className="pane-head">
+        <div>
+          <h1>Archived projects</h1>
+          <p>Archived projects are hidden from the project rail but keep their runs, scopes, findings, and reports.</p>
+        </div>
+        <div className="pane-actions">
+          <Counter>{projects.length}</Counter>
+        </div>
+      </div>
+      {projects.length ? (
+        <div className="resource-list">
+          {projects.map((project) => (
+            <div key={project.uuid} className="resource-card archived-project-card">
+              <span className="avatar">{project.name.slice(0, 2).toUpperCase()}</span>
+              <span className="grow">
+                <strong>{project.name}</strong>
+                <small>
+                  {project.archived_at ? `Archived ${fmtTime(project.archived_at)}` : "Archived"} · {project.created_at ? `Created ${fmtTime(project.created_at)}` : "Created time unavailable"}
+                </small>
+              </span>
+              <Button size="sm" icon="sync" onClick={() => onUnarchive(project)}>Unarchive</Button>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <EmptyInline>No archived projects.</EmptyInline>
+      )}
+    </Card>
   );
 }
 
@@ -3412,6 +3786,17 @@ function selectedProfilesForForm(defaultProviderId: string, phaseProviders: Phas
   });
 }
 
+function suggestProjectName(input: string): string {
+  const source = input
+    .trim()
+    .replace(/^https?:\/\//i, "")
+    .split(/\s+/)
+    .slice(0, 8)
+    .join(" ");
+  const slug = source.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 36).replace(/-+$/g, "");
+  return slug || "new-project";
+}
+
 function FormProviderAuthNote({ daemon, profiles }: { daemon?: DaemonRow; profiles: ProviderProfile[] }) {
   const byProvider = new Map<string, ProviderProfile>();
   for (const profile of profiles) byProvider.set(profile.provider, profile);
@@ -3476,17 +3861,20 @@ function PhaseProviderOverrides({ providers, defaultProviderId, values, onChange
   );
 }
 
-function NewProjectModal({ providers, daemons, onClose, onCreated, onError }: { providers: ProviderProfile[]; daemons: DaemonRow[]; onClose: () => void; onCreated: (uuid: string) => Promise<void>; onError: (message: string) => void }) {
+function NewProjectModal({ providers, daemons, onClose, onCreated, onError }: { providers: ProviderProfile[]; daemons: DaemonRow[]; onClose: () => void; onCreated: (uuid: string, runAfterCreate: boolean) => Promise<void>; onError: (message: string) => void }) {
   const [advanced, setAdvanced] = useState(false);
   const [phaseOpen, setPhaseOpen] = useState(false);
   const firstDaemon = daemons.find((daemon) => daemonHealth(daemon) === "online") ?? daemons[0];
-  const [form, setForm] = useState({ name: "", daemonId: firstDaemon?.id ? String(firstDaemon.id) : "", providerId: providers[0]?.id ? String(providers[0].id) : "", dir: "", sourcePaths: ".", buildRoot: ".", corpusPaths: "docs/specs", coverageMode: "standard" as CoverageMode, maxScopes: "30", digSamples: "1", mapSteps: "", digSteps: "", digConcurrency: "1" });
+  const [form, setForm] = useState({ intent: "", name: "", runAfterCreate: true, daemonId: firstDaemon?.id ? String(firstDaemon.id) : "", providerId: defaultProjectProviderId(providers), dir: "", sourcePaths: ".", buildRoot: ".", corpusPaths: "docs/specs", coverageMode: "standard" as CoverageMode, maxScopes: "30", digSamples: "1", mapSteps: "", digSteps: "", digConcurrency: "1" });
   const [phaseProviders, setPhaseProviders] = useState<PhaseProviderForm>({ prepare: "", map: "", dig: "", confirm: "" });
   const providerMissing = providers.length === 0;
   const daemonMissing = daemons.length === 0;
   const selectedDaemon = daemons.find((daemon) => String(daemon.id) === form.daemonId);
   const selectedProfiles = selectedProfilesForForm(form.providerId, phaseProviders, providers);
-  const canSubmit = !providerMissing && !daemonMissing && Boolean(form.daemonId) && Boolean(form.providerId);
+  const inferredName = suggestProjectName(form.intent);
+  const finalName = form.name.trim() || inferredName;
+  const hasIdentity = Boolean(form.name.trim() || form.intent.trim());
+  const canSubmit = !providerMissing && !daemonMissing && Boolean(form.daemonId) && Boolean(form.providerId) && hasIdentity;
   async function submit(event: FormEvent) {
     event.preventDefault();
     if (providerMissing) {
@@ -3505,11 +3893,20 @@ function NewProjectModal({ providers, daemons, onClose, onCreated, onError }: { 
       onError("Select the default provider profile for this project.");
       return;
     }
+    if (!hasIdentity) {
+      onError("Describe what this project should audit, or enter a project name.");
+      return;
+    }
     const cfg = applyBudgetFields(coverageConfig(form.coverageMode, form.maxScopes), form);
+    const intent = form.intent.trim();
+    if (intent) {
+      cfg.projectIntent = intent;
+      cfg.prepareClue = intent;
+    }
     const phaseCfg = phaseProviderConfig(phaseProviders);
     if (phaseCfg) cfg.phaseProviders = phaseCfg;
     const payload: ProjectPayload = {
-      name: form.name.trim(),
+      name: finalName,
       providerId: form.providerId ? Number(form.providerId) : undefined,
       daemonId: form.daemonId ? Number(form.daemonId) : undefined,
       dir: form.dir.trim() || undefined,
@@ -3520,13 +3917,13 @@ function NewProjectModal({ providers, daemons, onClose, onCreated, onError }: { 
     };
     try {
       const created = await api.createProject(payload);
-      await onCreated(created.uuid);
+      await onCreated(created.uuid, form.runAfterCreate);
     } catch (error) {
       onError(String(error instanceof Error ? error.message : error));
     }
   }
   return (
-    <Modal project title="Create project" onClose={onClose} footer={<><Button onClick={onClose}>Cancel</Button><Button variant="primary" type="submit" form="new-project-form" disabled={!canSubmit}>Create project</Button></>}>
+    <Modal project title="Create project" onClose={onClose} footer={<><label className="modal-footer-check"><input type="checkbox" checked={form.runAfterCreate} onChange={(event) => setForm({ ...form, runAfterCreate: event.target.checked })} />Run after create</label><span className="modal-footer-actions"><Button onClick={onClose}>Cancel</Button><Button variant="primary" type="submit" form="new-project-form" disabled={!canSubmit}>Create project</Button></span></>}>
       <form id="new-project-form" className="project-form" onSubmit={(event) => void submit(event)}>
         {providerMissing || daemonMissing ? (
           <div className="inline-note">
@@ -3535,12 +3932,29 @@ function NewProjectModal({ providers, daemons, onClose, onCreated, onError }: { 
             Credentials stay on the selected daemon; the server stores only routing and model choices.
           </div>
         ) : null}
+        <section className="project-intent-composer">
+          <div className="composer-copy">
+            <span>What should Flounder do?</span>
+            <small>Paste a target clue, repo, address, tx, contest link, or a short audit instruction.</small>
+          </div>
+          <textarea
+            value={form.intent}
+            onChange={(event) => setForm({ ...form, intent: event.target.value })}
+            placeholder="Audit the deployed rollup contracts behind 0x... and prepare source/docs before sealed map + dig."
+            rows={4}
+            autoFocus
+          />
+          <div className="composer-foot">
+            <span>{form.name.trim() ? `Project: ${form.name.trim()}` : `Project: ${inferredName}`}</span>
+            <Icon name="arrowright" size={15} />
+          </div>
+        </section>
         <FormSection title="Basics">
           <div className="form-grid two">
-            <Field label="Project name" span><input required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="aztec-rollup" autoFocus /></Field>
+            <Field label="Project name" help="Leave blank to use the generated name from the task." span><input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder={inferredName} /></Field>
             <Field label="Execution daemon" help={daemonMissing ? "Go to Settings -> Daemons to create one." : "Jobs for this project are claimed only by this daemon."}><select required disabled={daemonMissing} value={form.daemonId} onChange={(event) => setForm({ ...form, daemonId: event.target.value })}><option value="" disabled>Select daemon</option>{daemons.map((d) => <option key={d.id} value={d.id}>{d.name ?? `daemon-${d.id}`} · {relativeAge(d)}</option>)}</select></Field>
             <Field label="Default provider" help={providerMissing ? "Go to Settings -> Providers to create one." : "Used by every phase unless overridden below."}><select required disabled={providerMissing} value={form.providerId} onChange={(event) => setForm({ ...form, providerId: event.target.value })}><option value="" disabled>Select provider</option>{providers.map((p) => <option key={p.id} value={p.id}>{providerProfileLabel(p)}</option>)}</select></Field>
-            <Field label="Project directory" help="Resolved under the daemon workspace. Empty uses the project name."><input value={form.dir} onChange={(event) => setForm({ ...form, dir: event.target.value })} placeholder="defaults to project name" /></Field>
+            <Field label="Project directory" help="Resolved under the daemon workspace. Empty uses the project UUID."><input value={form.dir} onChange={(event) => setForm({ ...form, dir: event.target.value })} placeholder="defaults to project UUID" /></Field>
           </div>
         </FormSection>
         <button type="button" className="advanced-toggle" onClick={() => setPhaseOpen(!phaseOpen)}>{phaseOpen ? "Hide phase provider overrides" : "Customize phase providers"}</button>
@@ -3586,6 +4000,7 @@ function EditProjectModal({ detail, providers, daemons, onClose, onSaved, onErro
   const cfg = projectConfig(detail);
   const initialCoverageMode = coverageModeFromConfig(cfg.cfg);
   const [form, setForm] = useState({
+    intent: cfg.cfg.prepareClue ?? cfg.cfg.projectIntent ?? "",
     daemonId: detail.project.daemon_id ? String(detail.project.daemon_id) : "",
     providerId: detail.project.provider_id ? String(detail.project.provider_id) : "",
     dir: detail.project.dir ?? "",
@@ -3620,6 +4035,14 @@ function EditProjectModal({ detail, providers, daemons, onClose, onSaved, onErro
     }
     try {
       const nextConfig = applyBudgetFields({ ...cfg.cfg, ...coverageConfig(form.coverageMode, form.maxScopes) }, form);
+      const intent = form.intent.trim();
+      if (intent) {
+        nextConfig.projectIntent = intent;
+        nextConfig.prepareClue = intent;
+      } else {
+        delete nextConfig.projectIntent;
+        delete nextConfig.prepareClue;
+      }
       if (form.coverageMode !== "custom") delete nextConfig.maxScopes;
       const phaseCfg = phaseProviderConfig(phaseProviders);
       if (phaseCfg) nextConfig.phaseProviders = phaseCfg;
@@ -3633,6 +4056,18 @@ function EditProjectModal({ detail, providers, daemons, onClose, onSaved, onErro
   return (
     <Modal project title="Edit project config" onClose={onClose} footer={<><Button onClick={onClose}>Cancel</Button><Button variant="primary" type="submit" form="edit-project-form" disabled={!canSave}>Save config</Button></>}>
       <form id="edit-project-form" className="project-form" onSubmit={(event) => void submit(event)}>
+        <section className="project-intent-composer compact">
+          <div className="composer-copy">
+            <span>Project task and prepare clue</span>
+            <small>Used as the default clue when Prepare starts without an explicit clue.</small>
+          </div>
+          <textarea
+            value={form.intent}
+            onChange={(event) => setForm({ ...form, intent: event.target.value })}
+            placeholder="Audit the deployed protocol, acquire official source/docs, then map and dig."
+            rows={3}
+          />
+        </section>
         <FormSection title="Basics">
           <div className="form-grid two">
             <Field label="Execution daemon" help="Jobs for this project are claimed only by this daemon."><select required value={form.daemonId} onChange={(event) => setForm({ ...form, daemonId: event.target.value })}><option value="" disabled>Select daemon</option>{daemons.map((d) => <option key={d.id} value={d.id}>{d.name ?? `daemon-${d.id}`} · {relativeAge(d)}</option>)}</select></Field>
@@ -3681,6 +4116,7 @@ function RunModal({ detail, busy, onClose, onLaunch, onUpdateRunTarget, onError 
   const verifiable = pendingVerifyFindings(detail.allFindings).length;
   const reportable = reportableFindings(detail.allFindings, requiresConfirmation).length;
   const missingReports = pendingFormalReports(detail.allFindings, requiresConfirmation).length;
+  const hasPipelineRun = detail.runs.some((run) => run.kind === "run");
   const locked = busy || Boolean(running);
   const [runTargetDraft, setRunTargetDraft] = useState("");
   useEffect(() => {
@@ -3709,7 +4145,7 @@ function RunModal({ detail, busy, onClose, onLaunch, onUpdateRunTarget, onError 
     ? "Optionally re-run Prepare to close provenance, deployment-match, or real-target caveats. The current materials can still drive Map/Dig."
     : "Acquire official source/docs, pin provenance, and record material or real-target gaps before sealed auditing.";
   const options: Array<{ verb: LaunchAction; label: string; detail: string; disabled?: boolean }> = [
-    { verb: "run", label: "Continue audit", detail: "Prepare if needed, map scopes if needed, then dig the next batch.", disabled: locked },
+    { verb: "run", label: hasPipelineRun ? "Continue" : "Run", detail: "Run the automatic pipeline: Prepare when needed, then map/dig, confirm reproduced impact, and generate reports.", disabled: locked },
     {
       verb: "prepare",
       label: prepareActionLabel,
@@ -3723,7 +4159,7 @@ function RunModal({ detail, busy, onClose, onLaunch, onUpdateRunTarget, onError 
     { verb: "report", label: missingReports ? `Generate reports (${missingReports})` : "Regenerate reports", detail: reportable ? `Write formal Markdown reports for ${plural(reportable, requiresConfirmation ? "real-target reproduced finding" : "locally confirmed finding")}.` : requiresConfirmation ? "Disabled until confirm reproduces at least one finding." : "Disabled until local execution confirms at least one finding.", disabled: locked || reportable === 0 },
   ];
   return (
-    <Modal title={`${running ? "Run settings" : "Run audit"} - ${detail.project.name}`} onClose={onClose}>
+    <Modal title={`${running ? "Run settings" : "Run controls"} - ${detail.project.name}`} onClose={onClose}>
       {running ? (
         <div className="info-panel active-run-settings compact">
           <div>
@@ -3769,6 +4205,9 @@ function LaunchConfirmModal({ action, detail, busy, onCancel, onConfirm }: { act
   const [selectedIds, setSelectedIds] = useState<Set<number>>(() => new Set(defaultTargets.map((finding) => finding.id)));
   const selectedTargets = targets.filter((finding) => selectedIds.has(finding.id));
   const count = selectedTargets.length;
+  const selectedMissingReports = isReport ? selectedTargets.filter((finding) => !finding.has_report).length : 0;
+  const selectedExistingReports = isReport ? selectedTargets.filter((finding) => finding.has_report).length : 0;
+  const existingReportTargets = isReport ? targets.filter((finding) => finding.has_report).length : 0;
   const allSelected = targets.length > 0 && selectedIds.size === targets.length;
   function toggleFinding(id: number) {
     setSelectedIds((current) => {
@@ -3781,9 +4220,25 @@ function LaunchConfirmModal({ action, detail, busy, onCancel, onConfirm }: { act
   function toggleAll() {
     setSelectedIds(allSelected ? new Set() : new Set(targets.map((finding) => finding.id)));
   }
-  const title = isReport ? "Generate formal reports?" : isConfirm ? "Start real-target confirmation?" : "Verify candidates?";
+  const title = isReport
+    ? defaultReportTargets.length
+      ? existingReportTargets
+        ? "Generate or regenerate reports?"
+        : "Generate formal reports?"
+      : "Regenerate reports?"
+    : isConfirm
+      ? "Start real-target confirmation?"
+      : "Verify candidates?";
   const buttonIcon: IconName = isReport ? "file" : isConfirm ? "shieldcheck" : "search";
-  const buttonLabel = isReport ? "Generate reports" : isConfirm ? "Confirm" : "Verify";
+  const buttonLabel = isReport
+    ? selectedExistingReports > 0 && selectedMissingReports === 0
+      ? "Regenerate reports"
+      : selectedExistingReports > 0
+        ? "Generate / regenerate"
+        : "Generate reports"
+    : isConfirm
+      ? "Confirm"
+      : "Verify";
   return (
     <Modal
       title={title}
@@ -3800,7 +4255,11 @@ function LaunchConfirmModal({ action, detail, busy, onCancel, onConfirm }: { act
       <div className="confirm-copy">
         <strong>
           {isReport
-            ? `${plural(count, requiresConfirmation ? "reproduced finding" : "locally confirmed finding")} will be packaged into formal reports.`
+            ? selectedExistingReports > 0 && selectedMissingReports > 0
+              ? `${plural(selectedMissingReports, "new report")} will be generated and ${plural(selectedExistingReports, "existing report")} will be regenerated.`
+              : selectedExistingReports > 0
+                ? `${plural(selectedExistingReports, "existing report")} will be regenerated.`
+                : `${plural(count, requiresConfirmation ? "reproduced finding" : "locally confirmed finding")} will be packaged into formal reports.`
             : isConfirm
               ? `${plural(count, "finding")} will be checked against the real target.`
               : `${plural(count, "candidate")} will be checked by local execution.`}
@@ -4163,7 +4622,7 @@ function CommandPalette({ projects, currentProjectUuid, onClose, onNewProject, o
       { id: "settings", label: "Settings", meta: "view", run: () => go("/settings") },
       { id: "providers", label: "Provider profiles", meta: "settings", run: () => go("/settings") },
       { id: "daemons", label: "Daemons", meta: "settings", run: () => go("/settings/daemons") },
-      ...(current && !currentRunning ? [{ id: "run", label: `Continue audit - ${current.name}`, meta: "run", run: onLaunch }] : []),
+      ...(current && !currentRunning ? [{ id: "run", label: `${current.runCount ? "Continue" : "Run"} - ${current.name}`, meta: "run", run: onLaunch }] : []),
     ];
     return [...projectCommands, ...base].filter((command) => command.label.toLowerCase().includes(query.toLowerCase()));
   }, [projects, query, currentProjectUuid, onNewProject, onLaunch]);

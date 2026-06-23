@@ -23,6 +23,11 @@ export interface ProjectSnapshot {
   provider_id?: number | null;
   daemon_id?: number | null;
   dir?: string | null;
+  archived_at?: string | null;
+  pinned_at?: string | null;
+  sort_order?: number | null;
+  created_at?: string | null;
+  updated_at?: string | null;
   progress?: Coverage;
   findingCounts?: Record<string, number>;
   findingsTotal?: number;
@@ -34,6 +39,7 @@ export interface ProjectSnapshot {
   confirmDecisionCount?: number;
   activeRuns?: number;
   currentRunCount?: number;
+  runCount?: number;
   latestRun?: RunRow | null;
   material?: MaterialSummary;
 }
@@ -49,6 +55,9 @@ export interface ProjectRow {
   provider_id?: number | null;
   daemon_id?: number | null;
   dir?: string | null;
+  archived_at?: string | null;
+  pinned_at?: string | null;
+  sort_order?: number | null;
   created_at?: string;
   updated_at?: string;
 }
@@ -293,6 +302,8 @@ export type PhaseConfig = Partial<Record<"prepare" | "map" | "dig" | "confirm", 
 export type PhaseProviderConfig = Partial<Record<"prepare" | "map" | "dig" | "confirm", number>>;
 
 export interface ProjectConfig {
+  projectIntent?: string;
+  prepareClue?: string;
   scopeCoverageMode?: "focused" | "standard" | "half" | "full" | "custom";
   maxScopes?: number;
   mapSteps?: number;
@@ -312,6 +323,9 @@ export interface ProjectPayload {
   corpusPaths?: string[];
   config?: ProjectConfig;
   daemonId?: number;
+  archived?: boolean;
+  pinned?: boolean;
+  sortOrder?: number | null;
 }
 
 export interface LaunchPayload {
@@ -345,6 +359,7 @@ export async function fetchJson<T>(path: string, init?: RequestInit): Promise<T>
 
 export const api = {
   projects: () => fetchJson<{ projects: ProjectSnapshot[] }>("/api/projects"),
+  archivedProjects: () => fetchJson<{ projects: ProjectSnapshot[] }>("/api/projects?archived=1"),
   project: (uuid: string) => fetchJson<ProjectDetail>(`/api/projects/${encodeURIComponent(uuid)}`),
   scopes: (uuid: string, params = new URLSearchParams()) =>
     fetchJson<{ scopes: ScopeRow[]; progress: Coverage; total: number; limit: number; offset: number }>(`/api/projects/${encodeURIComponent(uuid)}/scopes?${params.toString()}`),
@@ -352,6 +367,7 @@ export const api = {
     fetchJson<{ findings: FindingRow[]; total: number; limit: number; offset: number }>(`/api/projects/${encodeURIComponent(uuid)}/findings?${params.toString()}`),
   createProject: (body: ProjectPayload) => postJson<{ ok: true; id: number; uuid: string; name: string }>("/api/projects", body),
   updateProject: (uuid: string, body: ProjectPayload) => patchJson<{ ok: true }>(`/api/projects/${encodeURIComponent(uuid)}`, body),
+  reorderProjects: (uuids: string[]) => patchJson<{ ok: true; changed: number }>("/api/projects/order", { uuids }),
   deleteProject: (uuid: string) => fetchJson<{ ok: true }>(`/api/projects/${encodeURIComponent(uuid)}`, { method: "DELETE" }),
   launchRun: (uuid: string, body: LaunchPayload) => postJson<unknown>(`/api/projects/${encodeURIComponent(uuid)}/runs`, body),
   updateRun: (id: number, body: { runScopesTarget?: number }) => patchJson<unknown>(`/api/runs/${id}`, body),
@@ -375,7 +391,7 @@ export const api = {
   renameDaemon: (id: number, name: string) => patchJson<unknown>(`/api/daemons/${id}`, { name }),
   deleteDaemon: (id: number) => fetchJson<unknown>(`/api/daemons/${id}`, { method: "DELETE" }),
   bugs: (params: URLSearchParams) =>
-    fetchJson<{ findings: FindingRow[]; total: number; limit: number; offset: number; stats: { total: number; byStatus: Record<string, number>; byTracking: Record<string, number> } }>(`/api/bugs?${params.toString()}`),
+    fetchJson<{ findings: FindingRow[]; total: number; limit: number; offset: number; stats: { total: number; active: number; byStatus: Record<string, number>; byTracking: Record<string, number> } }>(`/api/bugs?${params.toString()}`),
   findingReport: (id: number) => fetchJson<{ markdown: string; source: "db" | "generated" }>(`/api/findings/${id}/report`),
   trackFinding: (id: number, status: string) => patchJson<unknown>(`/api/findings/${id}/tracking`, { status }),
   artifact: (runId: number, name: string) => fetch(`/api/runs/${runId}/artifact?name=${encodeURIComponent(name)}`),

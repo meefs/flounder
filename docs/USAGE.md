@@ -4,25 +4,30 @@ Practical guide to driving Flounder from the CLI, the dashboard, the API, and th
 
 Flounder is an autonomous white-hat security auditor. The operator supplies the authorized target boundary, daemon, provider profile, and budget; the model decides what to read, test, and report. Flags shape *what* it may audit and *how thoroughly* it audits, never *what the bug is*.
 
-The product workflow is prepare -> map -> dig -> confirm:
+The product workflow is prepare -> map -> dig -> confirm -> report:
 
 - `prepare`: open-world acquisition from a clue, such as a transaction, address, project, repository, package, or link.
 - `map`: sealed scope inventory and scoring.
 - `dig`: sealed deep audit of selected scopes with local execution proof.
 - `confirm`: open-world reproduction against real-world ground truth, with white-hat no-broadcast rules.
+- `report`: formal Markdown packaging for reproduced or source-provided locally confirmed bugs.
 
 ## Agentic flow
 
-`flounder run` orchestrates a **map → dig** pass; each phase — and each other verb — runs the *same* thin agent session. The default `flounder run` is map→dig; `flounder run --quick`, `flounder audit`, and `flounder map` enter that one session directly, and `flounder confirm` runs it open-world.
+`flounder run` has two entry shapes. With a clue, it is the one-command pipeline: open-world prepare, sealed map/dig, open-world confirm, then report generation for reproduced bugs. With source paths already supplied, it runs the sealed **map → dig** audit directly. Each phase — and each other verb — runs the same thin agent session; `flounder run --quick`, `flounder audit`, and `flounder map` enter that session directly, and `flounder confirm` runs it open-world.
 
 ```mermaid
 flowchart TD
-  RUN["flounder run (default)"] --> MAP["MAP — enumerate + score a complete scope inventory (scopes.json)"]
+  CLUE["flounder run <clue>"] --> PREP["PREPARE — acquire/stage source and project material"]
+  PREP --> MAP
+  RUN["flounder run --source ..."] --> MAP["MAP — enumerate + score a complete scope inventory (scopes.json)"]
   MAP --> DIG["DIG — deep-audit each selected scope, one at a time"]
   DIG -. "checkpoint after MAP and after each dig — resumable, never drops a scope" .-> MAP
   QUICK["flounder run --quick · flounder audit &lt;region&gt;/--scope/--verify · flounder map"] --> SESSION["one agent session (the loop below)"]
   DIG --> SESSION
   CONFIRM["flounder confirm (open-world, networked)"] --> SESSION
+  DIG --> CONFIRM
+  CONFIRM --> REPORT["REPORT — generate formal Markdown reports for reproduced bugs"]
 ```
 
 Each session is the thin loop:
@@ -122,7 +127,7 @@ flounder run --source ./src --build-root . --sandbox-backend host --allow-host-e
 
 Host execution keeps the copied workspace, isolated `HOME`, temp directories, and package-cache environment, but it cannot provide kernel-level network or filesystem isolation and it inherits the host process/toolchain boundary. Do not use it for untrusted targets, malicious dependencies, or real model-generated exploit code unless the operator deliberately accepts that risk. The same opt-in can be supplied by setting `FLOUNDER_ALLOW_HOST_EXECUTION=1`; the backend and image can be set with `FLOUNDER_SANDBOX_BACKEND` and `FLOUNDER_SANDBOX_IMAGE`.
 
-Network policy is phase-specific. Sealed `run` / `map` / `audit` inspection and confirmation commands use `--network none` in OCI. Dependency warm-up and explicit `purpose=build` commands default to `--prepare-network enabled` so package registries can be used. `flounder prepare` and `flounder confirm` default to `--confirm-network enabled` because they are the open-world phases; the command-safety policy still forbids broadcast, value-moving, destructive, credential, and persistence behavior.
+Network policy is phase-specific. Sealed `run --source` / `map` / `audit` inspection and confirmation commands use `--network none` in OCI. Dependency warm-up and explicit `purpose=build` commands default to `--prepare-network enabled` so package registries can be used. `flounder prepare` and `flounder confirm` default to `--confirm-network enabled` because they are the open-world phases; the command-safety policy still forbids broadcast, value-moving, destructive, credential, and persistence behavior.
 
 ## Materials
 
@@ -147,7 +152,7 @@ The sealed verbs (`run --source`, `map`, and `audit`) share the tools, the confi
 | Command | What it does |
 |---|---|
 | `flounder prepare <clue>` | open-world acquisition before map: turn a transaction, address, project, package, repository, or link into staged source, corpus, dependency closure, and deployment-match evidence |
-| `flounder run <clue>` | one-command workflow: prepare the target, run the sealed map -> dig audit, then confirm reproduced findings when possible |
+| `flounder run <clue>` | one-command workflow: prepare the target, run the sealed map -> dig audit, confirm reproduced findings when possible, then generate reports |
 | `flounder run --source <paths...>` | source-provided sealed audit: map -> dig in one pass. MAP enumerates and scores a complete scope inventory, then DIG deep-audits selected scopes obligation-by-obligation and execution-confirms. Resumable, never silently drops a scope. (`--quick` runs a single breadth pass instead.) |
 | `flounder map` | enumerate + persist the scope inventory only (`audit_scopes.json`), no dig — inspect or curate scopes before auditing |
 | `flounder audit <region>` | deep-audit one region you already care about (skip the map) |
@@ -164,8 +169,8 @@ For a real audit, use the dashboard flow:
 1. Start `flounder ui`.
 2. Create or connect an execution daemon.
 3. Authenticate the daemon's provider with `flounder daemon provider login openai-codex` and verify with `flounder daemon provider check openai-codex`. This is the command an agent should run when it needs the user to complete OpenAI Codex auth.
-4. Create a provider profile that selects provider, model, and thinking level.
-5. Create a project, select its execution daemon and default provider profile, add source/build/corpus paths, and start a run.
+4. Create or reuse a provider profile that selects provider, model, and thinking level. Fresh installs seed `openai-codex · gpt-5.5 · xhigh` and `claude-code · opus 4.8 max`; the selected daemon still needs local auth for every provider used by the default profile or phase overrides.
+5. Create a project, describe the task/clue in the "What should Flounder do?" box, select its execution daemon and default provider profile, add source/build/corpus paths, and start a run. The project directory defaults to the project UUID under the daemon workspace, which stays stable if the display name changes. Leave **Run after create** checked to start the pipeline immediately.
 
 The equivalent source-provided CLI launch is:
 
@@ -190,10 +195,10 @@ flounder run \
 
 **Zcash — Rust ZK circuits (stack-agnostic, execution-confirmed).** Audit a circuit crate for a soundness gap: `--source` the crate, `--build-root` the cargo workspace, `--corpus` the circuit's design spec. `flounder run` makes MAP enumerate the circuit's constraints — including operands the spec treats as given, a classic under-constrained-witness bug — and the dig write a `MockProver` malicious-witness test. A real crate-internal soundness bug reached `confirmed-differential` this way (the model wrote the exploit, the framework built and ran it, then applied the model's fix and re-ran to show it blocked). A subtle one needs `flounder audit --scope <id>` + `--dig-samples` and an uninterrupted dig.
 
-**Aztec — Solidity rollup (incident analysis and cold audit).** Two scenarios on the deployed `RollupProcessorV3`:
+**Aztec — Solidity rollup (incident investigation and blind audit).** Two scenarios on the deployed `RollupProcessorV3`:
 
-- *Incident analysis* — give the agent the real deployed contracts (`--source`/`--build-root` on the Foundry project), the official Aztec specs, and a strictly factual on-chain incident brief (`--corpus`); nothing you authored, no hand-picked scope. Let it localize, then `flounder audit --verify` (or the dig) confirms by execution.
-- *Cold audit* — the same materials **minus** the incident brief. From scratch, `flounder run` independently flagged the decode/settlement region and reached `confirmed-differential` on an unbound-input bug (`numRealTransactions` not bound to the verifier's public-input hash), with a faithful proof-of-malleability PoC — with no knowledge that an incident had ever occurred.
+- *Incident investigation* — give the agent the real deployed contracts (`--source`/`--build-root` on the Foundry project), the official Aztec specs, and a strictly factual on-chain incident brief (`--corpus`); nothing you authored, no hand-picked scope. Let it investigate, then `flounder audit --verify` (or the dig) confirms by execution.
+- *Blind audit* — the same materials **minus** the incident brief. From scratch, `flounder run` independently flagged the decode/settlement region and reached `confirmed-differential` on an unbound-input bug (`numRealTransactions` not bound to the verifier's public-input hash), with a faithful proof-of-malleability PoC — with no knowledge that an incident had ever occurred.
 
 ## Local checks
 
@@ -207,7 +212,7 @@ npm run verify        # full local verification gate
 
 `flounder confirm <run-dir> --source <paths...>` takes a finished `flounder run` to a real-world standard of certainty and writes a submit/no-submit decision sheet. It is the open-world counterpart to the sealed `run`, and the only capability difference is that the network is available.
 
-Confirm is **finding-grained and resumable**: each finding gets a real-target outcome (`reproduced` / `not-reproduced`), and a re-run skips the ones already decided. The CLI form confirms a whole run dir; from the dashboard you can **Confirm** a single finding or all pending findings of a project (it reproduces only what's still undecided — including findings added by a later `Continue audit`).
+Confirm is **finding-grained and resumable**: each finding gets a real-target outcome (`reproduced` / `not-reproduced`), and a re-run skips the ones already decided. The CLI form confirms a whole run dir; from the dashboard you can **Confirm** a single finding or all pending findings of a project (it reproduces only what's still undecided, including findings added by a later **Continue** run).
 
 ```bash
 flounder confirm ~/.flounder/protocol-<timestamp> \
@@ -261,7 +266,7 @@ pi -e flounders
 The extension registers workflow tools that mirror the top-level verbs:
 
 - `flounder_prepare`: open-world target acquisition from a clue.
-- `flounder_run`: current `run` semantics. With a clue, it runs prepare -> sealed map/dig -> confirm; with `sourcePaths`, it runs the sealed source audit.
+- `flounder_run`: current `run` semantics. With a clue, it runs prepare -> sealed map/dig -> confirm -> report; with `sourcePaths`, it runs the sealed source audit.
 - `flounder_map`: sealed scope inventory only.
 - `flounder_audit`: sealed dig/region/scope/verify workflow.
 - `flounder_confirm`: open-world reproduction of finished run findings.
@@ -329,7 +334,11 @@ flounder daemon start --server http://<server>:4500 --token <token>   # run the 
 
 A web dashboard to track and drive audits across projects, updating live via SSE. A project is pinned to an **execution daemon** and a **default provider profile**. A provider profile is the model strategy: provider, model, thinking level, and optional role defaults. The project can also override the provider profile per phase (`prepare`, `map`, `dig`, `confirm`) when one phase needs a different model or reasoning level. The selected daemon must be authenticated for every provider profile the project can use.
 
-A project's detail is the **prepare → map → dig → confirm** workflow: it shows the current phase, elapsed phase timing, scope coverage, live model activity, and the scope being dug. Below it are the scope queue you can hand-order (`Top` pushes a scope to the front of the dig, separate from its score), findings that stream in as scopes land and change status through refutation, per-finding **Confirm** actions with real-target outcome (`reproduced` / `not-reproduced`), a project-wide **Confirm pending on real target**, and viewable Markdown reports. **Start/Continue** resumes an audit, **Restart** remaps from scratch, and **Stop** cooperatively cancels a running job. The cross-project **Findings** view tracks every finding and its submission state. Settings holds provider profiles and daemon CRUD (mint token, rename, revoke).
+Project creation starts with a task/clue composer so the operator can say what the audit should do. The clue is stored as `config.prepareClue` and reused by Prepare unless a launch supplies a new one. Project directories live under the daemon workspace and default to the project UUID, not the display name. The project list defaults to newest-created first, supports pinning, drag ordering, and archive/unarchive; archived projects move to Settings and lose their pin.
+
+A project's detail is the **prepare → map → dig → confirm → report** workflow: it shows the current phase, elapsed phase timing, scope coverage, live model activity, and the scope being dug. Below it are the scope queue you can prioritize, skip, or resume; findings that stream in as scopes land and change status through refutation; per-finding workflow state; per-finding tracking; real-target outcomes (`reproduced` / `not-reproduced`); and viewable Markdown reports. The primary button is **Run** before the first pipeline run and **Continue** afterward. More actions exposes the individual Prepare, Map, Dig, Verify, Confirm, and Report controls; Verify and Report can target selected findings. **Stop** cooperatively cancels a running job.
+
+The cross-project **Findings** view tracks every finding and its submission state. It supports project, audit-status, and tracking filters. The default **Active findings** filter hides rows marked `ignored`, while the **Ignored** view lets an operator recover machine false positives later by changing their tracking state back to `open`. Settings holds provider profiles, daemon CRUD (mint token, rename, revoke), and archived projects.
 
 Execution is **decoupled** from the dashboard: the `flounder ui` server is a **control plane** (REST API + SQLite + a job queue) and the audit runs on a **daemon**, so the target code and provider keys stay on the daemon's machine. `flounder ui` spawns a co-located daemon by default (rooted at `--workspace`, default `~/.flounder/workspace`) and reuses its local daemon identity across restarts, so projects pinned to the local executor keep claiming queued work. Pass `--no-daemon` and run `flounder daemon start` elsewhere (with a token from `flounder server daemon-token mint`) to execute on a different host. A project's materials are paths **relative to** its directory under the daemon's workspace, so nothing leaks an absolute path. The server binds to `127.0.0.1` by default; the daemon protocol is bearer-token-authenticated.
 
@@ -344,11 +353,12 @@ PROJECT_UUID=$(curl -s localhost:4500/api/projects \
   -d '{"name":"p","providerId":1,"daemonId":1,"dir":"p"}' | jq -r .uuid)
 curl -X POST localhost:4500/api/projects/$PROJECT_UUID/runs -d '{"verb":"run"}'   # enqueue a run for a daemon
 curl localhost:4500/api/projects/$PROJECT_UUID                        # progress, counts, runs, confirm decisions
+curl "localhost:4500/api/projects/$PROJECT_UUID/findings?tracking=active"
 curl "localhost:4500/api/projects/$PROJECT_UUID/findings?status=confirmed-differential"
 curl "localhost:4500/api/projects/$PROJECT_UUID/confirm-decisions?reproduced=yes"  # the confirmed bugs
 ```
 
-Resources: **project** (CRUD, including selected daemon and provider profile; project URLs are UUID-only), **provider** (model strategy profiles), **daemon** (CRUD — mint/rename/revoke), **run** (`POST /api/projects/:uuid/runs` enqueues a job a daemon claims; `GET /api/runs/:id`; `POST /api/runs/:id/stop`; `GET /api/runs/:id/artifact?name=` reads a report file), and read-only **scope** / **finding** / **confirm-decision** (paginated + filterable). Operator actions: `PATCH …/scopes/:id {prioritize:true}` reorders the dig queue; `PATCH /api/findings/:id/tracking` advances a finding's submission state; a confirm `POST …/runs {verb:"confirm"}` reproduces all pending findings (or one, with `findingId`). `GET /api/bugs` powers the cross-project Findings view. `GET /api/stream` is an SSE feed for live updates; `GET /api/runs/:id/log` streams a run's live token-level activity, fed by the executing daemon.
+Resources: **project** (CRUD, including selected daemon, provider profile, task/clue, source/build/corpus paths, archive/pin/manual order; project URLs are UUID-only), **provider** (model strategy profiles), **daemon** (CRUD — mint/rename/revoke), **run** (`POST /api/projects/:uuid/runs` enqueues a job a daemon claims; `verb:"run"` is the automatic prepare-if-needed -> map/dig -> confirm -> report pipeline; `GET /api/runs/:id`; `POST /api/runs/:id/stop`; `GET /api/runs/:id/artifact?name=` reads a report file), and read-only **scope** / **finding** / **confirm-decision** (paginated + filterable). Operator actions: `PATCH …/scopes/:id {prioritize:true}` reorders the dig queue; `PATCH /api/findings/:id/tracking` advances a finding's submission state, including `ignored` for human-dismissed machine findings; a confirm `POST …/runs {verb:"confirm"}` reproduces all pending findings (or selected findings with `findingId`/`findingIds`); a report `POST …/runs {verb:"report", findingIds:[...]}` regenerates selected reports or, without a selection, writes only missing reports. `GET /api/bugs` powers the cross-project Findings view and supports `project=<uuid>`, `status=...`, `tracking=active|ignored|...`, `limit`, and `offset`. `GET /api/stream` is an SSE feed for live updates; `GET /api/runs/:id/log` streams a run's live token-level activity, fed by the executing daemon.
 
 ## Library API
 

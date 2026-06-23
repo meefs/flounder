@@ -1,10 +1,10 @@
 # Reports
 
-Vulnerability reports and incident analyses produced with `flounder`.
+Vulnerability reports and incident investigations produced with `flounder`.
 
 Each report lives in its own directory as a `README.md`. New findings are added here over time.
 
-## Incident analysis
+## Incident Investigation
 
 - [Aztec Connect $2.1M Exploit](./aztec-connect-exploit/README.md)
   — a trusted-but-unbound input (`numRealTransactions`, sitting one byte outside the hashed

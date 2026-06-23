@@ -91,6 +91,7 @@ export async function launchViaApi(server: string, spec: LaunchSpec): Promise<Re
     console.log(`[warning] no executor daemon is connected — the job stays queued until one connects.`);
     console.log(`          start one co-located:  flounder ui    (or a remote: flounder daemon start --server ${server} --token <token>)`);
   }
+  if (spec.pipeline) return await streamPipelineJob(server, jobId);
 
   const runId = await waitForRun(server, jobId);
   if (runId === undefined) return undefined; // job ended before a run started (error/canceled) — already reported
@@ -120,6 +121,29 @@ async function waitForRun(server: string, jobId: number): Promise<number | undef
     if (now - lastNote > 5000) {
       console.log(`[${status}] waiting for a daemon to start the run…`);
       lastNote = now;
+    }
+    await delay(700);
+  }
+}
+
+async function streamPipelineJob(server: string, jobId: number): Promise<Record<string, unknown> | undefined> {
+  const seen = new Set<number>();
+  let lastRun: Record<string, unknown> | undefined;
+  for (;;) {
+    const { job } = (await api(server, "GET", `/api/jobs/${jobId}`)) as { job?: Record<string, unknown> };
+    if (!job) throw new Error(`job #${jobId} not found`);
+    const status = String(job.status);
+    const runId = typeof job.run_id === "number" ? job.run_id : undefined;
+    if (runId !== undefined && !seen.has(runId)) {
+      seen.add(runId);
+      console.log(`[pipeline] phase run #${runId} — live log below (Ctrl-C stops the pipeline):\n`);
+      lastRun = await streamAndAwait(server, runId);
+      continue;
+    }
+    if (status === "done") return { ...(lastRun ?? {}), status: "done", kind: "pipeline", job_id: jobId };
+    if (status === "error" || status === "canceled") {
+      console.error(`[pipeline ${status}] ${job.error ? String(job.error) : "(no detail)"}`);
+      return { ...(lastRun ?? {}), status: status === "canceled" ? "killed" : "error", kind: "pipeline", job_id: jobId };
     }
     await delay(700);
   }

@@ -18,7 +18,7 @@ import { timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { defaultOutputDir } from "../config.js";
-import { MetadataStore, type RunKind, type Coverage, type ProviderInput, type ProviderProfile, type ProjectInput, type ProviderRoles, type RoleOverride } from "../db/store.js";
+import { MetadataStore, type RunKind, type Coverage, type ProviderInput, type ProviderProfile, type ProjectInput, type ProjectListOptions, type ProviderRoles, type RoleOverride } from "../db/store.js";
 import { getProviders, getModels, getSupportedThinkingLevels, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { type LaunchSpec, ActivityBus, type Activity, type ReportFindingSpec } from "./run-manager.js";
 import { THINKING_LEVELS } from "../config.js";
@@ -147,24 +147,31 @@ const ROUTES: Route[] = [
 
   route({
     method: "GET", path: "/api/projects",
-    summary: "List all projects with a live snapshot (scope coverage, finding counts, confirmed-bug count, latest run, active runs).",
+    summary: "List active projects with a live snapshot (scope coverage, finding counts, confirmed-bug count, latest run, active runs). Pass ?archived=1 to list archived projects for Settings.",
+    query: { archived: "boolean? — when true, return archived projects instead of active projects" },
     handler: async (c) => {
       await reconcileAllStaleAuditingScopes(c);
-      sendJson(c.res, 200, { projects: projectSnapshots(c.store) });
+      sendJson(c.res, 200, { projects: projectSnapshots(c.store, { archived: truthyParam(c.url.searchParams.get("archived")) }) });
     },
   }),
   route({
+    method: "PATCH", path: "/api/projects/order",
+    summary: "Persist the visible project rail order after a drag-and-drop reorder. Pinned projects still sort above unpinned projects.",
+    body: { uuids: "string[] — active project UUIDs in desired display order" },
+    handler: projectOrderUpdate,
+  }),
+  route({
     method: "POST", path: "/api/projects",
-    summary: "Create a project (no run starts). A project selects exactly one execution daemon and one default provider profile; optional phaseProviders in config can override prepare/map/dig/confirm. Rejects a duplicate name.",
+    summary: "Create a project (no run starts). A project selects exactly one execution daemon and one default provider profile; config.prepareClue can store the user's target clue/task for later Prepare. Rejects a duplicate name.",
     body: {
       name: "string (required, unique)",
       daemonId: "number (required for normal use) — execution daemon that claims this project's jobs",
       providerId: "number (required for normal use) — default provider profile; phase overrides live in config.phaseProviders",
-      dir: "string? — project directory under the selected daemon workspace; defaults to the display name",
+      dir: "string? — project directory under the selected daemon workspace; defaults to the project UUID",
       sourcePaths: "string[] — code paths relative to dir",
       buildRoot: "string? — buildable root relative to dir",
       corpusPaths: "string[]? — specs/docs relative to dir",
-      config: "object? — { phaseProviders, scopeCoverageMode, maxScopes, mapSteps, digSteps, digSamples, digConcurrency, sandbox... }. Default coverage is cumulative: Standard audits until 30 project scopes are done, not 30 extra scopes per launch.",
+      config: "object? — { prepareClue, projectIntent, phaseProviders, scopeCoverageMode, maxScopes, mapSteps, digSteps, digSamples, digConcurrency, sandbox... }. Default coverage is cumulative: Standard audits until 30 project scopes are done, not 30 extra scopes per launch.",
     },
     handler: projectCreate,
   }),
@@ -176,9 +183,9 @@ const ROUTES: Route[] = [
   }),
   route({
     method: "PATCH", path: "/api/projects/:uuid",
-    summary: "Update a project's daemon, provider, project-relative materials, and/or config (no run starts). Used by Continue/Restart/Run afterwards.",
+    summary: "Update a project's daemon, provider, project-relative materials, config, or display state (archive, pin, manual order). No run starts.",
     params: { uuid: "project UUID" },
-    body: { daemonId: "number?", providerId: "number?", dir: "string?", sourcePaths: "string[]?", buildRoot: "string?", corpusPaths: "string[]?", config: "object?" },
+    body: { daemonId: "number?", providerId: "number?", dir: "string?", sourcePaths: "string[]?", buildRoot: "string?", corpusPaths: "string[]?", config: "object?", archived: "boolean?", pinned: "boolean?", sortOrder: "number|null?" },
     handler: projectUpdate,
   }),
   route({
@@ -196,10 +203,10 @@ const ROUTES: Route[] = [
   }),
   route({
     method: "POST", path: "/api/projects/:uuid/runs",
-    summary: "Queue a run on the project (start/continue an audit, restart, map, audit a region/scope, confirm, report, or prepare). The job is dispatched to a connected daemon, which executes it and reports back. Uses the project's stored materials + config unless overridden. This is the single action behind the UI's Start/Continue/Restart/Run buttons.",
+    summary: "Queue project work (Run/Continue pipeline, map, audit a region/scope, verify, confirm, report, or prepare). The job is dispatched to a connected daemon, which executes it and reports back. Uses the project's stored materials + config unless overridden. This is the single action behind the UI's primary and More actions controls.",
     params: { uuid: "project UUID" },
     body: {
-      verb: "'run' | 'map' | 'audit' | 'confirm' | 'report' | 'prepare' (default 'run'; run = map→dig, resumes)",
+      verb: "'run' | 'map' | 'audit' | 'confirm' | 'report' | 'prepare' (default 'run'; project run = prepare-if-needed→map/dig→confirm→report; source run = map→dig)",
       remap: "boolean? — re-enumerate scopes (restart)", fresh: "boolean? — confirm: ignore a prior interrupted confirm",
       quick: "boolean? — run: single breadth pass", mockLlm: "boolean? — offline mock model",
       region: "string? — audit: pinned region e.g. src/Foo.sol:120-180", scope: "string? — audit: scope id(s)", verifyFindings: "object|array? — audit: inline suspected finding(s) to confirm-or-refute by execution; project finding rows with id are linked back to that original row",
@@ -208,7 +215,7 @@ const ROUTES: Route[] = [
       maxScopes: "number? — one-off scope cap for this run, or the custom target when scopeCoverageMode=custom", mapSteps: "number? — one-off map turn cap", digSteps: "number? — one-off per-scope dig turn cap",
       maxSteps: "number? — one-off global turn cap", digSamples: "number? — one-off samples per scope", digConcurrency: "number? — one-off parallel scopes",
       findingId: "number? — confirm/report: reproduce or report one selected finding",
-      findingIds: "number[]? — confirm/report: reproduce selected pending audit-confirmed findings, or generate formal reports for selected reproduced findings",
+      findingIds: "number[]? — confirm/report: reproduce selected pending audit-confirmed findings, or generate/regenerate formal reports for selected reproduced findings. Report without selection only generates missing reports.",
       inputRunDir: "string? — confirm: the finished run dir to reproduce",
       clue: "string? — prepare: the tx / address / project / link to acquire from",
       posture: "string? — prepare: 'blind' | 'informed'", matchDeployed: "boolean? — prepare: prove staged source matches the live deployment (default true)", endpoint: "string? — prepare: read-only access hint (e.g. RPC URL)",
@@ -234,7 +241,7 @@ const ROUTES: Route[] = [
     method: "GET", path: "/api/projects/:uuid/findings",
     summary: "List current-material findings, paginated + filterable, each with its status timeline (suspect→confirm→refute). Pass ?includeStale=true to inspect findings from older prepared material snapshots.",
     params: { uuid: "project UUID" },
-    query: { status: "string? — exact status or execution-confirmed alias", q: "string? — text search (title/location)", includeStale: "boolean? — include findings from older prepared material snapshots", limit: "number? (default 50)", offset: "number? (default 0)" },
+    query: { status: "string? — exact status or execution-confirmed alias", tracking: "string? — tracking state or active to hide ignored findings", q: "string? — text search (title/location)", includeStale: "boolean? — include findings from older prepared material snapshots", limit: "number? (default 50)", offset: "number? (default 0)" },
     handler: findingsList,
   }),
   route({
@@ -321,25 +328,28 @@ const ROUTES: Route[] = [
 
   route({
     method: "GET", path: "/api/bugs",
-    summary: "Every finding across ALL projects (joined with project name) plus global aggregate stats — the cross-project Bugs dashboard. Optional ?status= (exact or execution-confirmed) and ?tracking= filters; ?limit/&offset paginate.",
-    query: { status: "string? — exact status or execution-confirmed alias", tracking: "string? — tracking state", limit: "number? (default 200)", offset: "number? (default 0)" },
+    summary: "Every finding across ALL projects (joined with project name) plus aggregate stats — the cross-project Bugs dashboard. Optional ?project=uuid, ?status= (exact or execution-confirmed), and ?tracking= filters; ?tracking=active hides ignored findings; ?limit/&offset paginate.",
+    query: { project: "string? — project uuid to scope findings and stats", status: "string? — exact status or execution-confirmed alias", tracking: "string? — tracking state, or active to hide ignored findings", limit: "number? (default 200)", offset: "number? (default 0)" },
     handler: (c) => {
+      const projectUuid = c.url.searchParams.get("project") || c.url.searchParams.get("projectUuid") || undefined;
       const status = c.url.searchParams.get("status") || undefined;
       const exactStatus = status === "execution-confirmed" ? undefined : status;
       const tracking = c.url.searchParams.get("tracking") || undefined;
+      const exactTracking = tracking === "active" ? undefined : tracking;
       const limit = clampInt(c.url.searchParams.get("limit"), 200, 1, 500);
       const offset = clampInt(c.url.searchParams.get("offset"), 0, 0, 1_000_000);
-      const statsRows = reportableFindings(c.store.listGlobalFindings({ limit: 10_000, offset: 0 }));
-      const all = reportableFindings(c.store.listGlobalFindings({ status: exactStatus, tracking, limit: 10_000, offset: 0 }))
-        .filter((finding) => findingStatusMatches(finding, status));
+      const statsRows = reportableFindings(c.store.listGlobalFindings({ projectUuid, limit: 10_000, offset: 0 }));
+      const all = reportableFindings(c.store.listGlobalFindings({ projectUuid, status: exactStatus, tracking: exactTracking, limit: 10_000, offset: 0 }))
+        .filter((finding) => findingStatusMatches(finding, status))
+        .filter((finding) => findingTrackingMatches(finding, tracking));
       sendJson(c.res, 200, { findings: all.slice(offset, offset + limit).map(findingSummaryRow), total: all.length, limit, offset, stats: globalFindingStats(statsRows) });
     },
   }),
   route({
     method: "PATCH", path: "/api/findings/:id/tracking",
-    summary: "Set a finding's submission-tracking state (open|triaging|submitted|accepted|fixed|duplicate|rejected) — for following a bug from discovery to vendor disclosure.",
+    summary: "Set a finding's submission-tracking state (open|triaging|submitted|accepted|fixed|duplicate|rejected|ignored) — for following a bug from discovery to vendor disclosure.",
     params: { id: "finding id" },
-    body: { status: "open|triaging|submitted|accepted|fixed|duplicate|rejected" },
+    body: { status: "open|triaging|submitted|accepted|fixed|duplicate|rejected|ignored" },
     handler: findingTracking,
   }),
 
@@ -352,7 +362,7 @@ const ROUTES: Route[] = [
       provider: "string?", model: "string?", thinking: "string?",
       scopeCoverageMode: "focused|standard|half|full|custom? — standard/focused are cumulative project targets, not per-run additions", maxScopes: "number?", mapSteps: "number?", digSteps: "number?", maxSteps: "number?", digSamples: "number?", digConcurrency: "number?",
       sandboxBackend: "'auto'|'oci'|'host'?", sandboxImage: "string?", sandboxAllowHostFallback: "boolean?", sandboxPrepareNetwork: "'none'|'enabled'?", sandboxConfirmNetwork: "'none'|'enabled'?",
-      remap: "boolean?", quick: "boolean?", mockLlm: "boolean?", region: "string?", scope: "string?", scopeNote: "string? — map/audit: 'authorized scope note' that focuses map on the in-scope target (the pipeline auto-derives it from prepare's manifest)", verifyFindings: "object|array? — audit: inline suspected finding(s) to confirm-or-refute by execution",
+      remap: "boolean?", quick: "boolean?", mockLlm: "boolean?", pipeline: "boolean? — run clue pipeline: prepare if needed -> map/dig -> confirm -> report", region: "string?", scope: "string?", scopeNote: "string? — map/audit: 'authorized scope note' that focuses map on the in-scope target (the pipeline auto-derives it from prepare's manifest)", verifyFindings: "object|array? — audit: inline suspected finding(s) to confirm-or-refute by execution",
       inputRunDir: "string? — confirm", fresh: "boolean? — confirm",
       clue: "string? — prepare", posture: "string? — prepare", matchDeployed: "boolean? — prepare", endpoint: "string? — prepare",
     },
@@ -360,7 +370,7 @@ const ROUTES: Route[] = [
   }),
   route({
     method: "GET", path: "/api/jobs/:id",
-    summary: "A queued/dispatched/running job (status, run_id once a daemon starts it, error). Poll after POST /api/launch to follow a CLI-launched run to its run id, then stream GET /api/runs/:id/log.",
+    summary: "A queued/dispatched/running job (status, run_id for the current active phase once a daemon starts it, error). Poll after POST /api/launch to follow a CLI-launched run.",
     params: { id: "job id" },
     handler: (c) => { const job = c.store.getJob(Number(c.params.id)); job ? sendJson(c.res, 200, { job }) : sendJson(c.res, 404, { error: "no such job" }); },
   }),
@@ -429,6 +439,7 @@ const ROUTES: Route[] = [
   route({ method: "POST", path: "/api/daemon/runs", summary: "(daemon) Start a run row for a claimed job; links job→run.", hidden: true, handler: daemonRunStart }),
   route({ method: "PATCH", path: "/api/daemon/runs/:id", summary: "(daemon) Report run progress: scopes / findings / confirm-decisions / finish.", hidden: true, handler: daemonRunUpdate }),
   route({ method: "POST", path: "/api/daemon/runs/:id/activity", summary: "(daemon) Push a batch of token-level activity events for the live log.", hidden: true, handler: daemonRunActivity }),
+  route({ method: "POST", path: "/api/daemon/pipeline-worklist", summary: "(daemon) Resolve confirm/report work for an in-process pipeline job.", hidden: true, handler: daemonPipelineWorklist }),
   route({ method: "POST", path: "/api/daemon/jobs/:id/status", summary: "(daemon) Report a job's terminal status (done/error/canceled).", hidden: true, handler: daemonJobStatus }),
 ];
 
@@ -466,7 +477,7 @@ export function startUiServer(options: UiServerOptions = {}): ReturnType<typeof 
   // Seed a couple of starter profiles so a fresh install has something to select (no-op if any exist).
   store.seedProviders([
     { name: "openai-codex · gpt-5.5 · xhigh", provider: "openai-codex", model: "gpt-5.5", thinking: "xhigh" },
-    { name: "claude-code · opus · high", provider: "claude-code", model: "opus", thinking: "high" },
+    { name: "claude-code · opus 4.8 max", provider: "claude-code", model: "claude-opus-4-8", thinking: "xhigh" },
   ]);
   const artifactReconciled = reconcileSuccessfulArtifactRuns(store);
   if (artifactReconciled > 0) console.log(`[flounder ui] reconciled ${artifactReconciled} completed run artifact${artifactReconciled === 1 ? "" : "s"}`);
@@ -659,7 +670,7 @@ async function withProjectAsync(c: Ctx, fn: (projectId: number, project: Record<
 }
 
 async function reconcileAllStaleAuditingScopes(c: Ctx): Promise<void> {
-  for (const project of c.store.listProjects()) await reconcileStaleAuditingScopes(c, project);
+  for (const project of c.store.listProjects({ archived: "all" })) await reconcileStaleAuditingScopes(c, project);
 }
 
 async function reconcileStaleAuditingScopes(c: Ctx, project: Record<string, unknown>): Promise<void> {
@@ -692,6 +703,9 @@ interface ProjectBody {
   providerId?: number | null;
   daemonId?: number | null;
   dir?: string;
+  archived?: boolean;
+  pinned?: boolean;
+  sortOrder?: number | null;
 }
 function projectFields(body: ProjectBody): Omit<ProjectInput, "name"> {
   return {
@@ -733,8 +747,9 @@ async function projectGet(c: Ctx): Promise<void> {
     const allFindings = activePrepareRefresh
       ? []
       : reportableFindings(c.store.listFindings(id).filter((row) => rowBelongsToCurrentMaterial(row, currentRunIds, materialBoundary)));
+    const activeFindings = allFindings.filter((finding) => !isIgnoredFinding(finding));
     const findingSummaries = allFindings.map(findingSummaryRow);
-    const auditConfirmedFindings = countAuditConfirmedFindings(allFindings);
+    const auditConfirmedFindings = countAuditConfirmedFindings(activeFindings);
     const confirmDecisions = activePrepareRefresh
       ? []
       : c.store.listConfirmDecisions(id).filter((row) => rowBelongsToCurrentMaterial(row, currentRunIds, materialBoundary));
@@ -742,8 +757,8 @@ async function projectGet(c: Ctx): Promise<void> {
     sendJson(c.res, 200, {
       project,
       progress,
-      statusCounts: findingCounts(allFindings),
-      findingsTotal: allFindings.length,
+      statusCounts: findingCounts(activeFindings),
+      findingsTotal: activeFindings.length,
       auditConfirmedFindings,
       reproducedBugs,
       confirmedBugs: reproducedBugs,
@@ -1646,6 +1661,9 @@ async function projectUpdate(c: Ctx): Promise<void> {
     daemonId: fields.daemonId ?? (typeof project.daemon_id === "number" ? project.daemon_id : undefined),
     dir: fields.dir ?? (typeof project.dir === "string" ? project.dir : undefined),
   });
+  if (typeof body.archived === "boolean") c.store.setProjectArchived(uuid, body.archived);
+  if (typeof body.pinned === "boolean") c.store.setProjectPinned(uuid, body.pinned);
+  if (body.sortOrder === null || typeof body.sortOrder === "number") c.store.setProjectSortOrder(uuid, body.sortOrder);
   sendJson(c.res, 200, { ok: true });
 }
 
@@ -1653,6 +1671,15 @@ function projectDelete(c: Ctx): void {
   const uuid = c.params.uuid ?? "";
   const removed = c.store.deleteProject(uuid);
   removed ? sendJson(c.res, 200, { ok: true, deleted: uuid }) : sendJson(c.res, 404, { error: `no project with uuid ${uuid}` });
+}
+
+async function projectOrderUpdate(c: Ctx): Promise<void> {
+  const body = (await readBody(c.req)) as { uuids?: unknown };
+  if (!Array.isArray(body.uuids)) return sendJson(c.res, 400, { error: "uuids must be an array" });
+  const uuids = uniqueStrings(body.uuids.filter((entry): entry is string => typeof entry === "string").map((entry) => entry.trim()));
+  if (uuids.length === 0) return sendJson(c.res, 400, { error: "uuids must include at least one project uuid" });
+  const changed = c.store.reorderProjects(uuids);
+  sendJson(c.res, 200, { ok: true, changed });
 }
 
 async function scopeSetStatus(c: Ctx): Promise<void> {
@@ -1709,12 +1736,25 @@ async function runLaunch(c: Ctx): Promise<void> {
   const scopeView = currentScopeView(c.store, projectId, currentRuns, undefined, scopeBoundary, !materialBoundary);
   const progress = scopeView.hasInventory ? scopeView.progress : emptyProgress();
   const spec = launchSpec(project, body, c.out, profile, progress, phaseProfiles);
-  if (spec.verb === "prepare") applyProjectPrepareDefaults(spec, project, runs);
+  if (spec.verb === "run") {
+    applyProjectPrepareDefaults(spec, project, runs);
+    spec.pipeline = true;
+    const prepared = latestPreparedWorkspace(runs);
+    if (prepared) {
+      spec.dir = undefined;
+      spec.sourcePaths = [prepared.workspaceDir];
+      spec.buildRoot = prepared.workspaceDir;
+      spec.clue = undefined;
+      if (!spec.scopeNote && prepared.scopeNote) spec.scopeNote = prepared.scopeNote;
+    }
+  } else if (spec.verb === "prepare") {
+    applyProjectPrepareDefaults(spec, project, runs);
+  }
   const prepared = applyPreparedWorkspaceIfNeeded(spec, runs);
   if (!prepared.ok) return sendJson(c.res, 400, { error: prepared.error });
   const materialDrift = verifyMaterialDrift(c.store, projectId, spec.verifyFindings, body.allowMaterialDrift === true);
   if (materialDrift) return sendJson(c.res, 409, materialDrift);
-  if (coverageTargetReached(spec)) {
+  if (coverageTargetReached(spec) && !(spec.verb === "run" && spec.pipeline)) {
     const target = spec.coverageTarget;
     const denominator = target ? Math.min(target, progress.total || target) : progress.total;
     const nextAction = spec.coverageMode === "full" ? "Select specific scopes to re-audit." : "Choose Full, Custom, or select specific scopes to continue.";
@@ -1776,16 +1816,17 @@ async function runLaunch(c: Ctx): Promise<void> {
       daemonOnline: false,
     });
   }
-  if (spec.verb === "prepare" || (isScopeInventoryVerb(spec.verb) && !scopeView.hasInventory)) await resetCurrentScopeProjection(c, project);
+  if (spec.verb === "prepare" || (spec.verb === "run" && spec.pipeline && spec.clue) || (isScopeInventoryVerb(spec.verb) && !scopeView.hasInventory)) await resetCurrentScopeProjection(c, project);
   const jobId = c.store.enqueueJob(spec.target, spec, daemonId);
   c.plane.nudge();
   sendJson(c.res, 200, { jobId, verb: spec.verb, queued: true, daemons: c.plane.daemonCount(daemonId), daemonId });
 }
 
 function applyProjectPrepareDefaults(spec: LaunchSpec, project: Record<string, unknown>, runs: Array<Record<string, unknown>>): void {
+  const cfg = (safeParse(project.config_json) as Record<string, unknown>) ?? {};
   const previousPrepare = latestPrepareSummary(runs);
   if (!spec.clue) {
-    spec.clue = stringValue(previousPrepare?.clue) || stringValue(project.dir) || stringValue(project.name);
+    spec.clue = stringValue(cfg.prepareClue) || stringValue(cfg.projectIntent) || stringValue(previousPrepare?.clue) || stringValue(project.name) || stringValue(project.dir);
   }
   if (!spec.posture) {
     spec.posture = stringValue(previousPrepare?.posture) || "blind";
@@ -1883,6 +1924,8 @@ function reportWorklist(
   const selected = selectedIds.length ? new Set(selectedIds) : undefined;
   const rows = reportableFindings(store.listFindings(projectId)).filter((row) => {
     if (selected && !selected.has(Number(row.id))) return false;
+    if (isIgnoredFinding(row)) return false;
+    if (!selected && rowHasFormalReport(row)) return false;
     if (!rowBelongsToCurrentMaterial(row, currentRunIds ?? new Set(), materialBoundary)) return false;
     if (!requiresRealTargetConfirmation) return isExecutionConfirmedFindingStatus(String(row.status ?? "").toLowerCase());
     if (String(row.confirm_status ?? "") !== "reproduced") return false;
@@ -1898,7 +1941,7 @@ function reportWorklist(
     return { error: `finding ${missing.join(", ")} ${reason}` };
   }
   if (rows.length === 0) {
-    return { error: requiresRealTargetConfirmation ? "no reproduced real-target findings are ready for formal reports" : "no locally execution-confirmed source-only findings are ready for formal reports" };
+    return { error: requiresRealTargetConfirmation ? "no reproduced real-target findings are missing formal reports" : "no locally execution-confirmed source-only findings are missing formal reports" };
   }
   return {
     findings: rows.map((row) => ({
@@ -1932,6 +1975,7 @@ function latestPrepareRequiresRealTargetConfirmation(runs: Array<Record<string, 
 
 function applyPreparedWorkspaceIfNeeded(spec: LaunchSpec, runs: Array<Record<string, unknown>>): { ok: true } | { ok: false; error: string } {
   if (spec.verb === "prepare") return { ok: true };
+  if (spec.verb === "run" && spec.pipeline) return { ok: true };
   if (spec.sourcePaths.length > 0) return { ok: true };
   const prepared = latestPreparedWorkspace(runs);
   if (!prepared) {
@@ -2027,6 +2071,7 @@ function normalizeLaunchSpec(body: Record<string, unknown>, target: string, verb
     fresh: bool(body.fresh),
     quick: bool(body.quick),
     mockLlm: bool(body.mockLlm),
+    pipeline: bool(body.pipeline),
     region: str(body.region),
     scope: str(body.scope),
     scopeNote: str(body.scopeNote),
@@ -2052,6 +2097,7 @@ function launchDisplayConfig(spec: LaunchSpec): Record<string, unknown> {
 function findingsList(c: Ctx): void {
   withProject(c, (id, project) => {
     const status = c.url.searchParams.get("status") ?? undefined;
+    const tracking = c.url.searchParams.get("tracking") ?? undefined;
     const search = c.url.searchParams.get("q") ?? undefined;
     const includeStale = c.url.searchParams.get("includeStale") === "true";
     const limit = clampInt(c.url.searchParams.get("limit"), 50, 1, 500);
@@ -2066,6 +2112,7 @@ function findingsList(c: Ctx): void {
       .filter((finding) => includeStale || (!activePrepareRefresh && rowBelongsToCurrentMaterial(finding, currentResultRunIds, materialBoundary))))
       .map((finding) => annotateFindingMaterialStaleness(finding, currentResultRunIds, materialBoundary, activePrepareRefresh))
       .filter((finding) => findingStatusMatches(finding, status))
+      .filter((finding) => findingTrackingMatches(finding, tracking))
       .filter((finding) => !search || `${finding.title ?? ""} ${finding.location ?? ""}`.toLowerCase().includes(search.toLowerCase()))
       .sort((a, b) => findingSeverityScore(b) - findingSeverityScore(a) || String(b.updated_at ?? "").localeCompare(String(a.updated_at ?? "")));
     const findings = rows.slice(offset, offset + limit).map((finding) => findingDetailRow({ ...finding, timeline: c.store.findingTimeline(Number(finding.id)) }));
@@ -2119,18 +2166,21 @@ function findingSummaryRow(row: Record<string, unknown>): Record<string, unknown
   ]) {
     if (key in row) out[key] = row[key];
   }
-  const reportMarkdown = stringValue(row.report_markdown).trimStart();
-  out.has_report = Boolean(reportMarkdown && !reportMarkdown.startsWith("# Security disclosure:"));
+  out.has_report = rowHasFormalReport(row);
   return findingDisplayRow(out);
 }
 
 function findingDetailRow(row: Record<string, unknown>): Record<string, unknown> {
   const out = { ...row };
   delete out.report_path;
-  const reportMarkdown = stringValue(out.report_markdown).trimStart();
   delete out.report_markdown;
-  out.has_report = Boolean(reportMarkdown && !reportMarkdown.startsWith("# Security disclosure:"));
+  out.has_report = rowHasFormalReport(row);
   return findingDisplayRow(out);
+}
+
+function rowHasFormalReport(row: Record<string, unknown>): boolean {
+  const reportMarkdown = stringValue(row.report_markdown).trimStart();
+  return Boolean(reportMarkdown && !reportMarkdown.startsWith("# Security disclosure:"));
 }
 
 function findingDisplayRow(row: Record<string, unknown>): Record<string, unknown> {
@@ -2229,6 +2279,17 @@ function findingStatusMatches(row: Record<string, unknown>, status?: string): bo
   const rowStatus = String(row.status ?? "").toLowerCase();
   if (status === "execution-confirmed") return rowStatus === "confirmed-executable" || rowStatus === "confirmed-differential";
   return rowStatus === status;
+}
+
+function findingTrackingMatches(row: Record<string, unknown>, tracking?: string): boolean {
+  if (!tracking) return true;
+  const rowTracking = String(row.tracking_status ?? "open") || "open";
+  if (tracking === "active") return rowTracking !== "ignored";
+  return rowTracking === tracking;
+}
+
+function isIgnoredFinding(row: Record<string, unknown>): boolean {
+  return String(row.tracking_status ?? "open") === "ignored";
 }
 
 const FINDING_STATUS_RANK: Record<string, number> = {
@@ -2356,14 +2417,14 @@ function findingCounts(rows: Array<Record<string, unknown>>): Record<string, num
   return counts;
 }
 
-function globalFindingStats(rows: Array<Record<string, unknown>>): { total: number; byStatus: Record<string, number>; byTracking: Record<string, number> } {
+function globalFindingStats(rows: Array<Record<string, unknown>>): { total: number; active: number; byStatus: Record<string, number>; byTracking: Record<string, number> } {
   const byStatus = findingCounts(rows);
   const byTracking: Record<string, number> = {};
   for (const row of rows) {
     const tracking = String(row.tracking_status ?? "open") || "open";
     byTracking[tracking] = (byTracking[tracking] ?? 0) + 1;
   }
-  return { total: rows.length, byStatus, byTracking };
+  return { total: rows.length, active: rows.filter((row) => !isIgnoredFinding(row)).length, byStatus, byTracking };
 }
 
 function confirmDecisionsList(c: Ctx): void {
@@ -2485,7 +2546,7 @@ async function daemonRename(c: Ctx): Promise<void> {
   ok ? sendJson(c.res, 200, { ok: true }) : sendJson(c.res, 404, { error: "no such daemon" });
 }
 
-const TRACKING_STATES = new Set(["open", "triaging", "submitted", "accepted", "fixed", "duplicate", "rejected"]);
+const TRACKING_STATES = new Set(["open", "triaging", "submitted", "accepted", "fixed", "duplicate", "rejected", "ignored"]);
 async function findingTracking(c: Ctx): Promise<void> {
   const body = (await readBody(c.req)) as Record<string, unknown>;
   const status = typeof body.status === "string" ? body.status : "";
@@ -2723,15 +2784,18 @@ function daemonClaim(c: Ctx): void {
 async function daemonRunStart(c: Ctx): Promise<void> {
   const daemon = daemonAuth(c);
   if (!daemon) return;
-  const body = (await readBody(c.req)) as { jobId?: number; project?: string; kind?: RunKind; runDir?: string; provider?: string; model?: string; thinking?: string; budgets?: unknown };
+  const body = (await readBody(c.req)) as { jobId?: number; project?: string; kind?: RunKind; runDir?: string; provider?: string; model?: string; thinking?: string; budgets?: unknown; additional?: boolean };
   const name = (body.project ?? "").trim();
   if (!name || !body.runDir) return sendJson(c.res, 400, { error: "project and runDir are required" });
   if (typeof body.jobId !== "number" || !Number.isFinite(body.jobId)) return sendJson(c.res, 400, { error: "jobId is required" });
   const job = c.store.getJob(body.jobId);
   if (!job) return sendJson(c.res, 404, { error: "no such job" });
   if (job.daemon_id != null && Number(job.daemon_id) !== Number(daemon.id)) return sendJson(c.res, 403, { error: "job is assigned to another daemon" });
-  if (job.run_id != null) return sendJson(c.res, 200, { runId: Number(job.run_id), existing: true });
-  if (job.status !== "dispatched") return sendJson(c.res, 409, { error: "job must be claimed before starting a run" });
+  const additional = body.additional === true;
+  if (job.run_id != null && !additional) return sendJson(c.res, 200, { runId: Number(job.run_id), existing: true });
+  if ((!additional && job.status !== "dispatched") || (additional && job.status !== "running")) {
+    return sendJson(c.res, 409, { error: additional ? "pipeline phase can only be appended to a running job" : "job must be claimed before starting a run" });
+  }
   const existing = c.store.getProject(name);
   const projectId = existing ? Number(existing.id) : c.store.upsertProject({ name, config: body.budgets });
   const runId = c.store.startRun({
@@ -2743,7 +2807,7 @@ async function daemonRunStart(c: Ctx): Promise<void> {
     thinking: body.thinking,
     budgets: body.budgets,
   });
-  c.store.setJobRun(body.jobId, runId); // link job → run (so stop can find it)
+  c.store.setJobRun(body.jobId, runId); // link job → current run (so stop can find the active phase)
   sendJson(c.res, 200, { runId });
 }
 
@@ -2797,6 +2861,50 @@ async function daemonRunActivity(c: Ctx): Promise<void> {
   const bus = c.plane.bus(runId);
   for (const ev of body.events ?? []) bus.push(ev);
   sendJson(c.res, 200, { ok: true });
+}
+
+async function daemonPipelineWorklist(c: Ctx): Promise<void> {
+  const daemon = daemonAuth(c);
+  if (!daemon) return;
+  const body = (await readBody(c.req)) as { project?: string; phase?: string };
+  const projectName = typeof body.project === "string" ? body.project.trim() : "";
+  if (!projectName) return sendJson(c.res, 400, { error: "project is required" });
+  const phase = body.phase === "confirm" || body.phase === "report" ? body.phase : "";
+  if (!phase) return sendJson(c.res, 400, { error: "phase must be confirm or report" });
+  const project = c.store.getProject(projectName);
+  if (!project) return sendJson(c.res, 404, { error: `no project named ${projectName}` });
+
+  const projectId = Number(project.id);
+  const allRuns = c.store.listRuns(projectId);
+  const materialBoundary = latestPrepareRun(allRuns);
+  const currentRuns = currentMaterialRuns(allRuns, materialBoundary);
+  const scopeBoundary = latestScopeInventoryBoundaryRun(currentRuns);
+  const currentResultRunIds = runIdSet(currentResultRuns(currentRuns, scopeBoundary));
+  const requiresRealTargetConfirmation = latestPrepareRequiresRealTargetConfirmation(allRuns);
+
+  if (phase === "confirm") {
+    if (!requiresRealTargetConfirmation) {
+      return sendJson(c.res, 200, { phase, requiresRealTargetConfirmation, inputRunDirs: [], confirmKeys: [] });
+    }
+    const pending = c.store.pendingConfirmable(projectId)
+      .filter((row) => row.run_dir)
+      .filter((row) => rowBelongsToCurrentMaterial(row as unknown as Record<string, unknown>, currentResultRunIds, materialBoundary));
+    return sendJson(c.res, 200, {
+      phase,
+      requiresRealTargetConfirmation,
+      inputRunDirs: [...new Set(pending.map((row) => String(row.run_dir)))],
+      inputRunDir: pending[0]?.run_dir ? String(pending[0].run_dir) : undefined,
+      confirmKeys: pending.map((row) => row.finding_key),
+    });
+  }
+
+  const reports = reportWorklist(c.store, projectId, [], currentResultRunIds, materialBoundary, requiresRealTargetConfirmation);
+  sendJson(c.res, 200, {
+    phase,
+    requiresRealTargetConfirmation,
+    reportFindings: reports.findings ?? [],
+    ...(reports.error ? { skipReason: reports.error } : {}),
+  });
 }
 
 async function daemonJobStatus(c: Ctx): Promise<void> {
@@ -2923,10 +3031,10 @@ function summarizeDaemonCapabilities(capabilities: unknown): Record<string, unkn
   };
 }
 
-function projectSnapshots(store: MetadataStore): Array<Record<string, unknown>> {
+function projectSnapshots(store: MetadataStore, options: ProjectListOptions = {}): Array<Record<string, unknown>> {
   const activeByTarget = new Map<string, number>();
   for (const job of store.runningJobs()) activeByTarget.set(String(job.project), (activeByTarget.get(String(job.project)) ?? 0) + 1);
-  return store.listProjects().map((project) => {
+  return store.listProjects(options).map((project) => {
     const id = Number(project.id);
     const allRuns = store.listRuns(id);
     const materialBoundary = latestPrepareRun(allRuns);
@@ -2937,9 +3045,10 @@ function projectSnapshots(store: MetadataStore): Array<Record<string, unknown>> 
     const currentResultRows = currentResultRuns(currentRuns, scopeBoundary);
     const currentRunIds = runIdSet(currentResultRows);
     const scopeView = currentScopeView(store, id, currentRuns, activePrepareRefresh, scopeBoundary, !materialBoundary);
-    const findings = activePrepareRefresh
+    const allFindings = activePrepareRefresh
       ? []
       : reportableFindings(store.listFindings(id).filter((row) => rowBelongsToCurrentMaterial(row, currentRunIds, materialBoundary)));
+    const findings = allFindings.filter((finding) => !isIgnoredFinding(finding));
     const counts = findingCounts(findings);
     const confirmDecisions = activePrepareRefresh
       ? []
@@ -2960,6 +3069,11 @@ function projectSnapshots(store: MetadataStore): Array<Record<string, unknown>> 
       provider_id: project.provider_id ?? null,
       daemon_id: project.daemon_id ?? null,
       dir: project.dir ?? null,
+      archived_at: project.archived_at ?? null,
+      pinned_at: project.pinned_at ?? null,
+      sort_order: project.sort_order ?? null,
+      created_at: project.created_at ?? null,
+      updated_at: project.updated_at ?? null,
       config: safeParse(project.config_json),
       progress: scopeView.progress,
       findingCounts: counts,
@@ -3034,7 +3148,7 @@ function launchSpec(project: Record<string, unknown>, body: Record<string, unkno
   // top-level model/thinking; an audit run (run/audit/map) additionally maps map/dig into
   // roles (refute follows dig). Legacy projects with profile-baked model/thinking/roles still
   // resolve via the profile fallback. Materials are RELATIVE to the project dir (resolved on
-  // the daemon against its workspace); dir defaults to the name.
+  // the daemon against its workspace); new projects default dir to their UUID.
   const verb = (typeof body.verb === "string" ? body.verb : "run") as RunKind;
   const phases = (merged.phases && typeof merged.phases === "object" ? merged.phases : {}) as Record<string, { model?: unknown; thinking?: unknown }>;
   const primaryPhase = verb === "prepare" ? "prepare" : verb === "map" ? "map" : verb === "confirm" || verb === "report" ? "confirm" : "dig";
@@ -3089,6 +3203,7 @@ function launchSpec(project: Record<string, unknown>, body: Record<string, unkno
     fresh: Boolean(body.fresh),
     quick: Boolean(body.quick),
     mockLlm: Boolean(body.mockLlm),
+    pipeline: Boolean(body.pipeline),
     region: str(body.region),
     scope: str(body.scope),
     scopeNote: str(merged.scopeNote), // a project may store a default focus note in its config
@@ -3222,4 +3337,8 @@ function clampInt(raw: string | null, fallback: number, min: number, max: number
   const n = raw === null ? NaN : Number(raw);
   if (!Number.isFinite(n)) return fallback;
   return Math.min(max, Math.max(min, Math.floor(n)));
+}
+
+function truthyParam(raw: string | null): boolean {
+  return raw === "1" || raw === "true" || raw === "yes";
 }

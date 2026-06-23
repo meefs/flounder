@@ -1,7 +1,7 @@
 import type { ConfirmDecision, Coverage, FindingRow, PhaseConfig, ProjectDetail, RunRow, ScopeRow } from "./api";
 
 export const STATUSES = ["confirmed-differential", "confirmed-executable", "confirmed-source", "suspected", "discharged", "refuted"] as const;
-export const TRACKING = ["open", "triaging", "submitted", "accepted", "fixed", "duplicate", "rejected"] as const;
+export const TRACKING = ["open", "triaging", "submitted", "accepted", "fixed", "duplicate", "rejected", "ignored"] as const;
 export const PROVIDER_PHASES = ["prepare", "map", "dig", "confirm"] as const;
 export const PHASES = ["prepare", "map", "dig", "synthesis", "verify", "confirm", "report"] as const;
 export type ProviderPhase = (typeof PROVIDER_PHASES)[number];
@@ -117,6 +117,8 @@ export function projectConfig(detail: ProjectDetail | null): { cfg: ProjectConfi
 }
 
 export interface ProjectConfigShape {
+  projectIntent?: string;
+  prepareClue?: string;
   scopeCoverageMode?: "focused" | "standard" | "half" | "full" | "custom";
   maxScopes?: number;
   mapSteps?: number;
