@@ -878,7 +878,12 @@ function rowBelongsToCurrentMaterial(row: Record<string, unknown>, currentRunIds
 }
 
 function isScopeInventoryRun(run: Record<string, unknown>): boolean {
-  return ["run", "map", "audit"].includes(stringValue(run.kind));
+  const kind = stringValue(run.kind);
+  if (kind === "audit") {
+    const budgets = safeParse(run.budgets_json) as { verify?: unknown } | null;
+    if (budgets?.verify === true) return false;
+  }
+  return ["run", "map", "audit"].includes(kind);
 }
 
 function currentScopeView(

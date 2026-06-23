@@ -906,6 +906,39 @@ test("api: one-off maxScopes overrides the project's saved coverage mode", async
   });
 });
 
+test("api: verify runs do not hide the latest scope inventory checkpoint", async () => {
+  await withServer(async (base, out) => {
+    const created = await (await fetch(base + "/api/projects", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "verify-scope-view", sourcePaths: ["./src"] }),
+    })).json();
+
+    const inventoryRunDir = path.join(out, "verify-scope-view-map");
+    await mkdir(inventoryRunDir, { recursive: true });
+    await writeFile(path.join(inventoryRunDir, "scopes.json"), JSON.stringify([
+      { id: "S1", obligation: "first scope", region: "src/a.ts:1", status: "audited", score: 9 },
+      { id: "S2", obligation: "second scope", region: "src/b.ts:1", status: "pending", score: 8 },
+    ]));
+
+    const store = MetadataStore.openForOutput(out);
+    try {
+      const projectId = Number(created.id);
+      const inventoryRun = store.startRun({ projectId, kind: "audit", runDir: inventoryRunDir });
+      store.finishRun(inventoryRun, "done", { total: 2, audited: 1, pending: 1, deferred: 0 });
+      const verifyRun = store.startRun({ projectId, kind: "audit", runDir: path.join(out, "verify-scope-view-verify"), budgets: { verify: true } });
+      store.finishRun(verifyRun, "done");
+    } finally {
+      store.close();
+    }
+
+    const detail = await (await fetch(base + `/api/projects/${created.uuid}`)).json();
+    assert.deepEqual(detail.progress, { total: 2, audited: 1, pending: 1, deferred: 0 });
+    assert.equal(detail.scopes.length, 2);
+    assert.equal(detail.material.currentScopeInventoryRunId, undefined);
+  });
+});
+
 test("api: startup reconciles error runs that have successful terminal artifacts", async () => {
   const out = await mkdtemp(path.join(os.tmpdir(), "flounder-api-reconcile-"));
   const runDir = path.join(out, "artifact-success-run");
