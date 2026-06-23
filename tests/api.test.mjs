@@ -578,6 +578,15 @@ test("api: running prepare resets the project current view to the new material s
     assert.equal(detail.runs[0].kind, "prepare");
     assert.equal(detail.runs.some((run) => run.kind === "audit" && run.material_stale === true), true);
 
+    const currentFindings = await json(await fetch(base + `/api/projects/${created.uuid}/findings`));
+    assert.equal(currentFindings.total, 0);
+    assert.deepEqual(currentFindings.findings, []);
+
+    const staleFindings = await json(await fetch(base + `/api/projects/${created.uuid}/findings?includeStale=true`));
+    assert.equal(staleFindings.total, 1);
+    assert.equal(staleFindings.findings[0].title, "Old verified finding");
+    assert.equal(staleFindings.findings[0].material_stale, true);
+
     const list = await json(await fetch(base + "/api/projects"));
     const snapshot = list.projects.find((project) => project.uuid === created.uuid);
     assert.deepEqual(snapshot.progress, { total: 0, audited: 0, deferred: 0, pending: 0 });

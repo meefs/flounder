@@ -232,9 +232,9 @@ const ROUTES: Route[] = [
   }),
   route({
     method: "GET", path: "/api/projects/:uuid/findings",
-    summary: "List findings, paginated + filterable, each with its status timeline (suspect→confirm→refute).",
+    summary: "List current-material findings, paginated + filterable, each with its status timeline (suspect→confirm→refute). Pass ?includeStale=true to inspect findings from older prepared material snapshots.",
     params: { uuid: "project UUID" },
-    query: { status: "string? — exact status or execution-confirmed alias", q: "string? — text search (title/location)", limit: "number? (default 50)", offset: "number? (default 0)" },
+    query: { status: "string? — exact status or execution-confirmed alias", q: "string? — text search (title/location)", includeStale: "boolean? — include findings from older prepared material snapshots", limit: "number? (default 50)", offset: "number? (default 0)" },
     handler: findingsList,
   }),
   route({
@@ -1875,18 +1875,38 @@ function launchDisplayConfig(spec: LaunchSpec): Record<string, unknown> {
 }
 
 function findingsList(c: Ctx): void {
-  withProject(c, (id) => {
+  withProject(c, (id, project) => {
     const status = c.url.searchParams.get("status") ?? undefined;
     const search = c.url.searchParams.get("q") ?? undefined;
+    const includeStale = c.url.searchParams.get("includeStale") === "true";
     const limit = clampInt(c.url.searchParams.get("limit"), 50, 1, 500);
     const offset = clampInt(c.url.searchParams.get("offset"), 0, 0, 1_000_000);
-    const rows = reportableFindings(c.store.listFindings(id))
+    const allRuns = c.store.listRuns(id);
+    const materialBoundary = latestPrepareRun(allRuns);
+    const activePrepareRefresh = activePrepareRefreshStartedAt(c.store, project, materialBoundary);
+    const currentRuns = activePrepareRefresh
+      ? allRuns.filter((run) => stringValue(run.started_at) >= activePrepareRefresh)
+      : currentMaterialRuns(allRuns, materialBoundary);
+    const currentRunIds = runIdSet(currentRuns);
+    const rows = reportableFindings(c.store.listFindings(id)
+      .filter((finding) => includeStale || (!activePrepareRefresh && rowBelongsToCurrentMaterial(finding, currentRunIds, materialBoundary))))
+      .map((finding) => annotateFindingMaterialStaleness(finding, currentRunIds, materialBoundary, activePrepareRefresh))
       .filter((finding) => findingStatusMatches(finding, status))
       .filter((finding) => !search || `${finding.title ?? ""} ${finding.location ?? ""}`.toLowerCase().includes(search.toLowerCase()))
       .sort((a, b) => findingSeverityScore(b) - findingSeverityScore(a) || String(b.updated_at ?? "").localeCompare(String(a.updated_at ?? "")));
     const findings = rows.slice(offset, offset + limit).map((finding) => findingDisplayRow({ ...finding, timeline: c.store.findingTimeline(Number(finding.id)) }));
     sendJson(c.res, 200, { findings, total: rows.length, limit, offset });
   });
+}
+
+function annotateFindingMaterialStaleness(row: Record<string, unknown>, currentRunIds: Set<number>, boundary?: Record<string, unknown>, activePrepareRefreshStartedAt?: string): Record<string, unknown> {
+  if (!activePrepareRefreshStartedAt && rowBelongsToCurrentMaterial(row, currentRunIds, boundary)) return row;
+  return {
+    ...row,
+    material_stale: true,
+    ...(boundary?.id !== undefined ? { stale_since_prepare_run_id: boundary.id } : {}),
+    stale_since_prepare_started_at: activePrepareRefreshStartedAt ?? boundary?.started_at,
+  };
 }
 
 function findingSeverityScore(finding: Record<string, unknown>): number {
