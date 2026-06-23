@@ -192,7 +192,7 @@ const ROUTES: Route[] = [
     method: "GET", path: "/api/projects/:uuid/runs",
     summary: "List a project's runs (newest first), including job error summaries when available.",
     params: { uuid: "project UUID" }, query: { limit: "number? — cap rows" },
-    handler: (c) => withProject(c, (id) => sendJson(c.res, 200, { runs: runApiRows(c.store, c.store.listRuns(id, clampInt(c.url.searchParams.get("limit"), 200, 1, 1000))) })),
+    handler: (c) => withProject(c, (id) => sendJson(c.res, 200, { runs: runApiRows(c.store, c.store.listRuns(id, clampInt(c.url.searchParams.get("limit"), 200, 1, 1000)), c.plane) })),
   }),
   route({
     method: "POST", path: "/api/projects/:uuid/runs",
@@ -382,7 +382,7 @@ const ROUTES: Route[] = [
     params: { id: "run id" },
     handler: (c) => {
       const run = c.store.getRun(Number(c.params.id));
-      run ? sendJson(c.res, 200, { run: runApiRow(c.store, run) }) : sendJson(c.res, 404, { error: "no such run" });
+      run ? sendJson(c.res, 200, { run: runApiRow(c.store, run, c.plane) }) : sendJson(c.res, 404, { error: "no such run" });
     },
   }),
   route({
@@ -717,7 +717,7 @@ async function projectCreate(c: Ctx): Promise<void> {
 async function projectGet(c: Ctx): Promise<void> {
   await withProjectAsync(c, async (id, project) => {
     await reconcileStaleAuditingScopes(c, project);
-    const runs = runApiRows(c.store, c.store.listRuns(id, 50));
+    const runs = runApiRows(c.store, c.store.listRuns(id, 50), c.plane);
     const storedProgress = c.store.scopeProgress(id);
     const storedScopes = c.store.queryScopes(id, { limit: 50, offset: 0 });
     const scopeCheckpoint = latestScopeCheckpoint(runs);
@@ -746,21 +746,37 @@ async function projectGet(c: Ctx): Promise<void> {
   });
 }
 
-function runApiRows(store: MetadataStore, runs: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
-  return runs.map((run) => runApiRow(store, run));
+function runApiRows(store: MetadataStore, runs: Array<Record<string, unknown>>, plane?: ControlPlane): Array<Record<string, unknown>> {
+  return runs.map((run) => runApiRow(store, run, plane));
 }
 
-function runApiRow(store: MetadataStore, run: Record<string, unknown>): Record<string, unknown> {
+function runApiRow(store: MetadataStore, run: Record<string, unknown>, plane?: ControlPlane): Record<string, unknown> {
   const runId = Number(run.id);
   const job = Number.isFinite(runId) ? store.getJobByRun(runId) : undefined;
-  if (!job) return run;
+  const activity = runActivityFields(store, plane, run);
+  if (!job) return { ...run, ...activity };
   const runStatus = typeof run.status === "string" ? run.status : "";
   const jobError = runStatus === "done" ? undefined : stringValue(job.error) || undefined;
   return {
     ...run,
+    ...activity,
     job_id: job.id,
     job_status: job.status,
     job_error: jobError,
+  };
+}
+
+const RUN_STALE_ACTIVITY_MS = 15 * 60 * 1000;
+
+function runActivityFields(store: MetadataStore, plane: ControlPlane | undefined, run: Record<string, unknown>): Record<string, unknown> {
+  if (run.status !== "running") return {};
+  const runId = Number(run.id);
+  if (!Number.isFinite(runId)) return {};
+  const lastActivityAt = latestRunActivityAt(store, plane, runId);
+  const activity = runInactivity(lastActivityAt);
+  return {
+    ...(lastActivityAt ? { last_activity_at: lastActivityAt } : {}),
+    ...(activity ? { inactive_seconds: activity.inactiveSeconds, stale_activity: activity.staleActivity } : {}),
   };
 }
 
@@ -2444,6 +2460,7 @@ function activeRuns(store: MetadataStore, plane?: ControlPlane): Array<Record<st
     const onlineDaemons = daemonId !== undefined && plane ? plane.daemonCount(daemonId) : undefined;
     const blockedReason = daemonId !== undefined && onlineDaemons === 0 ? "selected-daemon-offline" : undefined;
     const lastActivityAt = typeof job.run_id === "number" ? latestRunActivityAt(store, plane, Number(job.run_id)) : undefined;
+    const activity = runInactivity(lastActivityAt);
     const updatedAt = maxIsoTimestamp(String(job.updated_at ?? ""), lastActivityAt);
     return {
       jobId: job.id,
@@ -2454,6 +2471,7 @@ function activeRuns(store: MetadataStore, plane?: ControlPlane): Array<Record<st
       startedAt: job.created_at,
       updatedAt,
       ...(lastActivityAt ? { lastActivityAt } : {}),
+      ...(activity ? { inactiveSeconds: activity.inactiveSeconds, staleActivity: activity.staleActivity } : {}),
       daemonId: daemonId ?? null,
       ...(onlineDaemons !== undefined ? { onlineDaemons } : {}),
       ...(blockedReason ? { blockedReason } : {}),
@@ -2470,6 +2488,14 @@ function latestRunActivityAt(store: MetadataStore, plane: ControlPlane | undefin
 
 function maxIsoTimestamp(...values: Array<string | undefined>): string | undefined {
   return values.filter((v): v is string => Boolean(v)).sort().at(-1);
+}
+
+function runInactivity(lastActivityAt: string | undefined): { inactiveSeconds: number; staleActivity: boolean } | undefined {
+  if (!lastActivityAt) return undefined;
+  const last = Date.parse(lastActivityAt);
+  if (!Number.isFinite(last)) return undefined;
+  const inactiveSeconds = Math.max(0, Math.floor((Date.now() - last) / 1000));
+  return { inactiveSeconds, staleActivity: inactiveSeconds * 1000 >= RUN_STALE_ACTIVITY_MS };
 }
 
 function daemonRows(c: Ctx): Array<Record<string, unknown>> {

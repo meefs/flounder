@@ -71,6 +71,9 @@ export interface RunRow {
   started_at?: string | null;
   dig_started_at?: string | null;
   ended_at?: string | null;
+  last_activity_at?: string | null;
+  inactive_seconds?: number | null;
+  stale_activity?: boolean | null;
   job_id?: number | null;
   job_status?: string | null;
   job_error?: string | null;

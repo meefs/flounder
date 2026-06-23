@@ -1799,16 +1799,18 @@ test("api: active jobs recover last activity from persisted run logs", async () 
     const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     const created = await json(await post("/api/projects", { name: "active-persisted-activity", sourcePaths: ["./src"] }));
     const runDir = path.join(out, "active-persisted-activity-run");
+    const oldActivity = "2000-01-01T00:00:00.000Z";
     await mkdir(runDir, { recursive: true });
     await writeFile(
       path.join(runDir, "events.jsonl"),
-      `${JSON.stringify({ ts: "2026-06-22T23:13:40.395Z", kind: "audit_action", detail: "persisted after server restart" })}\n`,
+      `${JSON.stringify({ ts: oldActivity, kind: "audit_action", detail: "persisted after server restart" })}\n`,
     );
 
+    let runId;
     const store = MetadataStore.openForOutput(out);
     try {
       const jobId = store.enqueueJob(created.name, { verb: "prepare" });
-      const runId = store.startRun({ projectId: created.id, kind: "prepare", runDir });
+      runId = store.startRun({ projectId: created.id, kind: "prepare", runDir });
       store.setJobRun(jobId, runId);
     } finally {
       store.close();
@@ -1816,8 +1818,19 @@ test("api: active jobs recover last activity from persisted run logs", async () 
 
     const active = await json(await fetch(base + "/api/active"));
     const row = active.active.find((entry) => entry.target === created.name);
-    assert.equal(row.lastActivityAt, "2026-06-22T23:13:40.395Z");
+    assert.equal(row.lastActivityAt, oldActivity);
     assert.ok(row.updatedAt >= row.lastActivityAt);
+    assert.equal(row.staleActivity, true);
+    assert.ok(row.inactiveSeconds > 15 * 60);
+
+    const detail = await json(await fetch(base + `/api/projects/${created.uuid}`));
+    assert.equal(detail.runs[0].last_activity_at, oldActivity);
+    assert.equal(detail.runs[0].stale_activity, true);
+    assert.ok(detail.runs[0].inactive_seconds > 15 * 60);
+
+    const single = await json(await fetch(base + `/api/runs/${runId}`));
+    assert.equal(single.run.last_activity_at, oldActivity);
+    assert.equal(single.run.stale_activity, true);
   });
 });
 

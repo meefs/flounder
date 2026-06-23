@@ -18,6 +18,7 @@ import {
 import { Button, Card, Counter, IconButton, Modal, StateBadge, StatusBadge } from "./components";
 import {
   confirmedDecisions,
+  fmtDur,
   fmtTime,
   isVerifyRun,
   pct,
@@ -181,6 +182,11 @@ function relativeAge(daemon: DaemonRow): string {
   const hours = Math.floor(minutes / 60);
   if (hours < 48) return `${hours}h ago`;
   return `${Math.floor(hours / 24)}d ago`;
+}
+
+function runInactiveLabel(run: RunRow): string | null {
+  if (!run.stale_activity || typeof run.inactive_seconds !== "number") return null;
+  return fmtDur(Math.max(0, run.inactive_seconds) * 1000);
 }
 
 function daemonProviderStatuses(daemon: DaemonRow | undefined): Array<{ provider: string; configured: boolean; required?: boolean }> {
@@ -1587,6 +1593,7 @@ function ProjectDetailView(props: {
   const confirmed = totalConfirmed(project);
   const reproduced = confirmedDecisions(detail.confirmDecisions).length;
   const runningRun = detail.runs.find((run) => run.status === "running");
+  const runningInactive = runningRun ? runInactiveLabel(runningRun) : null;
   const pendingConfirm = pendingConfirmFindings(detail.allFindings).length;
   const pendingVerify = verifyCandidates.length;
   const pendingReports = pendingFormalReports(detail.allFindings).length;
@@ -1742,12 +1749,20 @@ function ProjectDetailView(props: {
           </div>
         </div>
         {runningRun ? (
-          <div className="info-panel run-notice">
-            <strong>{online.length ? `${runKindLabel(runningRun.kind, runningRun)} is running.` : `${runKindLabel(runningRun.kind, runningRun)} is waiting for a daemon.`}</strong>
+          <div className={`info-panel run-notice${runningInactive ? " stale" : ""}`}>
+            <strong>
+              {runningInactive
+                ? `${runKindLabel(runningRun.kind, runningRun)} has no recent activity.`
+                : online.length
+                  ? `${runKindLabel(runningRun.kind, runningRun)} is running.`
+                  : `${runKindLabel(runningRun.kind, runningRun)} is waiting for a daemon.`}
+            </strong>
             <span>
-              {online.length
-                ? "New launches are locked until this run finishes or you stop it."
-                : "No daemon is online, so the run may be stalled until an executor reconnects."} Current progress: {runProgress(runningRun, detail.confirmDecisions)}.
+              {runningInactive
+                ? `Last activity was ${runningInactive} ago. Stop the run if the daemon is no longer making progress.`
+                : online.length
+                  ? "New launches are locked until this run finishes or you stop it."
+                  : "No daemon is online, so the run may be stalled until an executor reconnects."} Current progress: {runProgress(runningRun, detail.confirmDecisions)}.
             </span>
           </div>
         ) : null}
@@ -2300,7 +2315,8 @@ function tailPath(value: string, parts = 3): string {
 }
 
 function overviewRunDetail(run: RunRow, decisions: ConfirmDecision[]): string {
-  if (run.status === "running") return `${run.status} · ${runProgress(run, decisions)}`;
+  const inactive = runInactiveLabel(run);
+  if (run.status === "running") return inactive ? `${run.status} · no activity for ${inactive} · ${runProgress(run, decisions)}` : `${run.status} · ${runProgress(run, decisions)}`;
   const pieces = [run.status, fmtTime(run.ended_at ?? run.started_at)];
   if (run.kind === "confirm") {
     const rows = decisions.filter((decision) => decision.run_id === run.id);
@@ -3673,6 +3689,7 @@ function RunLogModal({ run, onClose }: { run: RunRow; onClose: () => void }) {
   }, [run.id, run.status]);
   const lines = useMemo(() => events.reduce((current, event) => appendActivityLine(current, event), [] as ActivityLine[]), [events]);
   const lastLine = lines[lines.length - 1];
+  const inactive = runInactiveLabel(run);
   const logScroll = usePinnedScroll(lines, run.id);
   return (
     <Modal title={`Run log - #${run.id}`} wide onClose={onClose}>
@@ -3680,7 +3697,7 @@ function RunLogModal({ run, onClose }: { run: RunRow; onClose: () => void }) {
         <StateBadge status={run.status} />
         <strong>{runKindLabel(run.kind, run)}</strong>
         <span>{runProgress(run, [])}</span>
-        {lastLine ? <span>Last activity {formatActivityTime(lastLine.time)}</span> : null}
+        {inactive ? <span className="warn-text">No activity for {inactive}</span> : lastLine ? <span>Last activity {formatActivityTime(lastLine.time)}</span> : null}
       </div>
       {run.job_error ? <div className="inline-error">{run.job_error}</div> : null}
       {error ? <div className="inline-error">{error}</div> : null}
