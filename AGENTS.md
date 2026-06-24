@@ -110,6 +110,7 @@
 ## Git And Packaging
 
 - Assume every commit may become public. Commit messages, branch names, tags, package contents, and generated changelog text must not contain sensitive or machine-specific information.
+- Before publishing any new tag, verify that the persisted database can upgrade cleanly from the latest released version to the new version. Individual commits do not need to preserve database upgradeability, but every tagged release must. During v0, API and CLI compatibility may remain unstable; database upgrade compatibility is still a release gate.
 - After completing an independent, verified feature or coherent change set, commit it before moving on to the next unrelated task. Keep commits scoped and public-safe; do not commit half-finished work, blocked experiments, private materials, raw run artifacts, or generated caches.
 - Review package contents before release. The package should contain source, compiled outputs, docs, prompts, skills, fixtures intended for publication, and license/security files only.
 - Do not rely on later cleanup to protect secrets. Prevent them from entering Git, package archives, run artifacts, and logs in the first place.
