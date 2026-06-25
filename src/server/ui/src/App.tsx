@@ -44,6 +44,7 @@ import {
   STATUSES,
   THINKING_LEVELS,
   TRACKING,
+  projectSourceState,
   type ProjectPhase,
   type ProviderPhase,
 } from "./domain";
@@ -2383,6 +2384,7 @@ function ProjectDetailView(props: {
     .map((phase) => ({ phase, provider: phaseProvider(detail, providers, phase) }))
     .filter((entry) => entry.provider);
   const currentRunningRuns = currentRuns.filter((run) => run.status === "running").length;
+  const sourceState = projectSourceState(detail, config.sourcePaths);
   const openSetupTab = () => {
     setTab("setup");
     window.setTimeout(() => scrollToProjectSection("project-setup-tab"), 0);
@@ -2427,7 +2429,13 @@ function ProjectDetailView(props: {
       onClick: !provider || !selectedDaemon ? props.onOpenEdit : () => go("/settings/daemons"),
     },
     { label: "Coverage", state: coverageLabel(config.cfg), ok: true, actionLabel: "Edit", onClick: props.onOpenEdit },
-    { label: "Source", state: config.sourcePaths.length ? `${plural(config.sourcePaths.length, "path")}` : "No source paths", ok: config.sourcePaths.length > 0, actionLabel: config.sourcePaths.length ? "View" : "Fix", onClick: config.sourcePaths.length ? openSetupTab : props.onOpenEdit },
+    {
+      label: "Source",
+      state: sourceState.kind === "configured" ? `${plural(config.sourcePaths.length, "path")}` : sourceState.kind === "prepared" ? "Prepared workspace" : "No source paths",
+      ok: sourceState.ok,
+      actionLabel: sourceState.ok ? "View" : "Fix",
+      onClick: sourceState.ok ? openSetupTab : props.onOpenEdit,
+    },
     ...(setupAttention ? [{
       label: "Prepared materials",
       state: setupAttention.label,

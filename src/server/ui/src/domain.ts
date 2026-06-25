@@ -116,6 +116,16 @@ export function projectConfig(detail: ProjectDetail | null): { cfg: ProjectConfi
   };
 }
 
+export type ProjectSourceState = { kind: "configured" | "prepared" | "missing"; ok: boolean };
+
+export function projectSourceState(detail: Pick<ProjectDetail, "prepareSummary"> | null | undefined, sourcePaths: string[]): ProjectSourceState {
+  if (sourcePaths.length > 0) return { kind: "configured", ok: true };
+  const summary = detail?.prepareSummary;
+  const preparedWorkspaceReady = Boolean(summary?.workspace?.exists && (summary.auditReady || summary.quality === "ready" || summary.quality === "limited"));
+  if (preparedWorkspaceReady) return { kind: "prepared", ok: true };
+  return { kind: "missing", ok: false };
+}
+
 export interface ProjectConfigShape {
   projectIntent?: string;
   prepareClue?: string;
