@@ -2893,6 +2893,153 @@ test("api: active jobs recover last activity from persisted run logs", async () 
   });
 });
 
+test("api: daemon heartbeats keep held stale jobs active", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body, token) => fetch(base + p, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify(body),
+    });
+    const daemon = await json(await post("/api/daemons", { name: "heartbeat-held" }));
+    const created = await json(await post("/api/projects", { name: "heartbeat-held-project", sourcePaths: ["./src"], daemonId: daemon.id }));
+    const runDir = path.join(out, "heartbeat-held-run");
+    const oldActivity = "2000-01-01T00:00:00.000Z";
+    await mkdir(runDir, { recursive: true });
+    await writeFile(path.join(runDir, "events.jsonl"), `${JSON.stringify({ ts: oldActivity, kind: "audit_action", detail: "long model call" })}\n`);
+
+    let jobId;
+    let runId;
+    const store = MetadataStore.openForOutput(out);
+    try {
+      jobId = store.enqueueJob(created.name, { verb: "run" }, daemon.id);
+      runId = store.startRun({ projectId: created.id, kind: "run", runDir });
+      store.setJobRun(jobId, runId);
+    } finally {
+      store.close();
+    }
+
+    const heartbeat = await json(await post("/api/daemon/heartbeat", { instanceId: "held-worker", activeJobIds: [jobId] }, daemon.token));
+    assert.equal(heartbeat.reconciled, 0);
+    const active = await json(await fetch(base + "/api/active"));
+    const row = active.active.find((entry) => entry.jobId === jobId);
+    assert.equal(row.status, "running");
+    assert.equal(row.lastActivityAt, oldActivity);
+    assert.equal(row.staleActivity, true);
+    assert.equal(row.blockedReason, undefined);
+    assert.equal(row.onlineDaemons, 1);
+
+    const single = await json(await fetch(base + `/api/runs/${runId}`));
+    assert.equal(single.run.status, "running");
+  });
+});
+
+test("api: recently seen daemons without heartbeat do not lose stale jobs", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const daemon = await json(await post("/api/daemons", { name: "recent-no-heartbeat" }));
+    const created = await json(await post("/api/projects", { name: "recent-no-heartbeat-project", sourcePaths: ["./src"], daemonId: daemon.id }));
+    const runDir = path.join(out, "recent-no-heartbeat-run");
+    await mkdir(runDir, { recursive: true });
+    await writeFile(path.join(runDir, "events.jsonl"), `${JSON.stringify({ ts: "2000-01-01T00:00:00.000Z", kind: "audit_action", detail: "server just restarted" })}\n`);
+
+    let jobId;
+    let runId;
+    const store = MetadataStore.openForOutput(out);
+    try {
+      store.touchDaemon(daemon.id);
+      jobId = store.enqueueJob(created.name, { verb: "run" }, daemon.id);
+      runId = store.startRun({ projectId: created.id, kind: "run", runDir });
+      store.setJobRun(jobId, runId);
+    } finally {
+      store.close();
+    }
+
+    const active = await json(await fetch(base + "/api/active"));
+    const row = active.active.find((entry) => entry.jobId === jobId);
+    assert.equal(row.status, "running");
+    assert.equal(row.staleActivity, true);
+
+    const single = await json(await fetch(base + `/api/runs/${runId}`));
+    assert.equal(single.run.status, "running");
+  });
+});
+
+test("api: stale jobs not held by daemon heartbeat are reconciled automatically", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body, token) => fetch(base + p, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify(body),
+    });
+    const daemon = await json(await post("/api/daemons", { name: "heartbeat-unheld" }));
+    const created = await json(await post("/api/projects", { name: "heartbeat-unheld-project", sourcePaths: ["./src"], daemonId: daemon.id }));
+    const runDir = path.join(out, "heartbeat-unheld-run");
+    await mkdir(runDir, { recursive: true });
+    await writeFile(path.join(runDir, "events.jsonl"), `${JSON.stringify({ ts: "2000-01-01T00:00:00.000Z", kind: "audit_action", detail: "executor lost it" })}\n`);
+
+    let jobId;
+    let runId;
+    let store = MetadataStore.openForOutput(out);
+    try {
+      jobId = store.enqueueJob(created.name, { verb: "run" }, daemon.id);
+      runId = store.startRun({ projectId: created.id, kind: "run", runDir });
+      store.setJobRun(jobId, runId);
+    } finally {
+      store.close();
+    }
+
+    const heartbeat = await json(await post("/api/daemon/heartbeat", { instanceId: "unheld-worker", activeJobIds: [] }, daemon.token));
+    assert.equal(heartbeat.reconciled, 1);
+    const active = await json(await fetch(base + "/api/active"));
+    assert.equal(active.active.some((entry) => entry.jobId === jobId), false);
+
+    store = MetadataStore.openForOutput(out);
+    try {
+      assert.equal(store.getJob(jobId).status, "canceled");
+      assert.equal(store.getJob(jobId).error, "executor no longer holds this job");
+      assert.equal(store.getRun(runId).status, "killed");
+    } finally {
+      store.close();
+    }
+  });
+});
+
+test("api: empty killed runs do not replace the latest material project snapshot", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+    const created = await json(await post("/api/projects", { name: "latest-material-run", sourcePaths: ["./src"] }));
+    let doneRunId;
+    let emptyKilledRunId;
+    const store = MetadataStore.openForOutput(out);
+    try {
+      doneRunId = store.startRun({ projectId: created.id, kind: "run", runDir: path.join(out, "latest-material-done") });
+      store.updateRunScopes(doneRunId, 30, 30);
+      store.finishRun(doneRunId, "done", { total: 30, audited: 30, pending: 0 }, 0);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      emptyKilledRunId = store.startRun({ projectId: created.id, kind: "run", runDir: path.join(out, "latest-material-empty-killed") });
+      store.finishRun(emptyKilledRunId, "killed");
+    } finally {
+      store.close();
+    }
+
+    const list = await json(await fetch(base + "/api/projects"));
+    const row = list.projects.find((project) => project.uuid === created.uuid);
+    assert.equal(row.latestRun.id, doneRunId);
+    assert.equal(row.latestRun.status, "done");
+
+    const failed = await json(await fetch(base + "/api/projects?status=failed"));
+    assert.equal(failed.projects.some((project) => project.uuid === created.uuid), false);
+
+    const single = await json(await fetch(base + `/api/runs/${emptyKilledRunId}`));
+    assert.equal(single.run.status, "killed");
+  });
+});
+
 test("api: run rows include job error summaries", async () => {
   await withServer(async (base, out) => {
     const json = (r) => r.json();
