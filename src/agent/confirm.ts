@@ -39,7 +39,7 @@ interface ConfirmProvenance {
 
 export async function runConfirm(
   cfg: AuditorConfig,
-  options: { inputRunDir: string; inputRunDirs?: string[]; confirmKeys?: string[]; maxSteps?: number; fresh?: boolean; streamEvents?: boolean; signal?: AbortSignal; onRun?: (runId: number) => void; onActivity?: (event: { kind: string; delta?: string; tool?: string; step?: number }) => void; makeTracker?: RunTrackerFactory },
+  options: { inputRunDir: string; inputRunDirs?: string[]; confirmKeys?: string[]; settledDecisions?: ConfirmDecisionRow[]; maxSteps?: number; fresh?: boolean; streamEvents?: boolean; signal?: AbortSignal; onRun?: (runId: number) => void; onActivity?: (event: { kind: string; delta?: string; tool?: string; step?: number }) => void; makeTracker?: RunTrackerFactory },
 ): Promise<ConfirmRunResult> {
   // Confirm needs a real agent that can fork a live network and run real nodes; the
   // mock/CLI fallbacks cannot, so this mode requires a pi-session provider.
@@ -106,7 +106,7 @@ export async function runConfirm(
   // RESUME (auto, unless --fresh): an interrupted prior confirm of THIS input run left a
   // decision sheet; carry its already-SETTLED rows (reproduced yes/no) forward and tell
   // the model to skip them, so a re-run continues instead of re-reproducing from scratch.
-  const settled = options.fresh ? [] : await loadSettledFromPriorConfirm(confirmCfg.outputDir, confirmCfg.targetName, inputRunDir, logger.runDir, runDirs);
+  const settled = options.fresh ? [] : mergeSettledRows([...(options.settledDecisions ?? []), ...await loadSettledFromPriorConfirm(confirmCfg.outputDir, confirmCfg.targetName, inputRunDir, logger.runDir, runDirs)]);
   let seed = renderFindingsSeed(priorFindings);
   if (settled.length > 0) {
     seed += `\n\n=== ALREADY SETTLED in prior confirm run(s) — carry these rows into confirm_decision.json and do NOT reproduce their existing member ids again. Work on findings not settled here. If an unsettled finding is the same distinct bug as a settled row, add that finding id to that row's members and reuse the prior reproduction evidence; otherwise leave settled rows unchanged. ===\n${JSON.stringify(settled, null, 1)}`;
@@ -412,6 +412,22 @@ export interface ConfirmDecisionRow {
   patchedSuccessPatterns?: string[];
   // Set by the framework when this row is the merge of several rows a single fix neutralized.
   mergedFrom?: string[];
+}
+
+function mergeSettledRows(rows: ConfirmDecisionRow[]): ConfirmDecisionRow[] {
+  const out: ConfirmDecisionRow[] = [];
+  const covered = new Set<string>();
+  const memberKeys = (row: ConfirmDecisionRow): string[] => {
+    const keys = row.members.map((member) => member.trim().toLowerCase()).filter(Boolean);
+    return keys.length > 0 ? keys : [row.bug.trim().toLowerCase()].filter(Boolean);
+  };
+  for (const row of rows.filter((entry) => entry.reproduced === "yes" || entry.reproduced === "no")) {
+    const keys = memberKeys(row);
+    if (keys.length > 0 && keys.every((key) => covered.has(key))) continue;
+    out.push(row);
+    for (const key of keys) covered.add(key);
+  }
+  return out;
 }
 
 function readConfirmDecision(session: AgentSession): ConfirmDecisionRow[] {

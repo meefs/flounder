@@ -5,6 +5,7 @@ out/
 cache/
 .npm-cache/
 .gstack/
+.codex/
 .DS_Store
 *.log
 *.pdf

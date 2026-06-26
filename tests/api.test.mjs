@@ -74,6 +74,7 @@ test("api: GET /api is a self-describing catalog of every resource + operation",
     assert.match(projectScopes.query.offset, /default 0/);
     const projectFindings = cat.endpoints.find((e) => e.method === "GET" && e.path === "/api/projects/:uuid/findings");
     assert.match(projectFindings.query.status, /execution-confirmed/);
+    assert.match(projectFindings.query.q, /#finding-id/);
     const globalFindings = cat.endpoints.find((e) => e.method === "GET" && e.path === "/api/bugs");
     assert.match(globalFindings.summary, /execution-confirmed/);
     assert.match(globalFindings.query.project, /project uuid/);
@@ -459,6 +460,7 @@ test("api: daemon pipeline worklist exposes verify candidates before confirm", a
     }));
     assert.ok(confirm.confirmKeys.includes("confirmed-bug"));
     assert.ok(confirm.confirmKeys.includes("kalreadyreproduced"), "confirm worklist carries prior decided findings as consolidation context");
+    assert.deepEqual(confirm.confirmSettledRows.map((row) => row.bug), ["prior reproduced withdrawal proof"]);
     assert.ok(confirm.confirmKeys.some((key) => /^origin:\d+:confirmed-bug$/.test(key)), "worklist carries origin selector for verify-artifact recovery");
 
     const detail = await json(await fetch(base + `/api/projects/${created.uuid}`));
@@ -486,6 +488,11 @@ test("api: current confirm decisions hide older rows superseded by newer member 
         { bug: "new reproduced result", reproduced: "yes", recommendation: "submit-candidate", members: ["kabc123"] },
       ]);
       store.finishRun(newConfirm, "done");
+      const setupFailedConfirm = store.startRun({ projectId: created.id, kind: "confirm", runDir: path.join(out, "setup-failed-confirm") });
+      store.upsertConfirmDecisions(created.id, setupFailedConfirm, [
+        { bug: "new setup failed retry", reproduced: "could-not-set-up", recommendation: "needs-human", members: ["kabc123"] },
+      ]);
+      store.finishRun(setupFailedConfirm, "done");
     } finally {
       store.close();
     }
@@ -498,7 +505,7 @@ test("api: current confirm decisions hide older rows superseded by newer member 
     assert.deepEqual(new Set(current.confirmDecisions.map((row) => row.bug)), new Set(["new reproduced result", "still unsettled"]));
 
     const withHistory = await json(await fetch(base + `/api/projects/${created.uuid}/confirm-decisions?includeStale=true`));
-    assert.deepEqual(new Set(withHistory.confirmDecisions.map((row) => row.bug)), new Set(["new reproduced result", "old setup blocker", "still unsettled"]));
+    assert.deepEqual(new Set(withHistory.confirmDecisions.map((row) => row.bug)), new Set(["new setup failed retry", "new reproduced result", "old setup blocker", "still unsettled"]));
   });
 });
 
@@ -847,6 +854,45 @@ test("api: launching prepare clears the current scope inventory projection", asy
     assert.equal(snapshot.confirmDecisionCount, 0);
     assert.equal(snapshot.activeRuns, 1);
     assert.equal(snapshot.latestRun, null);
+  });
+});
+
+test("api: project findings search can target a finding id link", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const created = await json(await post("/api/projects", { name: "finding-id-search", sourcePaths: ["./src"] }));
+    let linkedId = 0;
+    const store = MetadataStore.openForOutput(out);
+    try {
+      const auditRun = store.startRun({ projectId: created.id, kind: "audit", runDir: path.join(out, "finding-id-search-audit") });
+      store.upsertFindings(created.id, auditRun, [
+        {
+          findingKey: "linked-finding",
+          title: "Linked finding target",
+          location: "src/Target.sol:10",
+          severity: "high",
+          status: "confirmed-executable",
+          confidence: 0.9,
+        },
+        {
+          findingKey: "other-finding",
+          title: "Other finding",
+          location: "src/Other.sol:20",
+          severity: "high",
+          status: "confirmed-executable",
+          confidence: 0.9,
+        },
+      ]);
+      linkedId = Number(store.listFindings(created.id).find((row) => row.finding_key === "linked-finding")?.id);
+    } finally {
+      store.close();
+    }
+
+    const byId = await json(await fetch(`${base}/api/projects/${created.uuid}/findings?q=%23${linkedId}`));
+    assert.equal(byId.total, 1);
+    assert.equal(byId.findings[0].id, linkedId);
+    assert.equal(byId.findings[0].finding_key, "linked-finding");
   });
 });
 
@@ -1531,6 +1577,7 @@ test("api: project detail summarizes the latest prepare manifest and workspace q
     assert.deepEqual(confirmSpec.inputRunDirs, [auditRunDir]);
     assert.ok(confirmSpec.confirmKeys.includes("confirmed-bug"));
     assert.ok(confirmSpec.confirmKeys.includes("kalreadyreproduced"), "project confirm carries prior decided findings as consolidation context");
+    assert.deepEqual(confirmSpec.confirmSettledRows.map((row) => row.bug), ["prior prepared source bug"]);
     assert.ok(confirmSpec.confirmKeys.some((key) => /^origin:\d+:confirmed-bug$/.test(key)), "confirm spec carries origin selector for verify-artifact recovery");
   });
 });

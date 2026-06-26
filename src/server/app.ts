@@ -21,7 +21,7 @@ import { defaultOutputDir } from "../config.js";
 import { MetadataStore, type RunKind, type Coverage, type ProviderInput, type ProviderProfile, type ProjectInput, type ProjectListOptions, type ProviderRoles, type RoleOverride } from "../db/store.js";
 import { getSupportedThinkingLevels, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { getProviders, getModels } from "@earendil-works/pi-ai/compat";
-import { type LaunchSpec, ActivityBus, type Activity, type ReportFindingSpec } from "./run-manager.js";
+import { type LaunchSpec, ActivityBus, type Activity, type ReportFindingSpec, type ConfirmSettledRow } from "./run-manager.js";
 import { THINKING_LEVELS } from "../config.js";
 import { projectHistoryDir } from "../trace/history.js";
 import { loadScopeInventory, saveScopeInventory } from "../agent/scope-store.js";
@@ -295,7 +295,7 @@ const ROUTES: Route[] = [
     method: "GET", path: "/api/projects/:uuid/findings",
     summary: "List current-material findings, paginated + filterable, each with its status timeline (suspect→confirm→refute). Pass ?includeStale=true to inspect findings from older prepared material snapshots.",
     params: { uuid: "project UUID" },
-    query: { status: "string? — exact status or execution-confirmed alias", tracking: "string? — tracking state or active to hide ignored findings", q: "string? — text search (title/location)", includeStale: "boolean? — include findings from older prepared material snapshots", limit: "number? (default 50)", offset: "number? (default 0)" },
+    query: { status: "string? — exact status or execution-confirmed alias", tracking: "string? — tracking state or active to hide ignored findings", q: "string? — text search (title/location) or #finding-id", includeStale: "boolean? — include findings from older prepared material snapshots", limit: "number? (default 50)", offset: "number? (default 0)" },
     handler: findingsList,
   }),
   route({
@@ -961,15 +961,52 @@ function currentConfirmDecisions(rows: Array<Record<string, unknown>>): Array<Re
     if (Number.isFinite(aRun) && Number.isFinite(bRun) && aRun !== bRun) return bRun - aRun;
     return a.index - b.index;
   });
-  const covered = new Set<string>();
   const kept: Array<Record<string, unknown>> = [];
+  const settledCovered = new Set<string>();
+  const unsettledCovered = new Set<string>();
   for (const { row } of ranked) {
+    if (!isSettledConfirmDecision(row)) continue;
     const keys = confirmDecisionMemberKeys(row);
-    if (keys.length > 0 && keys.every((key) => covered.has(key))) continue;
+    if (keys.length > 0 && keys.every((key) => settledCovered.has(key))) continue;
     kept.push(row);
-    for (const key of keys) covered.add(key);
+    for (const key of keys) settledCovered.add(key);
+  }
+  for (const { row } of ranked) {
+    if (isSettledConfirmDecision(row)) continue;
+    const keys = confirmDecisionMemberKeys(row);
+    if (keys.length > 0 && keys.every((key) => settledCovered.has(key) || unsettledCovered.has(key))) continue;
+    kept.push(row);
+    for (const key of keys) unsettledCovered.add(key);
   }
   return kept;
+}
+
+function isSettledConfirmDecision(row: Record<string, unknown>): boolean {
+  return row.reproduced === "yes" || row.reproduced === "no";
+}
+
+function confirmSettledRows(rows: Array<Record<string, unknown>>): ConfirmSettledRow[] {
+  return rows.filter(isSettledConfirmDecision).map((row) => {
+    const reproduced = row.reproduced === "yes" || row.reproduced === "no" ? row.reproduced : "unknown";
+    const recommendationRaw = stringValue(row.recommendation);
+    const recommendation: ConfirmSettledRow["recommendation"] =
+      recommendationRaw === "submit-candidate" || recommendationRaw === "needs-human" || recommendationRaw === "drop" ? recommendationRaw : "unknown";
+    const members = safeParse(row.members_json);
+    const out: ConfirmSettledRow = {
+      bug: stringValue(row.bug) || "(unnamed)",
+      members: Array.isArray(members) ? members.filter((member): member is string => typeof member === "string" && member.trim().length > 0) : [],
+      distinctFix: stringValue(row.distinct_fix),
+      reproduced,
+      reproEvidence: stringValue(row.repro_evidence),
+      corroboration: stringValue(row.corroboration),
+      novelty: stringValue(row.novelty),
+      humanGates: stringValue(row.human_gates),
+      recommendation,
+    };
+    const reproCommandId = stringValue(row.repro_command_id);
+    if (reproCommandId) out.reproCommandId = reproCommandId;
+    return out;
+  });
 }
 
 function confirmDecisionMemberKeys(row: Record<string, unknown>): string[] {
@@ -1930,6 +1967,8 @@ async function runLaunch(c: Ctx): Promise<void> {
       spec.inputRunDirs = [...new Set(rows.map((p) => confirmableRunDir(p as unknown as Record<string, unknown>)).filter(Boolean))];
       spec.inputRunDir = spec.inputRunDirs[0];
       spec.confirmKeys = rows.flatMap((p) => confirmSelectorsForFinding(p as unknown as { id?: unknown; finding_key?: unknown }));
+      const currentDecisions = currentConfirmDecisions(c.store.listConfirmDecisions(Number(project.id)).filter((row) => rowBelongsToCurrentMaterial(row, currentResultRunIds, materialBoundary)));
+      spec.confirmSettledRows = confirmSettledRows(currentDecisions);
     }
   }
   if (spec.verb === "report") {
@@ -2248,11 +2287,19 @@ function findingsList(c: Ctx): void {
       .map((finding) => annotateFindingMaterialStaleness(finding, currentResultRunIds, materialBoundary, activePrepareRefresh))
       .filter((finding) => findingStatusMatches(finding, status))
       .filter((finding) => findingTrackingMatches(finding, tracking))
-      .filter((finding) => !search || `${finding.title ?? ""} ${finding.location ?? ""}`.toLowerCase().includes(search.toLowerCase()))
+      .filter((finding) => findingSearchMatches(finding, search))
       .sort((a, b) => findingSeverityScore(b) - findingSeverityScore(a) || String(b.updated_at ?? "").localeCompare(String(a.updated_at ?? "")));
     const findings = rows.slice(offset, offset + limit).map((finding) => findingDetailRow({ ...finding, timeline: c.store.findingTimeline(Number(finding.id)) }));
     sendJson(c.res, 200, { findings, total: rows.length, limit, offset });
   });
+}
+
+function findingSearchMatches(row: Record<string, unknown>, search?: string): boolean {
+  const query = search?.trim().toLowerCase();
+  if (!query) return true;
+  const idMatch = query.match(/^#?(\d+)$/);
+  if (idMatch && String(row.id ?? "") === idMatch[1]) return true;
+  return `${row.title ?? ""} ${row.location ?? ""}`.toLowerCase().includes(query);
 }
 
 function annotateFindingMaterialStaleness(row: Record<string, unknown>, currentRunIds: Set<number>, boundary?: Record<string, unknown>, activePrepareRefreshStartedAt?: string): Record<string, unknown> {
@@ -3056,12 +3103,14 @@ async function daemonPipelineWorklist(c: Ctx): Promise<void> {
       .filter((row) => confirmableRunDir(row as unknown as Record<string, unknown>))
       .filter((row) => rowBelongsToCurrentMaterial(row as unknown as Record<string, unknown>, currentResultRunIds, materialBoundary));
     const rows = context.length > 0 ? context : pending;
+    const currentDecisions = currentConfirmDecisions(c.store.listConfirmDecisions(projectId).filter((row) => rowBelongsToCurrentMaterial(row, currentResultRunIds, materialBoundary)));
     return sendJson(c.res, 200, {
       phase,
       requiresRealTargetConfirmation,
       inputRunDirs: [...new Set(rows.map((row) => confirmableRunDir(row as unknown as Record<string, unknown>)).filter(Boolean))],
       inputRunDir: rows[0] ? confirmableRunDir(rows[0] as unknown as Record<string, unknown>) || undefined : undefined,
       confirmKeys: rows.flatMap((row) => confirmSelectorsForFinding(row as unknown as { id?: unknown; finding_key?: unknown })),
+      confirmSettledRows: confirmSettledRows(currentDecisions),
     });
   }
 

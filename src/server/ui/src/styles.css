@@ -1313,7 +1313,8 @@ small {
 }
 
 .tabs {
-  display: inline-flex;
+  display: flex;
+  width: 100%;
   gap: 2px;
   padding: 2px;
   border-radius: 8px;
@@ -1325,6 +1326,10 @@ small {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+
+.tabs button.tab-push {
+  margin-left: auto;
 }
 
 .tab-alert-dot {
@@ -3189,6 +3194,18 @@ small {
   color: var(--fg-muted);
 }
 
+.linked-findings {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  align-items: center;
+}
+
+.linked-findings .table-link {
+  font-size: 12px;
+  font-weight: 650;
+}
+
 .report-document-head {
   position: sticky;
   top: 0;
@@ -3726,6 +3743,10 @@ small {
     display: grid;
     grid-template-columns: repeat(4, 1fr);
     width: 100%;
+  }
+
+  .tabs button.tab-push {
+    margin-left: 0;
   }
 
   .tabs button {

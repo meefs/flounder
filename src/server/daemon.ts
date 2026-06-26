@@ -93,7 +93,7 @@ export async function runDaemon(opts: DaemonOptions): Promise<void> {
         await runReport(cfg, { findings: spec.reportFindings, signal: abort.signal, makeTracker, onActivity: sink.push, ...(spec.maxSteps !== undefined ? { maxSteps: spec.maxSteps } : {}) });
       } else if (spec.verb === "confirm") {
         if (!spec.inputRunDir) throw new Error("confirm requires inputRunDir");
-        await runConfirm(cfg, { inputRunDir: spec.inputRunDir, signal: abort.signal, makeTracker, onActivity: sink.push, ...(spec.inputRunDirs ? { inputRunDirs: spec.inputRunDirs } : {}), ...(spec.confirmKeys ? { confirmKeys: spec.confirmKeys } : {}), ...(spec.maxSteps !== undefined ? { maxSteps: spec.maxSteps } : {}), ...(spec.fresh ? { fresh: true } : {}) });
+        await runConfirm(cfg, { inputRunDir: spec.inputRunDir, signal: abort.signal, makeTracker, onActivity: sink.push, ...(spec.inputRunDirs ? { inputRunDirs: spec.inputRunDirs } : {}), ...(spec.confirmKeys ? { confirmKeys: spec.confirmKeys } : {}), ...(spec.confirmSettledRows ? { settledDecisions: spec.confirmSettledRows } : {}), ...(spec.maxSteps !== undefined ? { maxSteps: spec.maxSteps } : {}), ...(spec.fresh ? { fresh: true } : {}) });
       } else if (spec.verb === "prepare") {
         if (!spec.clue) throw new Error("prepare requires a clue (tx / address / project / link)");
         await runPrepare(cfg, {
@@ -274,6 +274,7 @@ async function runPipelineJob(
       inputRunDir: confirm.inputRunDir,
       inputRunDirs: confirm.inputRunDirs,
       confirmKeys: confirm.confirmKeys,
+      ...(confirm.confirmSettledRows ? { confirmSettledRows: confirm.confirmSettledRows } : {}),
     };
     const confirmCfg = specToConfig(confirmSpec, ctx.out, ctx.workspace);
     await runConfirm(confirmCfg, {
@@ -283,6 +284,7 @@ async function runPipelineJob(
       onActivity: ctx.onActivity,
       ...(confirmSpec.inputRunDirs ? { inputRunDirs: confirmSpec.inputRunDirs } : {}),
       ...(confirmSpec.confirmKeys ? { confirmKeys: confirmSpec.confirmKeys } : {}),
+      ...(confirmSpec.confirmSettledRows ? { settledDecisions: confirmSpec.confirmSettledRows } : {}),
       ...(spec.maxSteps !== undefined ? { maxSteps: spec.maxSteps } : {}),
       ...(spec.fresh ? { fresh: true } : {}),
     });
@@ -315,6 +317,7 @@ async function pipelineWorklist(base: string, headers: Record<string, string>, p
   inputRunDir?: string;
   inputRunDirs: string[];
   confirmKeys: string[];
+  confirmSettledRows?: LaunchSpec["confirmSettledRows"];
   reportFindings: ReportFindingSpec[];
 }> {
   const res = await fetch(base + "/api/daemon/pipeline-worklist", {
@@ -327,16 +330,19 @@ async function pipelineWorklist(base: string, headers: Record<string, string>, p
     inputRunDir?: unknown;
     inputRunDirs?: unknown;
     confirmKeys?: unknown;
+    confirmSettledRows?: unknown;
     reportFindings?: unknown;
     verifyFindings?: unknown;
   };
   const strings = (value: unknown): string[] => Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0) : [];
+  const settledRows = Array.isArray(body.confirmSettledRows) ? body.confirmSettledRows.filter((entry): entry is NonNullable<LaunchSpec["confirmSettledRows"]>[number] => Boolean(entry) && typeof entry === "object" && !Array.isArray(entry) && typeof (entry as { bug?: unknown }).bug === "string") : undefined;
   const inputRunDir = typeof body.inputRunDir === "string" ? body.inputRunDir : undefined;
   return {
     verifyFindings: Array.isArray(body.verifyFindings) ? body.verifyFindings : [],
     ...(inputRunDir ? { inputRunDir } : {}),
     inputRunDirs: strings(body.inputRunDirs),
     confirmKeys: strings(body.confirmKeys),
+    ...(settledRows && settledRows.length > 0 ? { confirmSettledRows: settledRows } : {}),
     reportFindings: Array.isArray(body.reportFindings) ? body.reportFindings as ReportFindingSpec[] : [],
   };
 }

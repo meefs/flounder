@@ -52,10 +52,20 @@ import { Icon, type IconName } from "./icons";
 
 type View = "projects" | "findings" | "settings";
 type SettingsPane = "providers" | "daemons" | "archived";
-type ProjectTab = "overview" | "findings" | "scopes" | "runs" | "setup";
+type ProjectTab = "overview" | "decisions" | "findings" | "scopes" | "runs" | "activity" | "setup";
 type ModalName = "new-project" | "run" | "edit-project" | "report" | "run-log" | "artifact" | null;
 type ArtifactPreview = { title: string; runId: number; name: string };
 type LaunchAction = "run" | "prepare" | "map" | "audit" | "confirm" | "verify" | "report";
+
+const PROJECT_TABS: Array<{ id: ProjectTab; label: string; side?: "right" }> = [
+  { id: "overview", label: "Overview" },
+  { id: "decisions", label: "Decisions" },
+  { id: "findings", label: "Findings" },
+  { id: "scopes", label: "Scopes" },
+  { id: "runs", label: "Runs" },
+  { id: "activity", label: "Activity", side: "right" },
+  { id: "setup", label: "Setup" },
+];
 
 interface RouteState {
   view: View;
@@ -1233,15 +1243,15 @@ function appendActivityLine(lines: ActivityLine[], event: ActivityRecord): Activ
   return next.slice(-60);
 }
 
-function ActivityBody({ line, pre = false }: { line: ActivityLine; pre?: boolean }) {
-  const [expanded, setExpanded] = useState(false);
+function ActivityBody({ line, pre = false, defaultExpanded = false }: { line: ActivityLine; pre?: boolean; defaultExpanded?: boolean }) {
+  const [expanded, setExpanded] = useState(defaultExpanded);
   const limit = activityPreviewLimit(line.kind);
   const canExpand = line.body.length > limit;
   const visibleBody = canExpand && !expanded ? `${line.body.slice(0, limit).trimEnd()}...` : line.body;
 
   useEffect(() => {
-    if (!canExpand) setExpanded(false);
-  }, [canExpand, line.id]);
+    setExpanded(canExpand && defaultExpanded);
+  }, [canExpand, defaultExpanded, line.id]);
 
   return (
     <div className={`activity-body-wrap ${pre ? "pre" : ""}`}>
@@ -2395,6 +2405,12 @@ function ProjectDetailView(props: {
     .filter((entry) => entry.provider);
   const currentRunningRuns = currentRuns.filter((run) => run.status === "running").length;
   const sourceState = projectSourceState(detail, config.sourcePaths);
+  const openLinkedFinding = (finding: FindingRow) => {
+    props.setFindingStatus("");
+    props.setFindingQuery(`#${finding.id}`);
+    setTab("findings");
+    scrollToProjectSection("project-findings");
+  };
   const openSetupTab = () => {
     setTab("setup");
     window.setTimeout(() => scrollToProjectSection("project-setup-tab"), 0);
@@ -2497,7 +2513,7 @@ function ProjectDetailView(props: {
       return;
     }
     if (phase === "confirm" || phase === "report") {
-      setTab("overview");
+      setTab("decisions");
       scrollToProjectSection("project-real-target-decisions");
       return;
     }
@@ -2594,28 +2610,31 @@ function ProjectDetailView(props: {
           <Stat n={progress.audited} label="audited" onClick={() => setTab("scopes")} />
           <Stat n={candidateStat} label={candidateLabel} onClick={() => { props.setFindingStatus(""); props.setFindingQuery(""); setTab("overview"); scrollToProjectSection("project-top-candidates"); }} />
           <Stat n={displayedVerified} label={runningVerifyProgress ? "checked" : "verified"} good onClick={() => { props.setFindingStatus("execution-confirmed"); props.setFindingQuery(""); setTab("findings"); }} />
-          <Stat n={reproduced} label="reproduced" onClick={() => { setTab("overview"); scrollToProjectSection("project-real-target-decisions"); }} />
-          <Stat n={reportStat} label={reportLabel} onClick={() => { setTab("overview"); scrollToProjectSection("project-real-target-decisions"); }} />
+          <Stat n={reproduced} label="reproduced" onClick={() => { setTab("decisions"); scrollToProjectSection("project-real-target-decisions"); }} />
+          <Stat n={reportStat} label={reportLabel} onClick={() => { setTab("decisions"); scrollToProjectSection("project-real-target-decisions"); }} />
         </div>
-        <RealTargetCallout decisions={confirmDecisions} onOpen={() => { setTab("overview"); scrollToProjectSection("project-real-target-decisions"); }} />
+        <RealTargetCallout decisions={confirmDecisions} onOpen={() => { setTab("decisions"); scrollToProjectSection("project-real-target-decisions"); }} />
         <ProjectSetupDisclosure items={readyItems} />
       </Card>
       <div className="tabs" role="tablist" aria-label="Project sections">
-        {(["overview", "findings", "scopes", "runs", "setup"] as ProjectTab[]).map((t) => (
+        {PROJECT_TABS.map((t) => (
           <button
-            key={t}
+            key={t.id}
             role="tab"
-            aria-selected={tab === t}
-            className={tab === t ? "sel" : ""}
-            title={t === "setup" && setupAttention ? setupAttention.label : undefined}
-            onClick={() => setTab(t)}
+            aria-selected={tab === t.id}
+            className={`${tab === t.id ? "sel" : ""}${t.side === "right" ? " tab-push" : ""}`}
+            title={t.id === "setup" && setupAttention ? setupAttention.label : t.id === "activity" && runningRun ? `${runKindLabel(runningRun.kind, runningRun)} is running` : undefined}
+            onClick={() => setTab(t.id)}
           >
-            <span>{t}</span>
-            {t === "setup" && setupAttention ? <span className={`tab-alert-dot ${setupAttention.tone}`} aria-hidden="true" /> : null}
+            <span>{t.label}</span>
+            {t.id === "decisions" && confirmDecisions.length ? <Counter>{confirmDecisions.length}</Counter> : null}
+            {t.id === "activity" && runningRun ? <span className="tab-alert-dot pending" aria-hidden="true" /> : null}
+            {t.id === "setup" && setupAttention ? <span className={`tab-alert-dot ${setupAttention.tone}`} aria-hidden="true" /> : null}
           </button>
         ))}
       </div>
       {tab === "overview" ? <ProjectOverview detail={currentDetail} candidates={overviewCandidates} verifyCount={pendingVerify} verifyLocked={launchLocked || pendingVerify === 0} onVerifyCandidates={() => props.onLaunch("verify")} onOpenReport={props.onOpenReport} /> : null}
+      {tab === "decisions" ? <ProjectDecisions detail={currentDetail} onOpenFinding={openLinkedFinding} onOpenReport={props.onOpenReport} /> : null}
       {tab === "findings" ? (
         <ProjectFindings
           detail={currentDetail}
@@ -2629,6 +2648,7 @@ function ProjectDetailView(props: {
       ) : null}
       {tab === "scopes" ? <ScopesView detail={currentDetail} onPatchScope={props.onPatchScope} /> : null}
       {tab === "runs" ? <RunsView detail={currentDetail} onStopRun={props.onStopRun} onOpenLog={props.onOpenRunLog} /> : null}
+      {tab === "activity" ? <ProjectActivity detail={currentDetail} /> : null}
       {tab === "setup" ? <ProjectSetupTab detail={detail} /> : null}
     </div>
   );
@@ -2893,9 +2913,32 @@ function ProjectOverview({
           </div>
         </Card>
       </div>
-      <ConfirmDecisionsCard decisions={detail.confirmDecisions} findings={detail.allFindings ?? []} onOpenReport={onOpenReport} />
     </>
   );
+}
+
+function ProjectDecisions({ detail, onOpenFinding, onOpenReport }: { detail: ProjectDetail; onOpenFinding: (finding: FindingRow) => void; onOpenReport: (finding: FindingRow) => void }) {
+  return (
+    <ConfirmDecisionsCard
+      decisions={detail.confirmDecisions}
+      findings={detail.allFindings ?? []}
+      onOpenFinding={onOpenFinding}
+      onOpenReport={onOpenReport}
+    />
+  );
+}
+
+function ProjectActivity({ detail }: { detail: ProjectDetail }) {
+  const currentRuns = currentMaterialRuns(detail.runs, detail.material);
+  const run = currentRuns.find((entry) => entry.status === "running") ?? currentRuns[0];
+  if (!run) {
+    return (
+      <Card title="Live activity">
+        <EmptyInline>No run activity has been recorded for this project.</EmptyInline>
+      </Card>
+    );
+  }
+  return <LiveActivityPanel run={run} defaultExpanded />;
 }
 
 function decisionLabel(decision: ConfirmDecision): string {
@@ -2934,8 +2977,16 @@ function decisionFindings(decision: ConfirmDecision, findings: FindingRow[]): Fi
   return findings.filter((finding) => finding.finding_key && keys.has(finding.finding_key.toLowerCase()));
 }
 
-function ConfirmDecisionsCard({ decisions, findings, onOpenReport }: { decisions: ConfirmDecision[]; findings: FindingRow[]; onOpenReport: (finding: FindingRow) => void }) {
-  if (!decisions.length) return null;
+function ConfirmDecisionsCard({ decisions, findings, onOpenFinding, onOpenReport }: { decisions: ConfirmDecision[]; findings: FindingRow[]; onOpenFinding: (finding: FindingRow) => void; onOpenReport: (finding: FindingRow) => void }) {
+  if (!decisions.length) {
+    return (
+      <div id="project-real-target-decisions" className="section-anchor">
+        <Card title={<span>Real-target decisions <Counter>0</Counter></span>}>
+          <EmptyInline>No real-target decision has been produced yet.</EmptyInline>
+        </Card>
+      </div>
+    );
+  }
   return (
     <div id="project-real-target-decisions" className="section-anchor">
       <Card title={<span>Real-target decisions <Counter>{decisions.length}</Counter></span>}>
@@ -2949,12 +3000,21 @@ function ConfirmDecisionsCard({ decisions, findings, onOpenReport }: { decisions
                     {decisionLabel(decision)}
                   </span>
                   <strong>{decision.bug}</strong>
-                  <small>{recommendationLabel(decision)}{linkedFindings.length > 1 ? ` · ${linkedFindings.length} linked findings` : ""}</small>
+                  <small>{recommendationLabel(decision)}</small>
+                  {linkedFindings.length ? (
+                    <div className="linked-findings" aria-label="Linked findings">
+                      {linkedFindings.map((finding) => (
+                        <button key={finding.id} type="button" className="table-link" onClick={() => onOpenFinding(finding)}>
+                          Finding #{finding.id}
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
                 </div>
                 <div className="decision-actions">
                   {linkedFindings.length ? (
                     linkedFindings.map((finding) => (
-                      <Button key={finding.id} size="sm" icon="file" title={finding.title ?? "Open finding report"} onClick={() => onOpenReport(finding)}>
+                      <Button key={finding.id} size="sm" icon="file" title={finding.title ?? "Open report"} onClick={() => onOpenReport(finding)}>
                         Report #{finding.id}
                       </Button>
                     ))
@@ -3255,33 +3315,46 @@ function overviewRunDetail(run: RunRow, decisions: ConfirmDecision[]): string {
   return pieces.filter(Boolean).join(" · ");
 }
 
-function LiveActivityPanel({ run }: { run: RunRow }) {
+function LiveActivityPanel({ run, defaultExpanded = false }: { run: RunRow; defaultExpanded?: boolean }) {
   const [lines, setLines] = useState<ActivityLine[]>([]);
   const [connected, setConnected] = useState(false);
   const [failed, setFailed] = useState(false);
   const activityScroll = usePinnedScroll(lines, run.id);
   useEffect(() => {
+    let cancelled = false;
     setLines([]);
     setFailed(false);
     setConnected(false);
+    void api.runLog(run.id, 120)
+      .then((res) => {
+        if (!cancelled) setLines((res.events ?? []).reduce((current, event) => appendActivityLine(current, event), [] as ActivityLine[]));
+      })
+      .catch(() => {
+        // The EventSource below still owns the live connection state.
+      });
     const source = new EventSource(`/api/runs/${run.id}/log`);
     source.onopen = () => {
+      if (cancelled) return;
       setConnected(true);
       setFailed(false);
     };
     source.onmessage = (message) => {
       try {
         const event = JSON.parse(message.data) as ActivityRecord;
-        setLines((current) => appendActivityLine(current, event));
+        if (!cancelled) setLines((current) => appendActivityLine(current, event));
       } catch {
         // Ignore malformed frames; the status polling still owns run state.
       }
     };
     source.onerror = () => {
+      if (cancelled) return;
       setConnected(false);
       setFailed(true);
     };
-    return () => source.close();
+    return () => {
+      cancelled = true;
+      source.close();
+    };
   }, [run.id]);
   return (
     <Card>
@@ -3311,7 +3384,7 @@ function LiveActivityPanel({ run }: { run: RunRow }) {
                         <time dateTime={new Date(line.time).toISOString()}>{formatActivityTime(line.time)}</time>
                       </span>
                     </span>
-                    <ActivityBody line={line} />
+                    <ActivityBody line={line} defaultExpanded={defaultExpanded} />
                   </div>
                 </div>
               ))}
@@ -3432,7 +3505,8 @@ function ProjectFindings(props: {
     },
   ];
   return (
-    <Card title={<span>Findings <Counter>{total}</Counter></span>}>
+    <div id="project-findings" className="section-anchor">
+      <Card title={<span>Findings <Counter>{total}</Counter></span>}>
       <div className="finding-journey" aria-label="Finding workflow summary">
         {journey.map((item) => (
           <div key={item.label} className={item.count > 0 ? "needs-work" : ""}>
@@ -3469,7 +3543,8 @@ function ProjectFindings(props: {
           onTracking={props.onTracking}
         />
       )}
-    </Card>
+      </Card>
+    </div>
   );
 }
 

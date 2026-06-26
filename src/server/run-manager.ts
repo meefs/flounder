@@ -65,6 +65,7 @@ export interface LaunchSpec {
   inputRunDir?: string | undefined; // confirm: the finished run dir to reproduce
   inputRunDirs?: string[] | undefined; // confirm (aggregate): several run dirs whose confirmed findings are unioned + reproduced together
   confirmKeys?: string[] | undefined; // confirm: restrict the work list to these finding content keys (project defaults pass the full current confirmed-finding context)
+  confirmSettledRows?: ConfirmSettledRow[] | undefined; // confirm: prior reproduced/not-reproduced decisions to carry forward across batches
   reportFindings?: ReportFindingSpec[] | undefined; // report: confirmed/reproduced bugs to package as formal Markdown reports
   pipeline?: boolean | undefined; // run: project/CLI clue pipeline (prepare if needed -> map/dig -> verify -> confirm -> report)
   verifyFromStart?: boolean | undefined; // pipeline: re-run Verify from the beginning instead of only pending candidates
@@ -88,6 +89,19 @@ export interface LaunchSpec {
   sandboxMemoryMb?: number | undefined;
   sandboxCpus?: number | undefined;
   out?: string | undefined;
+}
+
+export interface ConfirmSettledRow {
+  bug: string;
+  members: string[];
+  distinctFix: string;
+  reproduced: "yes" | "no" | "could-not-set-up" | "unknown";
+  reproEvidence: string;
+  corroboration: string;
+  novelty: string;
+  humanGates: string;
+  recommendation: "submit-candidate" | "needs-human" | "drop" | "unknown";
+  reproCommandId?: string;
 }
 
 export interface ReportFindingSpec {
