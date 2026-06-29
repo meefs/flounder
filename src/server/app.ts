@@ -934,7 +934,12 @@ function activePrepareRefreshStartedAt(store: MetadataStore, project: Record<str
   const job = (jobs ?? store.runningJobs()).find((entry) => {
     if (stringValue(entry.project) !== projectName) return false;
     const spec = safeParse(entry.spec_json) as { verb?: unknown } | null;
-    return spec?.verb === "prepare";
+    if (spec?.verb === "prepare") return true;
+    if (spec?.verb !== "run") return false;
+    const runId = Number(entry.run_id);
+    if (!Number.isFinite(runId)) return Boolean((spec as { pipeline?: unknown; clue?: unknown; sourcePaths?: unknown }).pipeline && stringValue((spec as { clue?: unknown }).clue));
+    const run = store.getRun(runId);
+    return stringValue(run?.kind) === "prepare" && stringValue(run?.status) === "running";
   });
   const startedAt = stringValue(job?.created_at);
   if (!startedAt) return undefined;
@@ -1128,13 +1133,20 @@ function materialStaleness(run: Record<string, unknown>, boundary?: Record<strin
 }
 
 function materialSummary(runs: Array<Record<string, unknown>>, boundary?: Record<string, unknown>, activePrepareRefreshStartedAt?: string): Record<string, unknown> {
-  if (!boundary) return { currentPrepareRunId: null, staleRunCount: 0, activePrepareRefreshStartedAt };
+  const activePrepareFields = activePrepareRefreshStartedAt
+    ? {
+      currentPrepareStatus: "running",
+      currentPrepareStartedAt: activePrepareRefreshStartedAt,
+      activePrepareRefreshStartedAt,
+    }
+    : {};
+  if (!boundary) return { currentPrepareRunId: null, staleRunCount: 0, ...activePrepareFields };
   const scopeBoundary = latestScopeInventoryBoundaryRun(currentVisibleRuns(runs, boundary, activePrepareRefreshStartedAt));
   const staleRunCount = runs.filter((run) => !isCurrentMaterialRun(run, boundary)).length;
   return {
     currentPrepareRunId: boundary.id,
-    currentPrepareStatus: boundary.status,
-    currentPrepareStartedAt: boundary.started_at,
+    currentPrepareStatus: activePrepareRefreshStartedAt ? "running" : boundary.status,
+    currentPrepareStartedAt: activePrepareRefreshStartedAt ?? boundary.started_at,
     ...(scopeBoundary ? {
       currentScopeInventoryRunId: scopeBoundary.id,
       currentScopeInventoryStatus: scopeBoundary.status,

@@ -1069,6 +1069,43 @@ test("api: running prepare resets the project current view to the new material s
   });
 });
 
+test("api: running pipeline prepare resets stale scope checkpoints from the current view", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const created = await json(await post("/api/projects", { name: "pipeline-prepare-refresh", sourcePaths: ["./src"] }));
+    const staleRunDir = path.join(out, "pipeline-prepare-refresh-stale-run");
+    await mkdir(path.join(staleRunDir, "audit", "workspace"), { recursive: true });
+    await writeFile(
+      path.join(staleRunDir, "audit", "workspace", "scopes.json"),
+      JSON.stringify([
+        { id: "OLD-1", title: "Old scope", region: "src/Old.sol:1-10", status: "pending", score: 100 },
+      ]),
+    );
+
+    const store = MetadataStore.openForOutput(out);
+    try {
+      const staleRun = store.startRun({ projectId: created.id, kind: "run", runDir: staleRunDir });
+      store.finishRun(staleRun, "killed");
+      const jobId = store.enqueueJob(created.name, { verb: "run", pipeline: true, clue: "fresh target", sourcePaths: [] });
+      const prepareRun = store.startRun({ projectId: created.id, kind: "prepare", runDir: path.join(out, "pipeline-prepare-refresh-prepare") });
+      store.setJobRun(jobId, prepareRun);
+    } finally {
+      store.close();
+    }
+
+    const detail = await json(await fetch(base + `/api/projects/${created.uuid}`));
+    assert.deepEqual(detail.progress, { total: 0, audited: 0, deferred: 0, pending: 0 });
+    assert.equal(detail.material.activePrepareRefreshStartedAt.length > 0, true);
+    assert.equal(detail.runs.find((run) => !run.material_stale)?.kind, "prepare");
+
+    const list = await json(await fetch(base + "/api/projects"));
+    const snapshot = list.projects.find((project) => project.uuid === created.uuid);
+    assert.deepEqual(snapshot.progress, { total: 0, audited: 0, deferred: 0, pending: 0 });
+    assert.equal(snapshot.latestRun.kind, "prepare");
+  });
+});
+
 test("api: remap resets downstream findings and decisions from the current view", async () => {
   await withServer(async (base, out) => {
     const json = (r) => r.json();
