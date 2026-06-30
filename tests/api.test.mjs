@@ -2814,21 +2814,27 @@ test("api: project scopes endpoint paginates large inventories", async () => {
     const created = await json(await post("/api/projects", { name: "scope-pages", sourcePaths: ["./src"] }));
     const store = MetadataStore.openForOutput(out);
     try {
-      store.upsertScopes(created.id, [
-        { scopeId: "scope-a", title: "A", status: "pending", score: 10 },
-        { scopeId: "scope-b", title: "B", status: "pending", score: 9 },
-        { scopeId: "scope-c", title: "C", status: "pending", score: 8 },
-      ]);
+      store.upsertScopes(created.id, Array.from({ length: 120 }, (_, index) => ({
+        scopeId: `scope-${String(index + 1).padStart(3, "0")}`,
+        title: `Scope ${index + 1}`,
+        status: "pending",
+        score: 120 - index,
+      })));
     } finally {
       store.close();
     }
 
     const page = await json(await fetch(base + `/api/projects/${created.uuid}/scopes?limit=2&offset=1`));
-    assert.equal(page.total, 3);
+    assert.equal(page.total, 120);
     assert.equal(page.limit, 2);
     assert.equal(page.offset, 1);
-    assert.deepEqual(page.scopes.map((scope) => scope.scope_id), ["scope-b", "scope-c"]);
-    assert.equal(page.progress.total, 3);
+    assert.deepEqual(page.scopes.map((scope) => scope.scope_id), ["scope-002", "scope-003"]);
+    assert.equal(page.progress.total, 120);
+
+    const thirdPage = await json(await fetch(base + `/api/projects/${created.uuid}/scopes?limit=50&offset=100`));
+    assert.equal(thirdPage.total, 120);
+    assert.equal(thirdPage.scopes.length, 20);
+    assert.deepEqual(thirdPage.scopes.map((scope) => scope.scope_id).slice(0, 2), ["scope-101", "scope-102"]);
   });
 });
 

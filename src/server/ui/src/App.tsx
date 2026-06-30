@@ -4122,6 +4122,18 @@ function ScopesView({ detail, onPatchScope }: { detail: ProjectDetail; onPatchSc
             onPageSize={setPageSize}
           />
         </>
+      ) : total > 0 ? (
+        <>
+          <EmptyInline>No scopes on this page. Use pagination to return to a populated page.</EmptyInline>
+          <PaginationControls
+            total={total}
+            page={safePage}
+            pageSize={pageSize}
+            label="scope"
+            onPage={setPage}
+            onPageSize={setPageSize}
+          />
+        </>
       ) : (
         <EmptyInline>No scopes mapped yet. Run the pipeline or Map scopes to create the scope inventory before digging.</EmptyInline>
       )}

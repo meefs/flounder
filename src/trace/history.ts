@@ -6,6 +6,28 @@ import { publicPath } from "../util/paths.js";
 
 const HISTORY_VERSION = 1;
 const DEFAULT_HISTORY_DIR_NAME = "history";
+const MAX_RUN_ARTIFACT_MATERIALS = 2_000;
+const RUN_ARTIFACT_RECURSE_DIRS = new Set(["calls", "reproduction", "reproductions"]);
+const RUN_ARTIFACT_SKIP_DIRS = new Set([
+  ".git",
+  ".next",
+  ".turbo",
+  "artifacts",
+  "audit",
+  "build",
+  "cache",
+  "confirm",
+  "coverage",
+  "dist",
+  "external",
+  "lib",
+  "node_modules",
+  "out",
+  "sources",
+  "target",
+  "tmp",
+  "workspace",
+]);
 
 export interface ProjectHistoryRun {
   runId: string;
@@ -361,7 +383,7 @@ async function materialIndexForRun(input: {
     ...input.sourcePaths.map((sourcePath) => configuredMaterial(input.runId, "source-path", sourcePath, "configured-source")),
     ...input.corpusPaths.map((corpusPath) => configuredMaterial(input.runId, "corpus-path", corpusPath, "configured-corpus")),
   ];
-  const artifactFiles = await listFiles(input.runDir);
+  const artifactFiles = await listRunArtifactMaterials(input.runDir);
   const artifacts = await Promise.all(
     artifactFiles.map(async (file) => {
       const relativeRunPath = toPosix(path.relative(input.runDir, file));
@@ -397,18 +419,30 @@ function configuredMaterial(
   };
 }
 
-async function listFiles(root: string): Promise<string[]> {
-  const entries = await readdir(root, { withFileTypes: true });
+async function listRunArtifactMaterials(root: string): Promise<string[]> {
   const out: string[] = [];
-  for (const entry of entries) {
-    const absolute = path.join(root, entry.name);
-    if (entry.isDirectory()) {
-      out.push(...(await listFiles(absolute)));
-    } else if (entry.isFile()) {
-      out.push(absolute);
+  const pending = [root];
+  while (pending.length > 0 && out.length < MAX_RUN_ARTIFACT_MATERIALS) {
+    const dir = pending.pop() as string;
+    const entries = (await readdir(dir, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      const absolute = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (shouldDescendRunArtifactDir(root, absolute, entry.name)) pending.push(absolute);
+      } else if (entry.isFile()) {
+        out.push(absolute);
+        if (out.length >= MAX_RUN_ARTIFACT_MATERIALS) break;
+      }
     }
   }
-  return out;
+  return out.sort((a, b) => a.localeCompare(b));
+}
+
+function shouldDescendRunArtifactDir(root: string, absoluteDir: string, dirname: string): boolean {
+  if (RUN_ARTIFACT_SKIP_DIRS.has(dirname)) return false;
+  const relative = toPosix(path.relative(root, absoluteDir));
+  const topLevel = relative.split("/")[0] ?? "";
+  return RUN_ARTIFACT_RECURSE_DIRS.has(topLevel);
 }
 
 function materialKind(relativeRunPath: string): ProjectHistoryMaterialKind {

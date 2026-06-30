@@ -1086,7 +1086,7 @@ function currentScopeView(
     const total = store.countScopes(projectId);
     if (allowDbFallback && total > 0) {
       return {
-        scopes: store.queryScopes(projectId, { limit: 50, offset: 0 }),
+        scopes: store.listScopes(projectId),
         progress: store.scopeProgress(projectId),
         total,
         hasInventory: true,
@@ -1106,7 +1106,7 @@ function currentScopeView(
   }
 
   return {
-    scopes: store.queryScopes(projectId, { limit: 50, offset: 0 }),
+    scopes: store.listScopes(projectId),
     progress: store.scopeProgress(projectId),
     total: store.countScopes(projectId),
     hasInventory: true,
