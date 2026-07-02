@@ -1044,6 +1044,10 @@ function confirmSettledRows(rows: Array<Record<string, unknown>>): ConfirmSettle
       humanGates: stringValue(row.human_gates),
       recommendation,
     };
+    const engagementProfile = safeParse(row.engagement_profile_json);
+    if (engagementProfile) out.engagementProfile = engagementProfile;
+    const adjudication = safeParse(row.adjudication_json);
+    if (adjudication) out.adjudication = adjudication;
     const reproCommandId = stringValue(row.repro_command_id);
     if (reproCommandId) out.reproCommandId = reproCommandId;
     return out;
@@ -2674,6 +2678,10 @@ function rowHasFormalReport(row: Record<string, unknown>): boolean {
 function confirmDecisionDisplayRow(row: Record<string, unknown>): Record<string, unknown> {
   const out = { ...row };
   delete out.report_markdown;
+  const engagementProfile = safeParse(row.engagement_profile_json);
+  if (engagementProfile) out.engagement_profile = engagementProfile;
+  const adjudication = safeParse(row.adjudication_json);
+  if (adjudication) out.adjudication = adjudication;
   out.has_report = decisionHasFormalReport(row);
   return out;
 }
@@ -2802,6 +2810,8 @@ function renderDecisionReportMarkdown(decision: Record<string, unknown>, linkedF
   const corroboration = stringValue(decision.corroboration);
   const novelty = stringValue(decision.novelty);
   const humanGates = stringValue(decision.human_gates);
+  const engagementProfile = safeParse(decision.engagement_profile_json);
+  const adjudication = safeParse(decision.adjudication_json);
   const locations = uniqueTextValues(linkedFindings, "location");
   const descriptions = uniqueTextValues(linkedFindings, "description", 4);
   const sourceEvidence = uniqueTextValues(linkedFindings, "evidence", 4);
@@ -2830,6 +2840,11 @@ function renderDecisionReportMarkdown(decision: Record<string, unknown>, linkedF
     confidence ? `Submission confidence: ${confidence}` : "",
     evidenceLevel ? `Evidence basis: ${evidenceLevel}` : "",
   ]);
+  const engagementNotes = [
+    engagementProfile ? `Engagement profile: ${jsonOneLine(engagementProfile)}` : "",
+    adjudication ? `Eligibility / payout adjudication: ${jsonOneLine(adjudication)}` : "",
+  ].filter(Boolean);
+  if (engagementNotes.length > 0) pushReportBullets(lines, "Engagement and Eligibility", engagementNotes);
   pushReportBullets(lines, "Affected Component", locations.map((entry) => `\`${entry}\``));
   pushReportSection(lines, "Root Cause", descriptions.join("\n\n"));
   pushReportSection(lines, "Attack Scenario", exploitSketches.join("\n\n"));
@@ -2845,13 +2860,23 @@ function renderDecisionReportMarkdown(decision: Record<string, unknown>, linkedF
     commandId ? `Re-run the local reproduction represented by \`${commandId}\` or an equivalent maintainer-owned local test after applying the fix.` : "Re-run an equivalent maintainer-owned local reproduction after applying the fix.",
   ].join("\n"));
   if (sourceEvidence.length > 0) pushReportSection(lines, "Source-Level Technical Detail", sourceEvidence.join("\n\n"));
-  if (corroboration || novelty || humanGates) {
+  if (corroboration || novelty || humanGates || engagementNotes.length > 0) {
     lines.push("## Novelty and Disclosure Notes", "");
     if (corroboration) lines.push(`- Corroboration: ${corroboration}`);
     if (novelty) lines.push(`- Novelty: ${novelty}`);
     if (humanGates) lines.push(`- Human gates: ${humanGates}`);
+    if (engagementProfile) lines.push(`- Engagement profile: ${jsonOneLine(engagementProfile)}`);
+    if (adjudication) lines.push(`- Eligibility / payout adjudication: ${jsonOneLine(adjudication)}`);
   }
   return lines.join("\n").trim();
+}
+
+function jsonOneLine(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }
 
 function cleanFindingTitle(value: unknown): unknown {

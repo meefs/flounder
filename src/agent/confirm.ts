@@ -37,6 +37,8 @@ interface ConfirmProvenance {
   frozenFiles: Array<{ path: string; sha256: string; bytes: number }>;
 }
 
+type ConfirmStructuredValue = Record<string, unknown> | unknown[];
+
 export async function runConfirm(
   cfg: AuditorConfig,
   options: { inputRunDir: string; inputRunDirs?: string[]; confirmKeys?: string[]; settledDecisions?: ConfirmDecisionRow[]; maxSteps?: number; fresh?: boolean; streamEvents?: boolean; signal?: AbortSignal; onRun?: (runId: number) => void; onActivity?: (event: { kind: string; delta?: string; tool?: string; step?: number }) => void; makeTracker?: RunTrackerFactory },
@@ -275,6 +277,8 @@ export async function runConfirm(
       corroboration: row.corroboration,
       novelty: row.novelty,
       humanGates: row.humanGates,
+      engagementProfile: row.engagementProfile,
+      adjudication: row.adjudication,
       mergedFrom: row.mergedFrom,
       reproCommandId: row.reproCommandId,
     })),
@@ -403,6 +407,8 @@ function toLiveConfirmRows(raw: unknown[]): Array<{
   corroboration?: string;
   novelty?: string;
   humanGates?: string;
+  engagementProfile?: unknown;
+  adjudication?: unknown;
   reproCommandId?: string;
 }> {
   const rows: Array<{
@@ -415,6 +421,8 @@ function toLiveConfirmRows(raw: unknown[]): Array<{
     corroboration?: string;
     novelty?: string;
     humanGates?: string;
+    engagementProfile?: unknown;
+    adjudication?: unknown;
     reproCommandId?: string;
   }> = [];
   for (const entry of raw) {
@@ -431,6 +439,8 @@ function toLiveConfirmRows(raw: unknown[]): Array<{
       corroboration?: string;
       novelty?: string;
       humanGates?: string;
+      engagementProfile?: unknown;
+      adjudication?: unknown;
       reproCommandId?: string;
     } = { bug: obj.bug };
     if (typeof obj.reproduced === "string") row.reproduced = obj.reproduced;
@@ -444,6 +454,10 @@ function toLiveConfirmRows(raw: unknown[]): Array<{
     if (typeof obj.novelty === "string") row.novelty = obj.novelty;
     if (typeof obj.human_gates === "string") row.humanGates = obj.human_gates;
     else if (typeof obj.humanGates === "string") row.humanGates = obj.humanGates;
+    const engagementProfile = normalizeStructuredValue(obj.engagement_profile ?? obj.engagementProfile);
+    if (engagementProfile) row.engagementProfile = engagementProfile;
+    const adjudication = normalizeStructuredValue(obj.adjudication);
+    if (adjudication) row.adjudication = adjudication;
     if (typeof obj.repro_command_id === "string") row.reproCommandId = obj.repro_command_id;
     else if (typeof obj.reproCommandId === "string") row.reproCommandId = obj.reproCommandId;
     rows.push(row);
@@ -462,6 +476,8 @@ export interface ConfirmDecisionRow {
   corroboration: string;
   novelty: string;
   humanGates: string;
+  engagementProfile?: unknown;
+  adjudication?: unknown;
   recommendation: "submit-candidate" | "needs-human" | "drop" | "unknown";
   // Structured fields the fix-equivalence matrix needs (present when the row's PoC is a
   // source-level test with a declared fix). Not rendered; consumed by consolidation.
@@ -522,6 +538,8 @@ function normalizeDecisionRow(raw: Record<string, unknown>): ConfirmDecisionRow 
   const reproCommandId = str(raw.repro_command_id) || str(raw.reproCommandId);
   const fixPatch = parseFixPatch(raw.fix_patch ?? raw.fixPatch);
   const patched = asStringList(raw.patched_success_patterns ?? raw.patchedSuccessPatterns);
+  const engagementProfile = normalizeStructuredValue(raw.engagement_profile ?? raw.engagementProfile);
+  const adjudication = normalizeStructuredValue(raw.adjudication);
   return {
     bug: str(raw.bug) || str(raw.title) || "(unnamed)",
     members,
@@ -531,6 +549,8 @@ function normalizeDecisionRow(raw: Record<string, unknown>): ConfirmDecisionRow 
     corroboration: str(raw.corroboration),
     novelty: str(raw.novelty),
     humanGates: str(raw.human_gates) || str(raw.humanGates),
+    ...(engagementProfile ? { engagementProfile } : {}),
+    ...(adjudication ? { adjudication } : {}),
     recommendation,
     ...(reproCommandId ? { reproCommandId } : {}),
     ...(fixPatch ? { fixPatch } : {}),
@@ -552,6 +572,35 @@ function asStringList(value: unknown): string[] {
   if (typeof value === "string") return value.trim() ? [value.trim()] : [];
   if (!Array.isArray(value)) return [];
   return value.map((entry) => (typeof entry === "string" ? entry.trim() : "")).filter(Boolean).slice(0, 16);
+}
+
+function normalizeStructuredValue(value: unknown): ConfirmStructuredValue | undefined {
+  let raw = value;
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed || (!trimmed.startsWith("{") && !trimmed.startsWith("["))) return undefined;
+    try {
+      raw = JSON.parse(trimmed);
+    } catch {
+      return undefined;
+    }
+  }
+  const normalized = sanitizeJsonValue(raw);
+  return normalized && typeof normalized === "object" ? (normalized as ConfirmStructuredValue) : undefined;
+}
+
+function sanitizeJsonValue(value: unknown, depth = 0): unknown {
+  if (value === undefined) return undefined;
+  if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
+  if (depth > 8) return String(value);
+  if (Array.isArray(value)) return value.map((entry) => sanitizeJsonValue(entry, depth + 1)).filter((entry) => entry !== undefined);
+  if (typeof value !== "object") return String(value);
+  const out: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    const normalized = sanitizeJsonValue(entry, depth + 1);
+    if (normalized !== undefined) out[key] = normalized;
+  }
+  return out;
 }
 
 // Find the latest prior confirm run of THIS input run (same output dir + target, matched
@@ -620,6 +669,8 @@ function mergeRows(members: ConfirmDecisionRow[]): ConfirmDecisionRow {
   const reproRank: Record<ConfirmDecisionRow["reproduced"], number> = { yes: 3, "could-not-set-up": 2, no: 1, unknown: 0 };
   const recRank: Record<ConfirmDecisionRow["recommendation"], number> = { "submit-candidate": 3, "needs-human": 2, drop: 1, unknown: 0 };
   const strongest = <T extends string>(values: T[], rank: Record<T, number>, fallback: T): T => values.reduce((best, value) => (rank[value] > rank[best] ? value : best), fallback);
+  const engagementProfile = members.map((m) => m.engagementProfile).find(Boolean);
+  const adjudication = members.map((m) => m.adjudication).find(Boolean);
   return {
     bug: members.map((m) => m.bug).join(" / "),
     members: uniq(members.flatMap((m) => [...m.members, m.bug])),
@@ -629,6 +680,8 @@ function mergeRows(members: ConfirmDecisionRow[]): ConfirmDecisionRow {
     corroboration: uniq(members.map((m) => m.corroboration)).join(" | "),
     novelty: uniq(members.map((m) => m.novelty)).join(" | "),
     humanGates: uniq(members.map((m) => m.humanGates)).join(" | "),
+    ...(engagementProfile ? { engagementProfile } : {}),
+    ...(adjudication ? { adjudication } : {}),
     recommendation: strongest(members.map((m) => m.recommendation), recRank, "unknown"),
     mergedFrom: members.map((m) => m.bug),
   };
@@ -675,9 +728,19 @@ function renderConfirmReport(input: {
     if (row.corroboration) out.push(`- Corroboration (web — a lead, not proof): ${row.corroboration}`);
     if (row.novelty) out.push(`- Novelty: ${row.novelty}`);
     if (row.humanGates) out.push(`- Human gates (not settled by execution): ${row.humanGates}`);
+    if (row.engagementProfile) out.push(`- Engagement profile: ${formatStructuredSummary(row.engagementProfile)}`);
+    if (row.adjudication) out.push(`- Eligibility / payout adjudication: ${formatStructuredSummary(row.adjudication)}`);
     out.push("");
   }
   return out.join("\n");
+}
+
+function formatStructuredSummary(value: unknown): string {
+  try {
+    return `\`${JSON.stringify(value)}\``;
+  } catch {
+    return String(value);
+  }
 }
 
 function historyLocation(cfg: AuditorConfig): { outputDir: string; targetName: string; historyDir?: string } {
