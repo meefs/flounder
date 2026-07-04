@@ -89,7 +89,12 @@ export function analyzeAgentBashCommandSafety(command: StructuredReproductionCom
   const workspaceDecision = analyzeWorkspacePathSafety(args);
   if (workspaceDecision.blocked) return workspaceDecision;
 
-  if (isAllowedLocalTestCommand(program, args) || isAllowedLocalInspectionCommand(program, args) || isAllowedBuildCommand(program, args)) {
+  if (
+    isAllowedLocalTestCommand(program, args) ||
+    isAllowedLocalInspectionCommand(program, args) ||
+    isAllowedBuildCommand(program, args) ||
+    isAllowedWorkspaceSetupCommand(program, args)
+  ) {
     return { blocked: false };
   }
 
@@ -399,6 +404,28 @@ function isAllowedBuildCommand(program: string, args: string[]): boolean {
   if (name === "func-js" || name === "tolk-js" || name === "tact") return args.length > 0 && !isToolInfoArgs(args);
   if (name === "npx") return (first === "hardhat" && second === "compile") || (first === "blueprint" && second === "build");
   return false;
+}
+
+function isAllowedWorkspaceSetupCommand(program: string, args: string[]): boolean {
+  if (program.toLowerCase() !== "mkdir") return false;
+  const paths: string[] = [];
+  for (const arg of args) {
+    const lower = arg.toLowerCase();
+    if (lower === "-p" || lower === "--parents") continue;
+    if (arg.startsWith("-")) return false;
+    paths.push(arg);
+  }
+  return paths.length > 0 && paths.every(isModelOwnedWorkspaceDirectory);
+}
+
+function isModelOwnedWorkspaceDirectory(arg: string): boolean {
+  if (arg.length === 0) return false;
+  if (arg.startsWith("/") || looksLikePathEscape(arg)) return false;
+  const normalized = arg.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/\/$/, "");
+  const segments = normalized.split("/").filter(Boolean);
+  if (segments.length === 0) return false;
+  const tokens = segments.flatMap((segment) => segment.toLowerCase().split(/[._-]+/).filter(Boolean));
+  return tokens.some((token) => ["poc", "repro", "harness", "scratch", "verify", "verification", "flounder"].includes(token));
 }
 
 function cargoSubcommand(args: string[]): string | undefined {

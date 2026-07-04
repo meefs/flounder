@@ -91,6 +91,23 @@ test("arbitrary non-build, non-test, non-inspection commands stay blocked", () =
   assert.equal(analyzeAgentBashCommandSafety(cmd("python3", "-c", "print('unchecked script')")).blocked, true);
 });
 
+test("agent bash allows creating model-owned PoC harness directories only", () => {
+  for (const c of [
+    cmd("mkdir", "-p", "poc/src"),
+    cmd("mkdir", "--parents", "tests/verify_poc/src"),
+    cmd("mkdir", "-p", ".tmp/flounder-repro/src"),
+    cmd("mkdir", "-p", "scratch/harness"),
+  ]) {
+    assert.equal(analyzeAgentBashCommandSafety(c).blocked, false, `${c.program} ${c.args.join(" ")} should be allowed`);
+    assert.equal(isAgentBuildCommand(c), false);
+    assert.equal(isAgentConfirmCommand(c), false);
+  }
+
+  assert.equal(analyzeAgentBashCommandSafety(cmd("mkdir", "src")).blocked, true);
+  assert.equal(analyzeAgentBashCommandSafety(cmd("mkdir", "-p", "../poc")).blocked, true);
+  assert.equal(analyzeAgentBashCommandSafety(cmd("mkdir", "-m", "777", "poc/src")).blocked, true);
+});
+
 test("destructive filesystem commands stay blocked even in network-enabled confirm mode", () => {
   for (const c of [
     cmd("rm", "-rf", "sources/reserve-protocol-protocol/sources"),
