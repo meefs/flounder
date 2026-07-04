@@ -2102,7 +2102,7 @@ async function runLaunch(c: Ctx): Promise<void> {
   const currentResultRunIds = runIdSet(currentResultRuns(currentRuns, scopeBoundary));
   const scopeView = currentScopeView(c.store, projectId, currentRuns, undefined, scopeBoundary, !materialBoundary);
   const progress = scopeView.hasInventory ? scopeView.progress : emptyProgress();
-  const spec = launchSpec(project, body, c.out, profile, progress, phaseProfiles);
+  const spec = launchSpec(c.store, project, body, c.out, profile, progress, phaseProfiles);
   if (spec.verb === "run") {
     if (spec.sourcePaths.length > 0) {
       applyProjectSourceDefaults(spec, project);
@@ -3831,7 +3831,7 @@ function verifyWorklist(store: MetadataStore, projectId: number, currentResultRu
       if (!fromStart || row.confirm_status != null) return false;
       return status === "confirmed-executable" || status === "confirmed-differential";
     })
-    .map((row) => normalizeProjectVerifyFindings(findingDetailRow(row)));
+    .map((row) => normalizeProjectVerifyFindings(store, projectId, findingDetailRow(row)));
 }
 
 async function daemonJobStatus(c: Ctx): Promise<void> {
@@ -4193,7 +4193,7 @@ function phaseProviderProfiles(project: Record<string, unknown>, store: Metadata
   return out;
 }
 
-function launchSpec(project: Record<string, unknown>, body: Record<string, unknown>, out: string, profile?: ProviderProfile, progress?: Coverage, phaseProfiles: PhaseProfiles = {}): LaunchSpec {
+function launchSpec(store: MetadataStore, project: Record<string, unknown>, body: Record<string, unknown>, out: string, profile?: ProviderProfile, progress?: Coverage, phaseProfiles: PhaseProfiles = {}): LaunchSpec {
   const cfg = (safeParse(project.config_json) as Record<string, unknown>) ?? {};
   const overrides = (body.overrides as Record<string, unknown>) ?? {};
   const configOverrides = (overrides.config as Record<string, unknown>) ?? {};
@@ -4279,7 +4279,7 @@ function launchSpec(project: Record<string, unknown>, body: Record<string, unkno
     region: str(body.region),
     scope: str(body.scope),
     scopeNote: str(merged.scopeNote), // a project may store a default focus note in its config
-    ...(body.verifyFindings !== undefined ? { verifyFindings: normalizeProjectVerifyFindings(body.verifyFindings) } : {}),
+    ...(body.verifyFindings !== undefined ? { verifyFindings: normalizeProjectVerifyFindings(store, Number(project.id), body.verifyFindings) } : {}),
     inputRunDir: str(body.inputRunDir),
     clue: str(body.clue),
     posture: str(body.posture),
@@ -4289,12 +4289,16 @@ function launchSpec(project: Record<string, unknown>, body: Record<string, unkno
   };
 }
 
-function normalizeProjectVerifyFindings(input: unknown): unknown {
-  if (Array.isArray(input)) return input.map(normalizeProjectVerifyFindings);
+function normalizeProjectVerifyFindings(store: MetadataStore, projectId: number, input: unknown): unknown {
+  if (Array.isArray(input)) return input.map((item) => normalizeProjectVerifyFindings(store, projectId, item));
   if (!input || typeof input !== "object") return input;
   const row = input as Record<string, unknown>;
   if (typeof row.originId === "number" || typeof row.origin_id === "number") return input;
   if (typeof row.id !== "number" || !Number.isFinite(row.id)) return input;
+  const finding = store.getFinding(row.id);
+  if (finding && Number(finding.project_id) === projectId) {
+    return { ...findingDetailRow(finding), ...row, originId: row.id };
+  }
   return { ...row, originId: row.id };
 }
 

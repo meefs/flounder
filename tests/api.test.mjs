@@ -836,6 +836,17 @@ test("api: verify launch links project finding rows back to the original finding
     assert.equal(spec.verb, "audit");
     assert.equal(spec.verifyFindings[0].id, finding.id);
     assert.equal(spec.verifyFindings[0].originId, finding.id);
+
+    const launchedById = await json(await post(`/api/projects/${created.uuid}/runs`, {
+      verb: "audit",
+      verifyFindings: [{ id: finding.id }],
+    }));
+    const idJob = (await json(await fetch(base + "/api/jobs/" + launchedById.jobId))).job;
+    const idSpec = JSON.parse(idJob.spec_json);
+    assert.equal(idSpec.verifyFindings[0].id, finding.id);
+    assert.equal(idSpec.verifyFindings[0].originId, finding.id);
+    assert.equal(idSpec.verifyFindings[0].title, "Proof input is not bound");
+    assert.equal(idSpec.verifyFindings[0].location, "src/Rollup.sol:44");
   });
 });
 
@@ -882,6 +893,8 @@ test("api: verify launch rejects findings produced before a newer prepare run", 
     const job = (await json(await fetch(base + "/api/jobs/" + launched.jobId))).job;
     const spec = JSON.parse(job.spec_json);
     assert.equal(spec.verifyFindings[0].originId, findingId);
+    assert.equal(spec.verifyFindings[0].finding_key, "stale-suspected-bug");
+    assert.equal(spec.verifyFindings[0].title, "Stale proof input is not bound");
   });
 });
 
