@@ -13,7 +13,7 @@
 // unless a per-daemon bearer token is configured.
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, readdirSync, statSync } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -36,6 +36,7 @@ const PROJECT_STREAM_LIMIT = 100;
 const DAEMON_JOB_HEARTBEAT_TTL_MS = 45_000;
 const DAEMON_OFFLINE_RECONCILE_GRACE_MS = DAEMON_JOB_HEARTBEAT_TTL_MS * 2;
 const PROJECT_STATUS_FILTERS = ["running", "needs-work", "done", "failed", "not-started"] as const;
+const PERSISTED_ACTIVITY_TAIL_BYTES = 16 * 1024 * 1024;
 type ProjectStatusFilter = (typeof PROJECT_STATUS_FILTERS)[number];
 type ProjectStatusCounts = Record<"all" | ProjectStatusFilter, number>;
 
@@ -642,7 +643,7 @@ function hasSuccessfulTerminalEvent(run: Record<string, unknown>): boolean {
   const eventsPath = path.join(path.resolve(runDir), "events.jsonl");
   if (!existsSync(eventsPath)) return false;
   try {
-    const lines = readFileSync(eventsPath, "utf8").trim().split("\n").filter(Boolean).slice(-500);
+    const lines = readTailLines(eventsPath, 500);
     for (let i = lines.length - 1; i >= 0; i -= 1) {
       const line = lines[i];
       if (!line) continue;
@@ -663,6 +664,40 @@ function hasSuccessfulTerminalEvent(run: Record<string, unknown>): boolean {
     return false;
   }
   return false;
+}
+
+function readTailLines(file: string, limit: number, maxBytes = PERSISTED_ACTIVITY_TAIL_BYTES): string[] {
+  const safeLimit = Math.max(0, Math.floor(limit));
+  const safeMaxBytes = Math.max(0, Math.floor(maxBytes));
+  if (safeLimit <= 0 || safeMaxBytes <= 0) return [];
+  const fd = openSync(file, "r");
+  try {
+    const size = fstatSync(fd).size;
+    if (size <= 0) return [];
+    const chunkSize = 64 * 1024;
+    const chunks: Buffer[] = [];
+    let position = size;
+    let bytesReadTotal = 0;
+    let newlineCount = 0;
+    while (position > 0 && newlineCount <= safeLimit && bytesReadTotal < safeMaxBytes) {
+      const readLength = Math.min(chunkSize, position, safeMaxBytes - bytesReadTotal);
+      if (readLength <= 0) break;
+      position -= readLength;
+      const buffer = Buffer.allocUnsafe(readLength);
+      const bytesRead = readSync(fd, buffer, 0, readLength, position);
+      if (bytesRead <= 0) break;
+      const chunk = bytesRead === readLength ? buffer : buffer.subarray(0, bytesRead);
+      chunks.unshift(chunk);
+      bytesReadTotal += bytesRead;
+      for (const byte of chunk) {
+        if (byte === 10) newlineCount += 1;
+      }
+    }
+    if (chunks.length === 0) return [];
+    return Buffer.concat(chunks, bytesReadTotal).toString("utf8").split(/\n+/).filter(Boolean).slice(-safeLimit);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 function isLoopbackHost(host: string): boolean {
@@ -3585,11 +3620,11 @@ function persistedRunActivity(run: Record<string, unknown>, limit: number): Arra
   if (path.dirname(file) !== runDir) return [];
   let lines: string[];
   try {
-    lines = readFileSync(file, "utf8").trim().split(/\n+/).filter(Boolean);
+    lines = readTailLines(file, limit);
   } catch {
     return [];
   }
-  return lines.slice(-limit).flatMap((line) => {
+  return lines.flatMap((line) => {
     try {
       const rec = JSON.parse(line) as Record<string, unknown>;
       return [persistedEventToActivity(rec)];

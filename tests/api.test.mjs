@@ -1808,7 +1808,15 @@ test("api: startup reconciles error runs that have successful terminal artifacts
   const out = await mkdtemp(path.join(os.tmpdir(), "flounder-api-reconcile-"));
   const runDir = path.join(out, "artifact-success-run");
   await mkdir(runDir, { recursive: true });
-  await writeFile(path.join(runDir, "events.jsonl"), JSON.stringify({ ts: new Date().toISOString(), kind: "audit_done", stoppedReason: "finished", findings: 1 }) + "\n");
+  const priorEvents = Array.from({ length: 700 }, (_, i) => JSON.stringify({
+    ts: new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString(),
+    kind: "audit_action",
+    detail: `historical activity ${i}`,
+  }));
+  await writeFile(
+    path.join(runDir, "events.jsonl"),
+    `${priorEvents.join("\n")}\n${JSON.stringify({ ts: new Date().toISOString(), kind: "audit_done", stoppedReason: "finished", findings: 1 })}\n`,
+  );
 
   const store = MetadataStore.openForOutput(out);
   let runId;
@@ -3694,7 +3702,12 @@ test("api: run log supports a bounded JSON tail for agents", async () => {
     } finally {
       store.close();
     }
-    await writeFile(path.join(runDir, "events.jsonl"), `${JSON.stringify({
+    const priorEvents = Array.from({ length: 75 }, (_, i) => JSON.stringify({
+      ts: new Date(Date.UTC(2026, 5, 22, 8, 0, i)).toISOString(),
+      kind: "audit_action",
+      detail: `older activity ${i}`,
+    }));
+    await writeFile(path.join(runDir, "events.jsonl"), `${priorEvents.join("\n")}\n${JSON.stringify({
       ts: "2026-06-22T08:12:50.000Z",
       kind: "audit_command_run",
       runId: "cmd23",
@@ -3704,7 +3717,7 @@ test("api: run log supports a bounded JSON tail for agents", async () => {
       output: "docker: Error response from daemon: exec: \"forge\": executable file not found in $PATH.",
     })}\n`);
 
-    const res = await fetch(base + `/api/runs/${runId}/log?tail=50`);
+    const res = await fetch(base + `/api/runs/${runId}/log?tail=1`);
     assert.equal(res.status, 200);
     assert.match(res.headers.get("content-type") ?? "", /application\/json/);
     const body = await res.json();
@@ -3715,7 +3728,7 @@ test("api: run log supports a bounded JSON tail for agents", async () => {
     assert.equal(body.events[0].passed, false);
     assert.equal(body.events[0].exitCode, 127);
     assert.match(body.events[0].output, /forge/);
-    assert.equal(body.limit, 50);
+    assert.equal(body.limit, 1);
   });
 });
 
