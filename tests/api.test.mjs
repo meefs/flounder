@@ -59,6 +59,7 @@ test("api: GET /api is a self-describing catalog of every resource + operation",
     const projectRun = cat.endpoints.find((e) => e.method === "POST" && e.path === "/api/projects/:uuid/runs");
     assert.match(projectRun.body.verb, /report/);
     assert.match(projectRun.body.verifyFromStart, /re-run Verify from the beginning/);
+    assert.match(projectRun.body.continueCoverage, /explicit opt-in/);
     assert.match(projectRun.body.scopeCoverageMode, /one-off coverage mode/);
     assert.match(projectRun.body.maxScopes, /one-off scope cap/);
     assert.match(projectRun.body.mapSteps, /one-off map turn cap/);
@@ -331,6 +332,41 @@ test("api: standard coverage fills the project up to 30 audited scopes instead o
   });
 });
 
+test("api: standard coverage resumes an interrupted batch before requiring explicit coverage", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const created = await json(await post("/api/projects", {
+      name: "standard-interrupted-batch",
+      sourcePaths: ["./src"],
+      config: { scopeCoverageMode: "standard" },
+    }));
+
+    const store = MetadataStore.openForOutput(out);
+    try {
+      store.upsertScopes(created.id, [
+        ...Array.from({ length: 58 }, (_, i) => ({ scopeId: `audited-${i}`, title: `Audited ${i}`, status: "audited", score: 100 - i })),
+        ...Array.from({ length: 34 }, (_, i) => ({ scopeId: `pending-${i}`, title: `Pending ${i}`, status: "pending", score: 34 - i })),
+      ]);
+      const runId = store.startRun({ projectId: created.id, kind: "run", runDir: path.join(out, "standard-interrupted-batch-run") });
+      store.updateRunScopes(runId, 28, 30);
+      store.finishRun(runId, "killed");
+    } finally {
+      store.close();
+    }
+
+    const launched = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "run" }));
+    assert.equal(launched.queued, true);
+    const job = (await json(await fetch(base + "/api/jobs/" + launched.jobId))).job;
+    const spec = JSON.parse(job.spec_json);
+
+    assert.equal(spec.pipeline, false);
+    assert.equal(spec.coverageMode, "standard");
+    assert.equal(spec.coverageTarget, 30);
+    assert.equal(spec.maxScopes, 2);
+  });
+});
+
 test("api: full coverage continues prepared pending inventory without a scope cap", async () => {
   await withServer(async (base, out) => {
     const json = (r) => r.json();
@@ -382,7 +418,7 @@ test("api: full coverage continues prepared pending inventory without a scope ca
   });
 });
 
-test("api: standard pipeline continue opens the next 30-scope batch after the first batch is settled", async () => {
+test("api: standard pipeline continue stops after a settled round unless coverage continuation is explicit", async () => {
   await withServer(async (base, out) => {
     const json = (r) => r.json();
     const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -402,11 +438,19 @@ test("api: standard pipeline continue opens the next 30-scope batch after the fi
       store.close();
     }
 
-    const pipeline = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "run", pipeline: true }));
+    const stopped = await post(`/api/projects/${created.uuid}/runs`, { verb: "run", pipeline: true });
+    assert.equal(stopped.status, 409);
+    const blocked = await json(stopped);
+    assert.equal(blocked.roundComplete, true);
+    assert.equal(blocked.continueCoverageRequired, true);
+    assert.equal(blocked.progress.pending, 35);
+
+    const pipeline = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "run", pipeline: true, continueCoverage: true }));
     assert.equal(pipeline.queued, true);
     const pipelineJob = (await json(await fetch(base + "/api/jobs/" + pipeline.jobId))).job;
     const pipelineSpec = JSON.parse(pipelineJob.spec_json);
     assert.equal(pipelineSpec.pipeline, true);
+    assert.equal(pipelineSpec.continueCoverage, true);
     assert.equal(pipelineSpec.coverageMode, "standard");
     assert.equal(pipelineSpec.coverageTarget, 30);
     assert.equal(pipelineSpec.maxScopes, 30);
@@ -414,8 +458,8 @@ test("api: standard pipeline continue opens the next 30-scope batch after the fi
 
     const continued = await post(`/api/projects/${created.uuid}/runs`, { verb: "run" });
     assert.equal(continued.status, 409);
-    const blocked = await json(continued);
-    assert.match(blocked.error, /Standard coverage is already complete/);
+    const nonPipelineBlocked = await json(continued);
+    assert.match(nonPipelineBlocked.error, /Standard coverage is already complete/);
 
     const launched = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "audit", scope: "pending-0" }));
     assert.equal(launched.queued, true);
@@ -466,6 +510,106 @@ test("api: standard pipeline continue finishes pending verify work before openin
     assert.equal(pipelineSpec.coverageMode, "standard");
     assert.equal(pipelineSpec.coverageTarget, 30);
     assert.equal(pipelineSpec.maxScopes, 0);
+    assert.equal(pipelineSpec.sandboxConfirmNetwork, "enabled");
+  });
+});
+
+test("api: standard pipeline continue keeps reproduced needs-human decisions in confirm before opening the next scope batch", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const created = await json(await post("/api/projects", {
+      name: "standard-cumulative-needs-human",
+      sourcePaths: ["./src"],
+      config: { scopeCoverageMode: "standard" },
+    }));
+
+    const store = MetadataStore.openForOutput(out);
+    try {
+      store.upsertScopes(created.id, [
+        ...Array.from({ length: 30 }, (_, i) => ({ scopeId: `audited-${i}`, title: `Audited ${i}`, status: "audited", score: 30 - i })),
+        ...Array.from({ length: 12 }, (_, i) => ({ scopeId: `pending-${i}`, title: `Pending ${i}`, status: "pending", score: 12 - i })),
+      ]);
+      const auditRun = store.startRun({ projectId: created.id, kind: "audit", runDir: path.join(out, "standard-cumulative-needs-human-audit") });
+      store.upsertFindings(created.id, auditRun, [
+        {
+          findingKey: "kgated",
+          title: "Locally reproduced but human-gated",
+          location: "src/A.sol:1",
+          severity: "medium",
+          status: "confirmed-executable",
+          evidence: "local proof",
+        },
+      ]);
+      store.finishRun(auditRun, "done");
+      const confirmRun = store.startRun({ projectId: created.id, kind: "confirm", runDir: path.join(out, "standard-cumulative-needs-human-confirm") });
+      store.upsertConfirmDecisions(created.id, confirmRun, [
+        {
+          bug: "Locally reproduced but human-gated",
+          reproduced: "yes",
+          recommendation: "needs-human",
+          members: ["kgated"],
+          reproEvidence: "Forge harness used published source; live deployment and funds-at-risk were not established.",
+          humanGates: "Live deployment and payout eligibility need human review.",
+        },
+      ]);
+      store.finishRun(confirmRun, "done");
+    } finally {
+      store.close();
+    }
+
+    const pipeline = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "run", pipeline: true }));
+    assert.equal(pipeline.queued, true);
+    const pipelineJob = (await json(await fetch(base + "/api/jobs/" + pipeline.jobId))).job;
+    const pipelineSpec = JSON.parse(pipelineJob.spec_json);
+    assert.equal(pipelineSpec.pipeline, true);
+    assert.equal(pipelineSpec.coverageMode, "standard");
+    assert.equal(pipelineSpec.coverageTarget, 30);
+    assert.equal(pipelineSpec.maxScopes, 0);
+  });
+});
+
+test("api: standard pipeline continue resumes an interrupted batch before pending verify work", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const created = await json(await post("/api/projects", {
+      name: "standard-pipeline-interrupted-batch",
+      sourcePaths: ["./src"],
+      config: { scopeCoverageMode: "standard" },
+    }));
+
+    const store = MetadataStore.openForOutput(out);
+    try {
+      store.upsertScopes(created.id, [
+        ...Array.from({ length: 58 }, (_, i) => ({ scopeId: `audited-${i}`, title: `Audited ${i}`, status: "audited", score: 100 - i })),
+        ...Array.from({ length: 34 }, (_, i) => ({ scopeId: `pending-${i}`, title: `Pending ${i}`, status: "pending", score: 34 - i })),
+      ]);
+      const runId = store.startRun({ projectId: created.id, kind: "run", runDir: path.join(out, "standard-pipeline-interrupted-batch-run") });
+      store.updateRunScopes(runId, 28, 30);
+      store.upsertFindings(created.id, runId, [
+        {
+          findingKey: "ksuspected",
+          title: "Needs execution verification",
+          location: "src/A.sol:1",
+          severity: "high",
+          status: "suspected",
+          evidence: "candidate",
+        },
+      ]);
+      store.finishRun(runId, "killed");
+    } finally {
+      store.close();
+    }
+
+    const pipeline = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "run", pipeline: true }));
+    assert.equal(pipeline.queued, true);
+    const pipelineJob = (await json(await fetch(base + "/api/jobs/" + pipeline.jobId))).job;
+    const pipelineSpec = JSON.parse(pipelineJob.spec_json);
+    assert.equal(pipelineSpec.pipeline, true);
+    assert.equal(pipelineSpec.coverageMode, "standard");
+    assert.equal(pipelineSpec.coverageTarget, 30);
+    assert.equal(pipelineSpec.maxScopes, 2);
     assert.equal(pipelineSpec.sandboxConfirmNetwork, "enabled");
   });
 });
@@ -666,9 +810,10 @@ test("api: daemon pipeline worklist exposes verify candidates before confirm", a
       body: JSON.stringify({ project: "pipeline-verify-worklist", phase: "confirm" }),
     }));
     assert.ok(confirm.confirmKeys.includes("confirmed-bug"));
-    assert.ok(confirm.confirmKeys.includes("kalreadyreproduced"), "confirm worklist carries prior decided findings as consolidation context");
-    assert.ok(confirm.confirmKeys.includes("kgateblocked"), "confirm worklist carries reproduced decisions whose submission gates are still open");
+    assert.ok(confirm.confirmKeys.includes("kgateblocked"), "confirm worklist retries reproduced needs-human decisions whose submission gates remain open");
+    assert.ok(!confirm.confirmKeys.includes("kalreadyreproduced"), "confirm worklist skips prior decided findings");
     assert.ok(confirm.confirmFindings.some((finding) => finding.id === "confirmed-bug" && finding.originId), "confirm worklist carries DB-backed finding seeds");
+    assert.ok(confirm.confirmFindings.some((finding) => finding.id === "kgateblocked" && finding.originId), "confirm worklist carries DB-backed seeds for submission-readiness retries");
     assert.deepEqual(confirm.confirmSettledRows.map((row) => row.bug), ["prior reproduced withdrawal proof"]);
     assert.ok(confirm.confirmKeys.some((key) => /^origin:\d+:confirmed-bug$/.test(key)), "worklist carries origin selector for verify-artifact recovery");
 
@@ -1728,7 +1873,15 @@ test("api: startup reconciles error runs that have successful terminal artifacts
   const out = await mkdtemp(path.join(os.tmpdir(), "flounder-api-reconcile-"));
   const runDir = path.join(out, "artifact-success-run");
   await mkdir(runDir, { recursive: true });
-  await writeFile(path.join(runDir, "events.jsonl"), JSON.stringify({ ts: new Date().toISOString(), kind: "audit_done", stoppedReason: "finished", findings: 1 }) + "\n");
+  const priorEvents = Array.from({ length: 700 }, (_, i) => JSON.stringify({
+    ts: new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString(),
+    kind: "audit_action",
+    detail: `historical activity ${i}`,
+  }));
+  await writeFile(
+    path.join(runDir, "events.jsonl"),
+    `${priorEvents.join("\n")}\n${JSON.stringify({ ts: new Date().toISOString(), kind: "audit_done", stoppedReason: "finished", findings: 1 })}\n`,
+  );
 
   const store = MetadataStore.openForOutput(out);
   let runId;
@@ -3614,7 +3767,12 @@ test("api: run log supports a bounded JSON tail for agents", async () => {
     } finally {
       store.close();
     }
-    await writeFile(path.join(runDir, "events.jsonl"), `${JSON.stringify({
+    const priorEvents = Array.from({ length: 75 }, (_, i) => JSON.stringify({
+      ts: new Date(Date.UTC(2026, 5, 22, 8, 0, i)).toISOString(),
+      kind: "audit_action",
+      detail: `older activity ${i}`,
+    }));
+    await writeFile(path.join(runDir, "events.jsonl"), `${priorEvents.join("\n")}\n${JSON.stringify({
       ts: "2026-06-22T08:12:50.000Z",
       kind: "audit_command_run",
       runId: "cmd23",
@@ -3624,7 +3782,7 @@ test("api: run log supports a bounded JSON tail for agents", async () => {
       output: "docker: Error response from daemon: exec: \"forge\": executable file not found in $PATH.",
     })}\n`);
 
-    const res = await fetch(base + `/api/runs/${runId}/log?tail=50`);
+    const res = await fetch(base + `/api/runs/${runId}/log?tail=1`);
     assert.equal(res.status, 200);
     assert.match(res.headers.get("content-type") ?? "", /application\/json/);
     const body = await res.json();
@@ -3635,7 +3793,7 @@ test("api: run log supports a bounded JSON tail for agents", async () => {
     assert.equal(body.events[0].passed, false);
     assert.equal(body.events[0].exitCode, 127);
     assert.match(body.events[0].output, /forge/);
-    assert.equal(body.limit, 50);
+    assert.equal(body.limit, 1);
   });
 });
 

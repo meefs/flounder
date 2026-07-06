@@ -13,7 +13,7 @@
 // unless a per-daemon bearer token is configured.
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, readdirSync, statSync } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -36,6 +36,7 @@ const PROJECT_STREAM_LIMIT = 100;
 const DAEMON_JOB_HEARTBEAT_TTL_MS = 45_000;
 const DAEMON_OFFLINE_RECONCILE_GRACE_MS = DAEMON_JOB_HEARTBEAT_TTL_MS * 2;
 const PROJECT_STATUS_FILTERS = ["running", "needs-work", "done", "failed", "not-started"] as const;
+const PERSISTED_ACTIVITY_TAIL_BYTES = 16 * 1024 * 1024;
 type ProjectStatusFilter = (typeof PROJECT_STATUS_FILTERS)[number];
 type ProjectStatusCounts = Record<"all" | ProjectStatusFilter, number>;
 
@@ -267,7 +268,8 @@ const ROUTES: Route[] = [
       region: "string? — audit: pinned region e.g. src/Foo.sol:120-180", scope: "string? — audit: scope id(s)", verifyFindings: "object|array? — audit: inline suspected finding(s) to confirm-or-refute by execution; project finding rows with id are linked back to that original row",
       allowMaterialDrift: "boolean? — expert override for verifyFindings when a newer Prepare run changed project materials after the selected findings were produced",
       regenerateReports: "boolean? — report: include findings that already have formal reports; selected findingIds are always regenerated",
-      scopeCoverageMode: "focused|standard|half|full|custom? — one-off coverage mode for this run; standard means audit until the project has 30 audited scopes, then pipeline Continue starts the next 30-scope batch after verify/confirm/report are settled",
+      continueCoverage: "boolean? — explicit opt-in to open the next mapped scope batch after the current pipeline round is fully settled",
+      scopeCoverageMode: "focused|standard|half|full|custom? — one-off coverage mode for this run; standard means audit until the project has 30 audited scopes; pass continueCoverage:true to explicitly start another scope batch after verify/confirm/report are settled",
       maxScopes: "number? — one-off scope cap for this run, or the custom target when scopeCoverageMode=custom", mapSteps: "number? — one-off map turn cap", digSteps: "number? — one-off per-scope dig turn cap",
       maxSteps: "number? — one-off global turn cap", digSamples: "number? — one-off samples per scope", digConcurrency: "number? — one-off parallel scopes",
       findingId: "number? — confirm/report: reproduce or report one selected finding",
@@ -438,7 +440,7 @@ const ROUTES: Route[] = [
       provider: "string?", model: "string?", thinking: "string?",
       scopeCoverageMode: "focused|standard|half|full|custom? — standard/focused are cumulative project targets, not per-run additions", maxScopes: "number?", mapSteps: "number?", digSteps: "number?", maxSteps: "number?", digSamples: "number?", digConcurrency: "number?",
       sandboxBackend: "'auto'|'oci'|'apple-container'|'host'?", sandboxImage: "string?", sandboxAllowHostFallback: "boolean?", sandboxPrepareNetwork: "'none'|'enabled'?", sandboxConfirmNetwork: "'none'|'enabled'?",
-      remap: "boolean?", quick: "boolean?", mockLlm: "boolean?", pipeline: "boolean? — run clue pipeline: prepare if needed -> map/dig -> synthesize -> verify -> confirm -> report", verifyFromStart: "boolean? — pipeline: re-run Verify from the beginning instead of only pending candidates", region: "string?", scope: "string?", scopeNote: "string? — map/audit: 'authorized scope note' that focuses map on the in-scope target (the pipeline auto-derives it from prepare's manifest)", verifyFindings: "object|array? — audit: inline suspected finding(s) to confirm-or-refute by execution",
+      remap: "boolean?", quick: "boolean?", mockLlm: "boolean?", pipeline: "boolean? — run clue pipeline: prepare if needed -> map/dig -> synthesize -> verify -> confirm -> report", continueCoverage: "boolean? — explicit opt-in to open the next mapped scope batch after the current pipeline round is fully settled", verifyFromStart: "boolean? — pipeline: re-run Verify from the beginning instead of only pending candidates", region: "string?", scope: "string?", scopeNote: "string? — map/audit: 'authorized scope note' that focuses map on the in-scope target (the pipeline auto-derives it from prepare's manifest)", verifyFindings: "object|array? — audit: inline suspected finding(s) to confirm-or-refute by execution",
       inputRunDir: "string? — confirm", fresh: "boolean? — confirm",
       clue: "string? — prepare", posture: "string? — prepare", matchDeployed: "boolean? — prepare", endpoint: "string? — prepare",
     },
@@ -642,7 +644,7 @@ function hasSuccessfulTerminalEvent(run: Record<string, unknown>): boolean {
   const eventsPath = path.join(path.resolve(runDir), "events.jsonl");
   if (!existsSync(eventsPath)) return false;
   try {
-    const lines = readFileSync(eventsPath, "utf8").trim().split("\n").filter(Boolean).slice(-500);
+    const lines = readTailLines(eventsPath, 500);
     for (let i = lines.length - 1; i >= 0; i -= 1) {
       const line = lines[i];
       if (!line) continue;
@@ -663,6 +665,40 @@ function hasSuccessfulTerminalEvent(run: Record<string, unknown>): boolean {
     return false;
   }
   return false;
+}
+
+function readTailLines(file: string, limit: number, maxBytes = PERSISTED_ACTIVITY_TAIL_BYTES): string[] {
+  const safeLimit = Math.max(0, Math.floor(limit));
+  const safeMaxBytes = Math.max(0, Math.floor(maxBytes));
+  if (safeLimit <= 0 || safeMaxBytes <= 0) return [];
+  const fd = openSync(file, "r");
+  try {
+    const size = fstatSync(fd).size;
+    if (size <= 0) return [];
+    const chunkSize = 64 * 1024;
+    const chunks: Buffer[] = [];
+    let position = size;
+    let bytesReadTotal = 0;
+    let newlineCount = 0;
+    while (position > 0 && newlineCount <= safeLimit && bytesReadTotal < safeMaxBytes) {
+      const readLength = Math.min(chunkSize, position, safeMaxBytes - bytesReadTotal);
+      if (readLength <= 0) break;
+      position -= readLength;
+      const buffer = Buffer.allocUnsafe(readLength);
+      const bytesRead = readSync(fd, buffer, 0, readLength, position);
+      if (bytesRead <= 0) break;
+      const chunk = bytesRead === readLength ? buffer : buffer.subarray(0, bytesRead);
+      chunks.unshift(chunk);
+      bytesReadTotal += bytesRead;
+      for (const byte of chunk) {
+        if (byte === 10) newlineCount += 1;
+      }
+    }
+    if (chunks.length === 0) return [];
+    return Buffer.concat(chunks, bytesReadTotal).toString("utf8").split(/\n+/).filter(Boolean).slice(-safeLimit);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 function isLoopbackHost(host: string): boolean {
@@ -1075,6 +1111,15 @@ function confirmDecisionMemberKeys(row: Record<string, unknown>): string[] {
     if (embedded) add(embedded);
   }
   return [...keys];
+}
+
+function confirmDecisionKeySet(rows: Array<Record<string, unknown>>): Set<string> {
+  return new Set(rows.flatMap(confirmDecisionMemberKeys));
+}
+
+function findingRowCoveredByDecision(row: Record<string, unknown>, decisionKeys: Set<string>): boolean {
+  const key = stringValue(row.finding_key).toLowerCase();
+  return Boolean(key && decisionKeys.has(key));
 }
 
 function linkedFindingsForDecision(store: MetadataStore, projectId: number, decision: Record<string, unknown>): Array<Record<string, unknown>> {
@@ -2126,9 +2171,20 @@ async function runLaunch(c: Ctx): Promise<void> {
   }
   const prepared = applyPreparedWorkspaceIfNeeded(spec, runs);
   if (!prepared.ok) return sendJson(c.res, 400, { error: prepared.error });
+  resumeInterruptedCoverageBatch(spec, progress, runs);
   promoteSettledPipelineCoverageBatch(spec, c.store, projectId, progress, currentResultRunIds, materialBoundary, runs);
   const materialDrift = verifyMaterialDrift(c.store, projectId, spec.verifyFindings, body.allowMaterialDrift === true);
   if (materialDrift) return sendJson(c.res, 409, materialDrift);
+  if (spec.verb === "run" && spec.pipeline && pipelineRoundComplete(spec, progress, c.store, projectId, currentResultRunIds, materialBoundary, runs)) {
+    return sendJson(c.res, 409, {
+      error: "Current pipeline round is complete. Pass continueCoverage:true, choose a coverage mode, or use Dig pending scopes to start another scope batch.",
+      roundComplete: true,
+      continueCoverageRequired: true,
+      coverageMode: spec.coverageMode,
+      coverageTarget: spec.coverageTarget,
+      progress,
+    });
+  }
   if (coverageTargetReached(spec) && !(spec.verb === "run" && spec.pipeline)) {
     const target = spec.coverageTarget;
     const denominator = target ? Math.min(target, progress.total || target) : progress.total;
@@ -2164,9 +2220,8 @@ async function runLaunch(c: Ctx): Promise<void> {
       spec.confirmKeys = rows.flatMap((row) => confirmSelectorsForFinding(row as unknown as { id?: unknown; finding_key?: unknown }));
       spec.confirmFindings = confirmFindingSeeds(c.store, Number(project.id), rows);
     } else {
-      const pending = c.store.pendingConfirmable(Number(project.id))
-        .filter((p) => confirmableRunDir(p as unknown as Record<string, unknown>))
-        .filter((p) => rowBelongsToCurrentMaterial(p as unknown as Record<string, unknown>, currentResultRunIds, materialBoundary));
+      const currentDecisions = currentConfirmDecisions(c.store.listConfirmDecisions(Number(project.id)).filter((row) => rowBelongsToCurrentMaterial(row, currentResultRunIds, materialBoundary)));
+      const pending = confirmWorkRows(c.store, Number(project.id), currentResultRunIds, materialBoundary, currentDecisions);
       if (pending.length === 0) return sendJson(c.res, 400, { error: "nothing to confirm — every audit-confirmed finding already has a real-target decision (use --fresh to redo)" });
       const context = c.store.confirmableContext(Number(project.id))
         .filter((p) => confirmableRunDir(p as unknown as Record<string, unknown>))
@@ -2176,7 +2231,6 @@ async function runLaunch(c: Ctx): Promise<void> {
       spec.inputRunDir = spec.inputRunDirs[0];
       spec.confirmKeys = rows.flatMap((p) => confirmSelectorsForFinding(p as unknown as { id?: unknown; finding_key?: unknown }));
       spec.confirmFindings = confirmFindingSeeds(c.store, Number(project.id), rows);
-      const currentDecisions = currentConfirmDecisions(c.store.listConfirmDecisions(Number(project.id)).filter((row) => rowBelongsToCurrentMaterial(row, currentResultRunIds, materialBoundary)));
       spec.confirmSettledRows = confirmSettledRows(currentDecisions);
     }
   }
@@ -2237,6 +2291,31 @@ function resetPipelineCoverageForUnknownInventory(spec: LaunchSpec): void {
   }
 }
 
+function resumeInterruptedCoverageBatch(spec: LaunchSpec, progress: Coverage, runs: Array<Record<string, unknown>>): void {
+  if (spec.verb !== "run" && spec.verb !== "audit") return;
+  if (spec.scope || spec.region || spec.verifyFindings !== undefined) return;
+  if (spec.maxScopes !== 0) return;
+  const pending = Math.max(0, Math.floor(progress.pending));
+  if (pending <= 0) return;
+  const remaining = latestInterruptedCoverageBatchRemainder(runs);
+  if (remaining <= 0) return;
+  spec.maxScopes = Math.min(pending, remaining);
+}
+
+function latestInterruptedCoverageBatchRemainder(runs: Array<Record<string, unknown>>): number {
+  const ordered = [...runs].sort((a, b) => numberValue(b.id) - numberValue(a.id));
+  for (const run of ordered) {
+    const kind = stringValue(run.kind);
+    if (kind !== "run" && kind !== "audit") continue;
+    const status = stringValue(run.status);
+    if (status !== "killed" && status !== "error") continue;
+    const target = Math.max(0, Math.floor(numberValue(run.run_scopes_target)));
+    const done = Math.max(0, Math.floor(numberValue(run.run_scopes_done)));
+    if (target > 0 && done < target) return target - done;
+  }
+  return 0;
+}
+
 function promoteSettledPipelineCoverageBatch(
   spec: LaunchSpec,
   store: MetadataStore,
@@ -2248,9 +2327,26 @@ function promoteSettledPipelineCoverageBatch(
 ): void {
   if (spec.verb !== "run" || !spec.pipeline) return;
   if (spec.coverageMode !== "standard" || spec.coverageTarget !== 30 || spec.maxScopes !== 0) return;
+  if (!spec.continueCoverage) return;
   if (progress.pending <= 0) return;
   if (pipelinePostAuditWorkPending(store, projectId, currentResultRunIds, materialBoundary, runs)) return;
   spec.maxScopes = Math.min(30, progress.pending);
+}
+
+function pipelineRoundComplete(
+  spec: LaunchSpec,
+  _progress: Coverage,
+  store: MetadataStore,
+  projectId: number,
+  currentResultRunIds: Set<number>,
+  materialBoundary: Record<string, unknown> | undefined,
+  runs: Array<Record<string, unknown>>,
+): boolean {
+  if (spec.continueCoverage) return false;
+  if (spec.maxScopes !== 0) return false;
+  if (!coverageTargetReached(spec)) return false;
+  if (pipelinePostAuditWorkPending(store, projectId, currentResultRunIds, materialBoundary, runs)) return false;
+  return true;
 }
 
 function pipelinePostAuditWorkPending(
@@ -2264,14 +2360,46 @@ function pipelinePostAuditWorkPending(
   const requiresRealTargetConfirmation = latestPrepareRequiresRealTargetConfirmation(runs);
   if (requiresRealTargetConfirmation) {
     const currentDecisions = currentConfirmDecisions(store.listConfirmDecisions(projectId).filter((row) => rowBelongsToCurrentMaterial(row, currentResultRunIds, materialBoundary)));
-    const submissionWorkKeys = new Set(currentDecisions.filter((row) => needsSubmissionReadinessWork(row)).flatMap(confirmDecisionMemberKeys));
-    const pending = store.pendingConfirmable(projectId)
-      .filter((row) => confirmableRunDir(row as unknown as Record<string, unknown>))
-      .filter((row) => rowBelongsToCurrentMaterial(row as unknown as Record<string, unknown>, currentResultRunIds, materialBoundary));
-    if (pending.length > 0 || submissionWorkKeys.size > 0) return true;
+    const pending = confirmWorkRows(store, projectId, currentResultRunIds, materialBoundary, currentDecisions);
+    if (pending.length > 0) return true;
   }
   const reports = reportWorklist(store, projectId, [], currentResultRunIds, materialBoundary, requiresRealTargetConfirmation);
   return Array.isArray(reports.findings) && reports.findings.length > 0;
+}
+
+function confirmWorkRows(
+  store: MetadataStore,
+  projectId: number,
+  currentResultRunIds: Set<number>,
+  materialBoundary: Record<string, unknown> | undefined,
+  currentDecisions: Array<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+  const settledKeys = confirmDecisionKeySet(currentDecisions.filter((row) => !needsSubmissionReadinessWork(row)));
+  const pending = store.pendingConfirmable(projectId)
+    .filter((row) => confirmableRunDir(row as unknown as Record<string, unknown>))
+    .filter((row) => rowBelongsToCurrentMaterial(row as unknown as Record<string, unknown>, currentResultRunIds, materialBoundary))
+    .filter((row) => !findingRowCoveredByDecision(row as unknown as Record<string, unknown>, settledKeys));
+  const readinessKeys = new Set(currentDecisions.filter((row) => needsSubmissionReadinessWork(row)).flatMap(confirmDecisionMemberKeys));
+  const readiness = readinessKeys.size === 0 ? [] : store.confirmableContext(projectId)
+    .filter((row) => confirmableRunDir(row as unknown as Record<string, unknown>))
+    .filter((row) => rowBelongsToCurrentMaterial(row as unknown as Record<string, unknown>, currentResultRunIds, materialBoundary))
+    .filter((row) => {
+      const key = stringValue((row as Record<string, unknown>).finding_key).toLowerCase();
+      return Boolean(key && readinessKeys.has(key));
+    });
+  return uniqueRowsByFindingKey([...pending, ...readiness]);
+}
+
+function uniqueRowsByFindingKey(rows: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  const seen = new Set<string>();
+  const out: Array<Record<string, unknown>> = [];
+  for (const row of rows) {
+    const key = stringValue(row.finding_key).toLowerCase() || String(row.id ?? "");
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(row);
+  }
+  return out;
 }
 
 function selectedFindingIds(body: Record<string, unknown>): number[] {
@@ -2641,6 +2769,7 @@ function normalizeLaunchSpec(body: Record<string, unknown>, target: string, verb
     quick: bool(body.quick),
     mockLlm: bool(body.mockLlm),
     pipeline: bool(body.pipeline),
+    continueCoverage: bool(body.continueCoverage),
     verifyFromStart: bool(body.verifyFromStart),
     region: str(body.region),
     scope: str(body.scope),
@@ -3559,11 +3688,11 @@ function persistedRunActivity(run: Record<string, unknown>, limit: number): Arra
   if (path.dirname(file) !== runDir) return [];
   let lines: string[];
   try {
-    lines = readFileSync(file, "utf8").trim().split(/\n+/).filter(Boolean);
+    lines = readTailLines(file, limit);
   } catch {
     return [];
   }
-  return lines.slice(-limit).flatMap((line) => {
+  return lines.flatMap((line) => {
     try {
       const rec = JSON.parse(line) as Record<string, unknown>;
       return [persistedEventToActivity(rec)];
@@ -3790,17 +3919,11 @@ async function daemonPipelineWorklist(c: Ctx): Promise<void> {
       return sendJson(c.res, 200, { phase, requiresRealTargetConfirmation, inputRunDirs: [], confirmKeys: [] });
     }
     const currentDecisions = currentConfirmDecisions(c.store.listConfirmDecisions(projectId).filter((row) => rowBelongsToCurrentMaterial(row, currentResultRunIds, materialBoundary)));
-    const submissionWorkKeys = new Set(currentDecisions.filter((row) => needsSubmissionReadinessWork(row)).flatMap(confirmDecisionMemberKeys));
-    const pending = c.store.pendingConfirmable(projectId)
-      .filter((row) => confirmableRunDir(row as unknown as Record<string, unknown>))
-      .filter((row) => rowBelongsToCurrentMaterial(row as unknown as Record<string, unknown>, currentResultRunIds, materialBoundary));
-    if (pending.length === 0 && submissionWorkKeys.size === 0) {
+    const pending = confirmWorkRows(c.store, projectId, currentResultRunIds, materialBoundary, currentDecisions);
+    if (pending.length === 0) {
       return sendJson(c.res, 200, { phase, requiresRealTargetConfirmation, inputRunDirs: [], confirmKeys: [] });
     }
-    const context = c.store.confirmableContext(projectId)
-      .filter((row) => confirmableRunDir(row as unknown as Record<string, unknown>))
-      .filter((row) => rowBelongsToCurrentMaterial(row as unknown as Record<string, unknown>, currentResultRunIds, materialBoundary));
-    const rows = context.length > 0 ? context : pending;
+    const rows = pending;
     return sendJson(c.res, 200, {
       phase,
       requiresRealTargetConfirmation,
@@ -4200,6 +4323,11 @@ function launchSpec(store: MetadataStore, project: Record<string, unknown>, body
   const bodyOverrides = runBodyConfigOverrides(body);
   const merged = { ...cfg, ...configOverrides, ...bodyOverrides };
   const explicitRunMaxScopes = configOverrides.maxScopes !== undefined || bodyOverrides.maxScopes !== undefined;
+  const explicitCoverageContinuation =
+    body.continueCoverage === true
+    || configOverrides.scopeCoverageMode !== undefined
+    || bodyOverrides.scopeCoverageMode !== undefined
+    || explicitRunMaxScopes;
   const num = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
   const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
   const backend = (v: unknown): SandboxBackend | undefined => isSandboxBackend(v) ? v : undefined;
@@ -4275,6 +4403,7 @@ function launchSpec(store: MetadataStore, project: Record<string, unknown>, body
     quick: Boolean(body.quick),
     mockLlm: Boolean(body.mockLlm),
     pipeline,
+    continueCoverage: explicitCoverageContinuation,
     verifyFromStart: Boolean(body.verifyFromStart),
     region: str(body.region),
     scope: str(body.scope),

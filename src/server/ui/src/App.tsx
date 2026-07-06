@@ -60,7 +60,7 @@ type SettingsPane = "providers" | "daemons" | "archived";
 type ProjectTab = "overview" | "decisions" | "findings" | "scopes" | "runs" | "activity" | "setup";
 type ModalName = "new-project" | "run" | "edit-project" | "report" | "decision-report" | "run-log" | "artifact" | null;
 type ArtifactPreview = { title: string; runId: number; name: string };
-type LaunchAction = "run" | "prepare" | "map" | "audit" | "confirm" | "verify" | "report";
+type LaunchAction = "run" | "run-next-coverage" | "prepare" | "map" | "audit" | "confirm" | "verify" | "report";
 
 const PROJECT_TABS: Array<{ id: ProjectTab; label: string }> = [
   { id: "overview", label: "Overview" },
@@ -671,6 +671,15 @@ function coverageLabel(cfg: { scopeCoverageMode?: string; maxScopes?: number }):
   return `Custom - ${cfg.maxScopes ?? 30} scopes per run`;
 }
 
+function coverageModeName(cfg: { scopeCoverageMode?: string; maxScopes?: number }): string {
+  const mode = coverageModeFromConfig(cfg);
+  if (mode === "focused") return "Focused";
+  if (mode === "standard") return "Standard";
+  if (mode === "half") return "Half";
+  if (mode === "full") return "Full";
+  return "Custom";
+}
+
 function coverageCapText(mode: CoverageMode, maxScopes: string): string {
   if (mode === "focused") return "until 10 audited scopes";
   if (mode === "standard") return "until 30 audited scopes";
@@ -804,14 +813,11 @@ function isExecutionConfirmedFinding(finding: FindingRow): boolean {
 
 function pendingConfirmFindings(rows: FindingRow[] | undefined, requiresConfirmation = true, decisions?: ConfirmDecision[]): FindingRow[] {
   if (!requiresConfirmation) return [];
-  const readinessWorkKeys = new Set((decisions ?? []).filter(needsSubmissionReadinessWork).flatMap(confirmDecisionMemberKeys));
-  const decidedFindingKeys = new Set((decisions ?? []).filter((decision) => !needsSubmissionReadinessWork(decision)).flatMap(confirmDecisionMemberKeys));
+  const decidedFindingKeys = new Set((decisions ?? []).flatMap(confirmDecisionMemberKeys));
   return activeFindings(rows).filter((finding) =>
     isExecutionConfirmedFinding(finding)
-    && (
-      (!finding.confirm_status && !(finding.finding_key && decidedFindingKeys.has(finding.finding_key.toLowerCase())))
-      || Boolean(finding.finding_key && readinessWorkKeys.has(finding.finding_key.toLowerCase()))
-    )
+    && !finding.confirm_status
+    && !(finding.finding_key && decidedFindingKeys.has(finding.finding_key.toLowerCase()))
   );
 }
 
@@ -844,26 +850,49 @@ function pendingDecisionReports(decisions: ConfirmDecision[] | undefined): Confi
   return reportableDecisions(decisions).filter((decision) => !decision.has_report);
 }
 
+function configuredCoverageTarget(detail: ProjectDetail): number | undefined {
+  const total = Math.max(0, detail.progress.total ?? 0);
+  if (total <= 0) return undefined;
+  const cfg = projectConfig(detail).cfg;
+  const mode = coverageModeFromConfig(cfg);
+  if (mode === "standard") return Math.min(30, total);
+  if (mode === "focused") return Math.min(10, total);
+  if (mode === "half") return Math.min(Math.ceil(total / 2), total);
+  if (mode === "full") return total;
+  return Math.min(Math.max(1, cfg.maxScopes ?? 30), total);
+}
+
+function pipelineCoverageRoundComplete(detail: ProjectDetail): boolean {
+  const audited = Math.max(0, detail.progress.audited ?? 0);
+  const pending = Math.max(0, detail.progress.pending ?? 0);
+  const target = configuredCoverageTarget(detail);
+  if (target !== undefined && audited >= target) return true;
+  return audited > 0 && pending === 0;
+}
+
 function pipelineRunActionDetail(detail: ProjectDetail, hasPipelineRun: boolean): string {
   if (!hasPipelineRun) return "Run the automatic pipeline: Prepare when needed, then map/dig, confirm reproduced impact, and generate reports.";
   const requiresConfirmation = needsRealTargetConfirmation(detail);
   const verifyCount = rawPendingVerifyCount(detail.allFindings);
-  if (verifyCount > 0) return `Continue the current pipeline by verifying ${plural(verifyCount, "candidate")} before starting new scope coverage.`;
+  if (verifyCount > 0) return `Continue the current pipeline by verifying ${plural(verifyCount, "candidate")} before this round can finish.`;
   const confirmCount = pendingConfirmFindings(detail.allFindings, requiresConfirmation, detail.confirmDecisions).length;
-  if (confirmCount > 0) return `Continue the current pipeline by confirming ${plural(confirmCount, "finding")} before starting new scope coverage.`;
+  if (confirmCount > 0) return `Continue the current pipeline by confirming ${plural(confirmCount, "finding")} before this round can finish.`;
   const reportCount = requiresConfirmation ? pendingDecisionReports(detail.confirmDecisions).length : pendingFormalReports(detail.allFindings, requiresConfirmation).length;
-  if (reportCount > 0) return `Continue the current pipeline by generating ${plural(reportCount, "report")} before starting new scope coverage.`;
+  if (reportCount > 0) return `Continue the current pipeline by generating ${plural(reportCount, "report")} before this round can finish.`;
   const mode = coverageModeFromConfig(projectConfig(detail).cfg);
   const audited = Math.max(0, detail.progress.audited ?? 0);
   const pending = Math.max(0, detail.progress.pending ?? 0);
+  if (pipelineCoverageRoundComplete(detail)) {
+    return pending
+      ? `Current ${coverageModeName(projectConfig(detail).cfg)} round is complete. Continue stays stopped; use Start next scope round to open another batch from ${plural(pending, "pending scope")}.`
+      : "Current pipeline round is complete. Continue stays stopped; no pending mapped scopes remain.";
+  }
   if (mode === "standard") {
     if (pending === 0) return "Continue any remaining pipeline work; no pending mapped scopes remain.";
-    if (audited >= 30) return `Continue will start the next Standard batch of up to 30 scopes (${plural(pending, "pending scope")}).`;
     return `Continue will audit up to ${plural(Math.min(30 - audited, pending), "scope")} to finish the first Standard batch (${audited}/30 audited).`;
   }
   if (mode === "focused") {
     if (pending === 0) return "Continue any remaining pipeline work; no pending mapped scopes remain.";
-    if (audited >= 10) return `Continue will use the saved Focused coverage setting; choose Custom or Full for more scopes.`;
     return `Continue will audit up to ${plural(Math.min(10 - audited, pending), "scope")} to finish Focused coverage (${audited}/10 audited).`;
   }
   if (mode === "half") return pending ? `Continue will audit about half of the ${plural(pending, "pending scope")}.` : "Continue any remaining pipeline work; no pending mapped scopes remain.";
@@ -1852,6 +1881,7 @@ export function App() {
     if (!route.projectUuid) return;
     let verifyCandidates: FindingRow[] = [];
     let runHint = "";
+    const opensNextCoverage = action === "run-next-coverage";
     if (detail?.project.uuid === route.projectUuid) {
       const currentDetail = currentMaterialDetail(detail);
       const running = currentMaterialRuns(detail.runs, detail.material).find((run) => run.status === "running");
@@ -1878,7 +1908,13 @@ export function App() {
         return;
       }
       if (action === "run") runHint = pipelineRunActionDetail(currentDetail, currentDetail.runs.some((run) => run.kind === "run"));
+      if (opensNextCoverage) runHint = "Explicit next scope round requested; the control plane will still settle any current-round work first.";
       const requiresConfirmation = needsRealTargetConfirmation(currentDetail);
+      if (opensNextCoverage && (currentDetail.progress.pending ?? 0) === 0) {
+        setToast({ tone: "warning", message: "There are no pending mapped scopes for another scope round. Map new scopes first." });
+        setModal(null);
+        return;
+      }
       if (action === "confirm" && pendingConfirmFindings(currentDetail.allFindings, requiresConfirmation, currentDetail.confirmDecisions).length === 0) {
         setToast({ tone: "warning", message: "There are no audit-confirmed findings waiting for real-target confirmation yet." });
         setModal(null);
@@ -1911,21 +1947,22 @@ export function App() {
     }
     setBusy(true);
     try {
-      const verb = action === "verify" ? "audit" : action;
+      const verb = action === "verify" ? "audit" : opensNextCoverage ? "run" : action;
       const selected = selectedFindings && selectedFindings.length ? selectedFindings : undefined;
       const result = (await api.launchRun(route.projectUuid, {
         verb,
-        ...(action === "run" ? { pipeline: true } : {}),
+        ...(action === "run" || opensNextCoverage ? { pipeline: true } : {}),
+        ...(opensNextCoverage ? { continueCoverage: true } : {}),
         ...(action === "verify" ? { verifyFindings: selected ?? verifyCandidates } : {}),
         ...((action === "confirm" || action === "report") && selected ? { findingIds: selected.map((finding) => finding.id) } : {}),
       })) as LaunchResult;
       const waiting = (result.daemons ?? 0) === 0;
-      const label = action === "verify" ? "verify" : verb;
+      const label = action === "verify" ? "verify" : opensNextCoverage ? "run" : verb;
       setToast({
         tone: waiting ? "warning" : "success",
         message: waiting
           ? `${label} queued, but no online daemon is connected. Start a daemon to claim the job.`
-          : `${label} queued for ${plural(result.daemons ?? 0, "daemon")}.${runHint && action === "run" ? ` ${runHint}` : ""}`,
+          : `${label} queued for ${plural(result.daemons ?? 0, "daemon")}.${runHint && (action === "run" || opensNextCoverage) ? ` ${runHint}` : ""}`,
       });
       await refreshBase();
     } catch (error) {
@@ -2662,6 +2699,8 @@ function ProjectDetailView(props: {
   const reportLabel = pendingReports > 0 ? "to report" : "reports";
   const candidateStat = pendingVerify > 0 ? pendingVerify : needsEvidenceCount > 0 ? needsEvidenceCount : overviewCandidates.length;
   const candidateLabel = pendingVerify > 0 ? "to verify" : needsEvidenceCount > 0 ? "need evidence" : "top findings";
+  const currentRoundWorkPending = rawPendingVerify > 0 || pendingConfirmBase > 0 || pendingReports > 0;
+  const currentRoundComplete = hasPipelineRun && !currentRoundWorkPending && pipelineCoverageRoundComplete(currentDetail);
   const localVerifySummary = activeVerifySummary(runningVerify) || verifyStatusSummary(allFindings);
   const setupAttention = prepareMaterialsAttention(detail.prepareSummary);
   const sandboxStatus = daemonSandboxStatus(selectedDaemon);
@@ -2683,6 +2722,7 @@ function ProjectDetailView(props: {
     && setupReadWatermarks[project.uuid] !== setupAttentionSignature
   );
   const launchLocked = props.busy || Boolean(runningRun);
+  const runLaunchLocked = launchLocked || currentRoundComplete;
   const requiredProviders = requiredProviderProfiles(detail, providers);
   const authStatuses = requiredProviders.map((profile) => ({ profile, status: daemonHasProvider(selectedDaemon, profile.provider) }));
   const authUnknown = authStatuses.some((entry) => entry.status === null);
@@ -2863,7 +2903,7 @@ function ProjectDetailView(props: {
             <Button
               variant="primary"
               icon="play"
-              disabled={launchLocked}
+              disabled={runLaunchLocked}
               title={runningRun ? "A run is already active for this project." : pipelineActionDetail}
               onClick={() => props.onLaunch("run")}
             >
@@ -5528,6 +5568,8 @@ function RunModal({ detail, busy, onClose, onLaunch, onUpdateRunTarget, onError 
   const missingReports = requiresConfirmation ? pendingDecisionReports(detail.confirmDecisions).length : pendingFormalReports(detail.allFindings, requiresConfirmation).length;
   const hasPipelineRun = detail.runs.some((run) => run.kind === "run");
   const pipelineActionDetail = pipelineRunActionDetail(detail, hasPipelineRun);
+  const currentRoundWorkPending = verifiable > 0 || confirmable > 0 || missingReports > 0;
+  const currentRoundComplete = hasPipelineRun && !currentRoundWorkPending && pipelineCoverageRoundComplete(detail);
   const locked = busy || Boolean(running);
   const projectCoverageMode = coverageModeFromConfig(projectConfig(detail).cfg);
   const [runCoverageMode, setRunCoverageMode] = useState<CoverageMode>(projectCoverageMode);
@@ -5563,7 +5605,17 @@ function RunModal({ detail, busy, onClose, onLaunch, onUpdateRunTarget, onError 
     ? "Optionally re-run Prepare to close provenance, deployment-match, or real-target caveats. The current materials can still drive Map/Dig."
     : "Acquire official source/docs, pin provenance, and record material or real-target gaps before sealed auditing.";
   const options: Array<{ verb: LaunchAction; label: string; detail: string; disabled?: boolean }> = [
-    { verb: "run", label: hasPipelineRun ? "Continue" : "Run", detail: pipelineActionDetail, disabled: locked },
+    { verb: "run", label: hasPipelineRun ? "Continue" : "Run", detail: pipelineActionDetail, disabled: locked || currentRoundComplete },
+    ...(hasPipelineRun ? [{
+      verb: "run-next-coverage" as const,
+      label: "Start next scope round",
+      detail: currentRoundWorkPending
+        ? "Disabled until this round's verify, confirm, and report work is settled."
+        : pendingScopes
+          ? `Explicitly open another pipeline batch from ${plural(pendingScopes, "pending mapped scope")}.`
+          : "Disabled until Map scopes creates pending scope inventory.",
+      disabled: locked || currentRoundWorkPending || pendingScopes === 0,
+    }] : []),
     {
       verb: "prepare",
       label: prepareActionLabel,
@@ -5571,7 +5623,7 @@ function RunModal({ detail, busy, onClose, onLaunch, onUpdateRunTarget, onError 
       disabled: locked,
     },
     { verb: "map", label: "Map scopes only", detail: "Build or refresh the scope inventory without digging.", disabled: locked },
-    { verb: "audit", label: "Dig pending scopes", detail: pendingScopes ? `Deep-audit the next pending batch from ${plural(pendingScopes, "mapped scope")}.` : "Disabled until Map scopes creates pending scope inventory.", disabled: locked || pendingScopes === 0 },
+    { verb: "audit", label: "Dig pending scopes", detail: pendingScopes ? `Explicitly deep-audit pending mapped scopes without starting another full pipeline round.` : "Disabled until Map scopes creates pending scope inventory.", disabled: locked || pendingScopes === 0 },
     { verb: "verify", label: verifyButtonLabel(verifiable), detail: verifiable ? `Confirm-or-refute ${plural(verifiable, "candidate")} by local execution.` : "Disabled until synthesis or dig leaves suspected candidates.", disabled: locked || verifiable === 0 },
     { verb: "confirm", label: "Confirm", detail: requiresConfirmation ? (confirmable ? `Reproduce ${plural(confirmable, "execution-confirmed finding")} against the real target.` : "Disabled until local execution confirms a finding.") : "Not required for this source-only target.", disabled: locked || confirmable === 0 },
     { verb: "report", label: missingReports ? `Generate reports (${missingReports})` : "Regenerate reports", detail: reportable ? `Write formal Markdown reports for ${plural(reportable, requiresConfirmation ? "real-target decision" : "locally confirmed finding")}.` : requiresConfirmation ? "Disabled until confirm reproduces at least one decision." : "Disabled until local execution confirms at least one finding.", disabled: locked || reportable === 0 },

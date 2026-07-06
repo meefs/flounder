@@ -69,6 +69,7 @@ export interface LaunchSpec {
   confirmSettledRows?: ConfirmSettledRow[] | undefined; // confirm: prior reproduced/not-reproduced decisions to carry forward across batches
   reportFindings?: ReportFindingSpec[] | undefined; // report: confirmed/reproduced bugs to package as formal Markdown reports
   pipeline?: boolean | undefined; // run: project/CLI clue pipeline (prepare if needed -> map/dig -> verify -> confirm -> report)
+  continueCoverage?: boolean | undefined; // run pipeline: explicitly open another scope batch after current verify/confirm/report work is settled
   verifyFromStart?: boolean | undefined; // pipeline: re-run Verify from the beginning instead of only pending candidates
   region?: string | undefined; // audit: a pinned region
   scope?: string | undefined; // audit: scope id[,id...]
