@@ -1216,6 +1216,26 @@ small {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 16%, transparent);
 }
 
+.real-target-callout.blocked {
+  border-color: color-mix(in srgb, var(--danger) 28%, var(--border));
+  background: color-mix(in srgb, var(--danger) 6%, var(--canvas));
+}
+
+.real-target-callout.blocked .dot {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 14%, transparent);
+}
+
+.real-target-callout.neutral {
+  border-color: var(--border);
+  background: var(--canvas-subtle);
+}
+
+.real-target-callout.neutral .dot {
+  background: var(--fg-muted);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--fg-muted) 12%, transparent);
+}
+
 .real-target-callout small {
   display: block;
   margin-top: 1px;
@@ -1224,6 +1244,14 @@ small {
 
 .real-target-callout:hover {
   border-color: color-mix(in srgb, var(--success) 52%, var(--border));
+}
+
+.real-target-callout.blocked:hover {
+  border-color: color-mix(in srgb, var(--danger) 46%, var(--border));
+}
+
+.real-target-callout.neutral:hover {
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
 }
 
 .setup-disclosure summary {
@@ -3365,6 +3393,14 @@ small {
 
 .decision-main small {
   color: var(--fg-muted);
+}
+
+.decision-drop-reason {
+  display: block;
+  max-width: 100%;
+  color: var(--fg-muted);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
 }
 
 .decision-meta-chips {

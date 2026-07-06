@@ -7,8 +7,9 @@ import { enforceBountySubmitReadiness, loadSettledFromPriorConfirm } from "../di
 import { publicPath } from "../dist/util/paths.js";
 
 // `flounder confirm` auto-resumes a prior interrupted confirm of the same input run: it finds
-// the latest prior confirm dir (matched by frozen provenance) and carries its SETTLED rows
-// (reproduced yes/no) forward. This pins that detection.
+// the latest prior confirm dir (matched by frozen provenance) and carries only rows that
+// are final for the pipeline forward. Reproduced rows with open submission gates must be
+// retried, not treated as settled.
 
 async function mkConfirmRun(outDir, name, inputRunDir, rows) {
   const dir = path.join(outDir, name);
@@ -31,11 +32,11 @@ test("confirm resume: loads SETTLED rows from the latest prior confirm of the sa
   const inputX = "/some/input-run-X";
   const inputY = "/some/input-run-Y";
   await mkConfirmRun(out, "tgt-confirm-20260101T000000Z", inputX, [
-    { bug: "Bug A", reproduced: "yes" },
+    { bug: "Bug A", reproduced: "yes", recommendation: "submit-candidate", humanGates: "" },
     { bug: "Bug B", reproduced: "could-not-set-up" },
   ]);
   await mkConfirmRun(out, "tgt-confirm-20260102T000000Z", inputX, [
-    { bug: "Bug A", reproduced: "yes" },
+    { bug: "Bug A", reproduced: "yes", recommendation: "submit-candidate", humanGates: "" },
     { bug: "Bug B", reproduced: "no" },
   ]);
   await mkConfirmRun(out, "tgt-confirm-20260103T000000Z", inputY, [{ bug: "Bug Z", reproduced: "yes" }]); // different input → ignored
@@ -43,6 +44,25 @@ test("confirm resume: loads SETTLED rows from the latest prior confirm of the sa
   const settled = await loadSettledFromPriorConfirm(out, "tgt", inputX, path.join(out, "tgt-confirm-20260104T000000Z"));
   assert.deepEqual(settled.map((r) => r.bug).sort(), ["Bug A", "Bug B"]); // both settled, from the LATEST matching run
   assert.equal(settled.every((r) => r.reproduced === "yes" || r.reproduced === "no"), true);
+});
+
+test("confirm resume: reproduced needs-human rows are not settled and remain retry work", async () => {
+  const out = await mkdtemp(path.join(os.tmpdir(), "flounder-confirm-resume-gates-"));
+  const inputX = "/some/input-run-X";
+  await mkConfirmRun(out, "tgt-confirm-20260101T000000Z", inputX, [
+    {
+      bug: "Gate blocked bug",
+      reproduced: "yes",
+      recommendation: "needs-human",
+      humanGates: "Live funded exposure and payout tier remain unknown.",
+      adjudication: { live_impact_status: "unknown" },
+    },
+    { bug: "Not reproduced bug", reproduced: "no", recommendation: "drop" },
+    { bug: "Dropped bug", reproduced: "yes", recommendation: "drop", humanGates: "Deprecated deployment." },
+  ]);
+
+  const settled = await loadSettledFromPriorConfirm(out, "tgt", inputX, path.join(out, "tgt-confirm-cur"));
+  assert.deepEqual(settled.map((r) => r.bug).sort(), ["Dropped bug", "Not reproduced bug"]);
 });
 
 test("confirm resume: no prior confirm → empty (fresh start)", async () => {
@@ -53,7 +73,7 @@ test("confirm resume: no prior confirm → empty (fresh start)", async () => {
 test("confirm resume: skips a latest run with no decision sheet (killed before first checkpoint), falls back to an older one", async () => {
   const out = await mkdtemp(path.join(os.tmpdir(), "flounder-confirm-resume-fallback-"));
   const inputX = "/some/input-run-X";
-  await mkConfirmRun(out, "tgt-confirm-20260101T000000Z", inputX, [{ bug: "Bug A", reproduced: "yes" }]);
+  await mkConfirmRun(out, "tgt-confirm-20260101T000000Z", inputX, [{ bug: "Bug A", reproduced: "yes", recommendation: "drop" }]);
   await mkConfirmRun(out, "tgt-confirm-20260102T000000Z", inputX, null); // no decision yet
   const settled = await loadSettledFromPriorConfirm(out, "tgt", inputX, path.join(out, "tgt-confirm-cur"));
   assert.deepEqual(settled.map((r) => r.bug), ["Bug A"]);
@@ -64,12 +84,12 @@ test("confirm resume: aggregate input carries settled rows from prior subset con
   const inputA = "/some/input-run-A";
   const inputB = "/some/input-run-B";
   const inputC = "/some/input-run-C";
-  await mkConfirmRun(out, "tgt-confirm-20260101T000000Z", inputA, [{ bug: "Bug A", reproduced: "yes", members: ["ka"] }]);
+  await mkConfirmRun(out, "tgt-confirm-20260101T000000Z", inputA, [{ bug: "Bug A", reproduced: "yes", recommendation: "drop", members: ["ka"] }]);
   await mkAggregateConfirmRun(out, "tgt-confirm-20260102T000000Z", [inputA, inputB], [
     { bug: "Bug A newer", reproduced: "no", members: ["ka"] },
-    { bug: "Bug B", reproduced: "yes", members: ["kb"] },
+    { bug: "Bug B", reproduced: "yes", recommendation: "submit-candidate", humanGates: "", members: ["kb"] },
   ]);
-  await mkAggregateConfirmRun(out, "tgt-confirm-20260103T000000Z", [inputA, inputC], [{ bug: "Bug C", reproduced: "yes", members: ["kc"] }]);
+  await mkAggregateConfirmRun(out, "tgt-confirm-20260103T000000Z", [inputA, inputC], [{ bug: "Bug C", reproduced: "yes", recommendation: "drop", members: ["kc"] }]);
 
   const settled = await loadSettledFromPriorConfirm(out, "tgt", inputA, path.join(out, "tgt-confirm-cur"), [inputA, inputB]);
   assert.deepEqual(settled.map((r) => r.bug).sort(), ["Bug A newer", "Bug B"]);

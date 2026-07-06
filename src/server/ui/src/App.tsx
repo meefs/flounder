@@ -3442,25 +3442,31 @@ function ProjectOverviewDecisions({
 }) {
   if (!decisions.length) return null;
   const reproduced = confirmedDecisions(decisions).length;
+  const submissionReady = submissionReadyCount(decisions);
   const submitCandidates = submitCandidateCount(decisions);
+  const droppedReproductions = droppedReproductionCount(decisions);
   const missingReports = pendingDecisionReports(decisions).length;
   const meta = decisionCalloutMeta(decisions);
   const preview = overviewDecisionPreview(decisions);
   const remaining = decisions.length - preview.length;
-  const headline = submitCandidates
-    ? plural(submitCandidates, "submit candidate")
-    : reproduced
-      ? plural(reproduced, "real-target reproduction")
-      : plural(decisions.length, "decision");
+  const headline = submissionReady
+    ? plural(submissionReady, "submission-ready bug")
+    : droppedReproductions
+      ? `${plural(droppedReproductions, "reproduced decision")} dropped`
+      : reproduced
+        ? `${plural(reproduced, "real-target reproduction")} not submission-ready`
+        : "No submission-ready bugs";
   const detailParts = [
     plural(decisions.length, "decision"),
+    submissionReady ? plural(submissionReady, "submission-ready bug") : "0 submission-ready",
     reproduced ? plural(reproduced, "real-target reproduction") : "",
+    droppedReproductions ? `${plural(droppedReproductions, "reproduced decision")} dropped` : "",
     missingReports ? `${plural(missingReports, "formal report")} missing` : "",
     meta,
   ].filter(Boolean);
   return (
     <div id="project-submission-decisions" className="section-anchor">
-      <Card title={<span>Submission decisions <Counter>{submitCandidates || reproduced || decisions.length}</Counter></span>}>
+      <Card title={<span>Submission decisions <Counter>{decisions.length}</Counter></span>}>
         <div className="candidate-head">
           <div>
             <strong>{headline}</strong>
@@ -3473,6 +3479,7 @@ function ProjectOverviewDecisions({
         <div className="decision-list overview-decision-list">
           {preview.map((decision) => {
             const metaChips = decisionMetaChips(decision);
+            const dropReason = decisionDropReason(decision);
             return (
               <div className={`decision-row overview-decision-row${isSubmitCandidateDecision(decision) ? " submit-candidate" : ""}`} key={decision.id ?? `${decision.run_id}-${decision.bug}`}>
                 <div className="decision-main">
@@ -3487,10 +3494,11 @@ function ProjectOverviewDecisions({
                       ))}
                     </div>
                   ) : null}
+                  {dropReason ? <small className="decision-drop-reason">{dropReason}</small> : null}
                 </div>
                 <div className="decision-actions">
-                  <Button size="sm" icon="file" title={decision.has_report ? "Open submission report" : "Open generated decision report draft"} onClick={() => onOpenDecisionReport(decision)}>
-                    {decision.has_report ? "Submission report" : "Draft report"}
+                  <Button size="sm" icon="file" title={decisionReportButtonTitle(decision)} onClick={() => onOpenDecisionReport(decision)}>
+                    {decisionReportButtonLabel(decision)}
                   </Button>
                 </div>
               </div>
@@ -3568,6 +3576,14 @@ function decisionLabel(decision: ConfirmDecision): string {
 
 function isSubmitCandidateDecision(decision: ConfirmDecision): boolean {
   return decision.reproduced === "yes" && decision.recommendation === "submit-candidate";
+}
+
+function submissionReadyCount(decisions: ConfirmDecision[]): number {
+  return decisions.filter(isSubmissionReadyDecision).length;
+}
+
+function droppedReproductionCount(decisions: ConfirmDecision[]): number {
+  return decisions.filter((decision) => decision.reproduced === "yes" && decision.recommendation === "drop").length;
 }
 
 function overviewDecisionPreview(decisions: ConfirmDecision[]): ConfirmDecision[] {
@@ -3725,6 +3741,47 @@ function decisionAdjudicationChips(decision: ConfirmDecision): DecisionChip[] {
   ].filter((entry): entry is DecisionChip => Boolean(entry));
 }
 
+function adjudicationGate(adjudication: DecisionObject | undefined, needles: string[]): DecisionObject | undefined {
+  const gates = recordArrayField(adjudication, ["gates", "required_gates", "requiredGates"]);
+  return gates.find((gate) => {
+    const name = [stringField(gate, ["id", "kind", "name", "gate"]), stringField(gate, ["description", "label"])].join(" ").toLowerCase();
+    return needles.some((needle) => name.includes(needle));
+  });
+}
+
+function decisionDropReason(decision: ConfirmDecision): string {
+  if (decision.recommendation !== "drop") return "";
+  const adjudication = decisionStructuredObject(decision, "adjudication", "adjudication_json");
+  const gateDefs = [
+    { label: "Live impact", needles: ["live", "impact", "fund", "exposure", "deployment"], fallback: ["live_impact_status", "liveImpactStatus", "funds_status", "fundsStatus"] },
+    { label: "Payout", needles: ["payout", "reward", "collectible", "bounty"], fallback: ["payout_status", "payoutStatus", "reward_status", "rewardStatus"] },
+    { label: "Scope", needles: ["scope", "venue", "eligib"], fallback: ["scope_status", "scopeStatus"] },
+    { label: "Known issue", needles: ["known", "novel", "duplicate", "disclos"], fallback: ["known_issue_status", "knownIssueStatus", "novelty_status", "noveltyStatus"] },
+  ];
+  for (const gateDef of gateDefs) {
+    const status = gateStatus(adjudication, gateDef.needles, gateDef.fallback);
+    const kind = gateStatusKind(status);
+    if (kind !== "fail" && kind !== "open") continue;
+    const gate = adjudicationGate(adjudication, gateDef.needles);
+    const evidence = stringField(gate, ["evidence", "reason", "basis", "detail"]);
+    return `${gateDef.label}: ${evidence || badgeLabel(status)}`;
+  }
+  if (decision.human_gates?.trim()) return decision.human_gates.trim();
+  if (decision.repro_evidence?.trim()) return decision.repro_evidence.trim();
+  return "Decision report records the non-submittable reason.";
+}
+
+function decisionReportButtonLabel(decision: ConfirmDecision): string {
+  if (decision.has_report) return "Submission report";
+  return isSubmissionReadyDecision(decision) ? "Draft report" : "Decision report";
+}
+
+function decisionReportButtonTitle(decision: ConfirmDecision): string {
+  if (decision.has_report) return "Open submission report";
+  if (isSubmissionReadyDecision(decision)) return "Open generated submission draft";
+  return "Open decision report with reproduction, gates, and drop rationale";
+}
+
 function SeverityBadge({ value }: { value?: string | null }) {
   if (!value?.trim()) return null;
   const token = badgeToken(value);
@@ -3826,6 +3883,7 @@ function ConfirmDecisionsCard({
           {orderedDecisions.map((decision) => {
             const linkedFindings = decisionFindings(decision, findings);
             const metaChips = decisionMetaChips(decision);
+            const dropReason = decisionDropReason(decision);
             return (
               <div className={`decision-row${decision.recommendation === "submit-candidate" ? " submit-candidate" : ""}`} key={decision.id ?? `${decision.run_id}-${decision.bug}`}>
                 <div className="decision-main">
@@ -3841,6 +3899,7 @@ function ConfirmDecisionsCard({
                       ))}
                     </div>
                   ) : null}
+                  {dropReason ? <small className="decision-drop-reason">{dropReason}</small> : null}
                   {linkedFindings.length ? (
                     <div className="linked-findings" aria-label="Linked findings">
                       {linkedFindings.map((finding) => (
@@ -3852,8 +3911,8 @@ function ConfirmDecisionsCard({
                   ) : null}
                 </div>
                 <div className="decision-actions">
-                  <Button size="sm" icon="file" title={decision.has_report ? "Open submission report" : "Open generated decision report draft"} onClick={() => onOpenDecisionReport(decision)}>
-                    {decision.has_report ? "Submission report" : "Draft report"}
+                  <Button size="sm" icon="file" title={decisionReportButtonTitle(decision)} onClick={() => onOpenDecisionReport(decision)}>
+                    {decisionReportButtonLabel(decision)}
                   </Button>
                 </div>
               </div>
@@ -3866,16 +3925,23 @@ function ConfirmDecisionsCard({
 }
 
 function RealTargetCallout({ decisions, onOpen }: { decisions: ConfirmDecision[]; onOpen: () => void }) {
-  const reproduced = decisions.filter((decision) => decision.reproduced === "yes").length;
-  const submitCandidates = submitCandidateCount(decisions);
+  const reproduced = confirmedDecisions(decisions).length;
+  const submissionReady = submissionReadyCount(decisions);
+  const droppedReproductions = droppedReproductionCount(decisions);
   const meta = decisionCalloutMeta(decisions);
   if (!decisions.length) return null;
+  const headline = submissionReady
+    ? plural(submissionReady, "submission-ready bug")
+    : droppedReproductions
+      ? `${plural(droppedReproductions, "reproduced decision")} dropped`
+      : "No submission-ready bugs";
+  const tone = submissionReady ? "ready" : droppedReproductions ? "blocked" : "neutral";
   return (
-    <button className="real-target-callout" type="button" onClick={onOpen}>
+    <button className={`real-target-callout ${tone}`} type="button" onClick={onOpen}>
       <span className="dot" />
       <span>
-        <strong>{plural(reproduced, "real-target reproduction")}</strong>
-        <small>{plural(decisions.length, "decision")} recorded{submitCandidates ? ` · ${plural(submitCandidates, "submit candidate")}` : ""}{meta ? ` · ${meta}` : ""}. Open decision reports.</small>
+        <strong>{headline}</strong>
+        <small>{plural(decisions.length, "decision")} recorded{reproduced ? ` · ${plural(reproduced, "real-target reproduction")}` : ""}{droppedReproductions ? ` · ${plural(droppedReproductions, "reproduced decision")} dropped` : ""}{meta ? ` · ${meta}` : ""}. Open decision reports.</small>
       </span>
       <Icon name="arrowright" size={14} />
     </button>
@@ -5946,7 +6012,7 @@ function DecisionReportModal({ decision, onClose }: { decision: ConfirmDecision;
     };
   }, [decision.id, fallback]);
   return (
-    <Modal title={`Submission report #${decision.id ?? ""}`} wide onClose={onClose}>
+    <Modal title={`${decision.has_report ? "Submission report" : "Decision report"} #${decision.id ?? ""}`} wide onClose={onClose}>
       {loading ? <EmptyInline>Loading report...</EmptyInline> : null}
       {!loading && error ? <div className="inline-note">Showing a generated decision summary because the DB report endpoint could not be loaded.</div> : null}
       <MarkdownReport markdown={markdown} fileName={`decision-${decision.id ?? "report"}.md`} />
