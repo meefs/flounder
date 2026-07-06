@@ -1012,7 +1012,7 @@ Usage:
   flounder verify  <file> --source <paths...>                                     alias for audit --verify: confirm/refute suspected findings locally
   flounder confirm <run-dir> --source <paths...>                                  open-world: reproduce a run's findings on the real target
   flounder report  --project <uuid|name> [--finding <id>...] [--all]              generate missing reports or regenerate selected/all formal reports
-  flounder continue --project <uuid|name>                                         continue the stored project pipeline (same as the UI Continue button)
+  flounder continue --project <uuid|name>                                         finish the stored project pipeline round (same as the UI Continue button)
   flounder history import-run --target <name> --run <dir>
   flounder server project list                                                   list tracked projects
   flounder server run list [--project <name>]                                    list run history globally or for one project
@@ -1121,6 +1121,7 @@ flounder continue:
   --project <uuid|name>   tracked UI/API project. Names are resolved client-side when unique.
   --verify-from-start     re-run Verify from the beginning instead of only pending candidates.
   --remap                 re-enumerate scopes from scratch before digging.
+  --continue-coverage     explicitly open another mapped scope batch after the current round is settled.
   --coverage <mode>       focused|standard|half|full|custom one-off coverage mode.
   --max-scopes <n>        one-off scope cap, or custom target when --coverage custom.
 `);
@@ -1153,14 +1154,19 @@ Usage:
 
 This is the CLI equivalent of the UI Continue button. It queues project work with
 verb:"run", so the control plane decides the next phase from stored project state:
-prepare if needed, map/dig pending scopes, verify pending claims, confirm pending
-real-target findings, and generate missing reports.
+prepare if needed, finish the current map/dig batch, verify pending claims,
+confirm pending real-target findings, and generate missing reports.
+
+After a round has produced its reports, plain continue stops. Pass
+--continue-coverage, --coverage, or --max-scopes only when you intentionally want
+to open another mapped scope batch.
 
 Options:
   --project <uuid|name>     tracked UI/API project; names are allowed when unique
   --verify-from-start       re-run Verify from the beginning instead of only pending candidates
   --remap                   re-enumerate scopes from scratch before digging
   --quick                   single breadth pass instead of map -> dig
+  --continue-coverage       explicitly open another mapped scope batch after this round is settled
   --coverage <mode>         focused|standard|half|full|custom one-off coverage mode
   --max-scopes <n>          one-off scope cap, or custom target when --coverage custom
   --map-steps <n>           one-off map turn cap

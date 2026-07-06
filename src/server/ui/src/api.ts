@@ -429,6 +429,7 @@ export interface LaunchPayload {
   quick?: boolean;
   mockLlm?: boolean;
   pipeline?: boolean;
+  continueCoverage?: boolean;
   remap?: boolean;
   verifyFromStart?: boolean;
   findingId?: number;

@@ -59,6 +59,7 @@ test("api: GET /api is a self-describing catalog of every resource + operation",
     const projectRun = cat.endpoints.find((e) => e.method === "POST" && e.path === "/api/projects/:uuid/runs");
     assert.match(projectRun.body.verb, /report/);
     assert.match(projectRun.body.verifyFromStart, /re-run Verify from the beginning/);
+    assert.match(projectRun.body.continueCoverage, /explicit opt-in/);
     assert.match(projectRun.body.scopeCoverageMode, /one-off coverage mode/);
     assert.match(projectRun.body.maxScopes, /one-off scope cap/);
     assert.match(projectRun.body.mapSteps, /one-off map turn cap/);
@@ -417,7 +418,7 @@ test("api: full coverage continues prepared pending inventory without a scope ca
   });
 });
 
-test("api: standard pipeline continue opens the next 30-scope batch after the first batch is settled", async () => {
+test("api: standard pipeline continue stops after a settled round unless coverage continuation is explicit", async () => {
   await withServer(async (base, out) => {
     const json = (r) => r.json();
     const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -437,11 +438,19 @@ test("api: standard pipeline continue opens the next 30-scope batch after the fi
       store.close();
     }
 
-    const pipeline = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "run", pipeline: true }));
+    const stopped = await post(`/api/projects/${created.uuid}/runs`, { verb: "run", pipeline: true });
+    assert.equal(stopped.status, 409);
+    const blocked = await json(stopped);
+    assert.equal(blocked.roundComplete, true);
+    assert.equal(blocked.continueCoverageRequired, true);
+    assert.equal(blocked.progress.pending, 35);
+
+    const pipeline = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "run", pipeline: true, continueCoverage: true }));
     assert.equal(pipeline.queued, true);
     const pipelineJob = (await json(await fetch(base + "/api/jobs/" + pipeline.jobId))).job;
     const pipelineSpec = JSON.parse(pipelineJob.spec_json);
     assert.equal(pipelineSpec.pipeline, true);
+    assert.equal(pipelineSpec.continueCoverage, true);
     assert.equal(pipelineSpec.coverageMode, "standard");
     assert.equal(pipelineSpec.coverageTarget, 30);
     assert.equal(pipelineSpec.maxScopes, 30);
@@ -449,8 +458,8 @@ test("api: standard pipeline continue opens the next 30-scope batch after the fi
 
     const continued = await post(`/api/projects/${created.uuid}/runs`, { verb: "run" });
     assert.equal(continued.status, 409);
-    const blocked = await json(continued);
-    assert.match(blocked.error, /Standard coverage is already complete/);
+    const nonPipelineBlocked = await json(continued);
+    assert.match(nonPipelineBlocked.error, /Standard coverage is already complete/);
 
     const launched = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "audit", scope: "pending-0" }));
     assert.equal(launched.queued, true);

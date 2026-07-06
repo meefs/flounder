@@ -18,12 +18,23 @@ test("cli continue builds the project run pipeline body", () => {
     verb: "run",
     verifyFromStart: true,
     mockLlm: true,
+    continueCoverage: true,
     scopeCoverageMode: "custom",
     maxScopes: 3,
     mapSteps: 5,
     digSteps: 7,
     digSamples: 2,
     digConcurrency: 2,
+  });
+});
+
+test("cli continue leaves coverage closed by default", () => {
+  assert.deepEqual(buildProjectContinueBody(["--project", "demo"]), {
+    verb: "run",
+  });
+  assert.deepEqual(buildProjectContinueBody(["--project", "demo", "--continue-coverage"]), {
+    verb: "run",
+    continueCoverage: true,
   });
 });
 

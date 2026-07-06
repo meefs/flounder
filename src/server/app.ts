@@ -268,7 +268,7 @@ const ROUTES: Route[] = [
       region: "string? — audit: pinned region e.g. src/Foo.sol:120-180", scope: "string? — audit: scope id(s)", verifyFindings: "object|array? — audit: inline suspected finding(s) to confirm-or-refute by execution; project finding rows with id are linked back to that original row",
       allowMaterialDrift: "boolean? — expert override for verifyFindings when a newer Prepare run changed project materials after the selected findings were produced",
       regenerateReports: "boolean? — report: include findings that already have formal reports; selected findingIds are always regenerated",
-      scopeCoverageMode: "focused|standard|half|full|custom? — one-off coverage mode for this run; standard means audit until the project has 30 audited scopes, then pipeline Continue starts the next 30-scope batch after verify/confirm/report are settled",
+      scopeCoverageMode: "focused|standard|half|full|custom? — one-off coverage mode for this run; standard means audit until the project has 30 audited scopes; pass continueCoverage:true to explicitly start another scope batch after verify/confirm/report are settled",
       maxScopes: "number? — one-off scope cap for this run, or the custom target when scopeCoverageMode=custom", mapSteps: "number? — one-off map turn cap", digSteps: "number? — one-off per-scope dig turn cap",
       maxSteps: "number? — one-off global turn cap", digSamples: "number? — one-off samples per scope", digConcurrency: "number? — one-off parallel scopes",
       findingId: "number? — confirm/report: reproduce or report one selected finding",
@@ -439,7 +439,7 @@ const ROUTES: Route[] = [
       provider: "string?", model: "string?", thinking: "string?",
       scopeCoverageMode: "focused|standard|half|full|custom? — standard/focused are cumulative project targets, not per-run additions", maxScopes: "number?", mapSteps: "number?", digSteps: "number?", maxSteps: "number?", digSamples: "number?", digConcurrency: "number?",
       sandboxBackend: "'auto'|'oci'|'apple-container'|'host'?", sandboxImage: "string?", sandboxAllowHostFallback: "boolean?", sandboxPrepareNetwork: "'none'|'enabled'?", sandboxConfirmNetwork: "'none'|'enabled'?",
-      remap: "boolean?", quick: "boolean?", mockLlm: "boolean?", pipeline: "boolean? — run clue pipeline: prepare if needed -> map/dig -> synthesize -> verify -> confirm -> report", verifyFromStart: "boolean? — pipeline: re-run Verify from the beginning instead of only pending candidates", region: "string?", scope: "string?", scopeNote: "string? — map/audit: 'authorized scope note' that focuses map on the in-scope target (the pipeline auto-derives it from prepare's manifest)", verifyFindings: "object|array? — audit: inline suspected finding(s) to confirm-or-refute by execution",
+      remap: "boolean?", quick: "boolean?", mockLlm: "boolean?", pipeline: "boolean? — run clue pipeline: prepare if needed -> map/dig -> synthesize -> verify -> confirm -> report", continueCoverage: "boolean? — explicit opt-in to open the next mapped scope batch after the current pipeline round is fully settled", verifyFromStart: "boolean? — pipeline: re-run Verify from the beginning instead of only pending candidates", region: "string?", scope: "string?", scopeNote: "string? — map/audit: 'authorized scope note' that focuses map on the in-scope target (the pipeline auto-derives it from prepare's manifest)", verifyFindings: "object|array? — audit: inline suspected finding(s) to confirm-or-refute by execution",
       inputRunDir: "string? — confirm", fresh: "boolean? — confirm",
       clue: "string? — prepare", posture: "string? — prepare", matchDeployed: "boolean? — prepare", endpoint: "string? — prepare",
     },
@@ -2174,6 +2174,16 @@ async function runLaunch(c: Ctx): Promise<void> {
   promoteSettledPipelineCoverageBatch(spec, c.store, projectId, progress, currentResultRunIds, materialBoundary, runs);
   const materialDrift = verifyMaterialDrift(c.store, projectId, spec.verifyFindings, body.allowMaterialDrift === true);
   if (materialDrift) return sendJson(c.res, 409, materialDrift);
+  if (spec.verb === "run" && spec.pipeline && pipelineRoundComplete(spec, progress, c.store, projectId, currentResultRunIds, materialBoundary, runs)) {
+    return sendJson(c.res, 409, {
+      error: "Current pipeline round is complete. Pass continueCoverage:true, choose a coverage mode, or use Dig pending scopes to start another scope batch.",
+      roundComplete: true,
+      continueCoverageRequired: true,
+      coverageMode: spec.coverageMode,
+      coverageTarget: spec.coverageTarget,
+      progress,
+    });
+  }
   if (coverageTargetReached(spec) && !(spec.verb === "run" && spec.pipeline)) {
     const target = spec.coverageTarget;
     const denominator = target ? Math.min(target, progress.total || target) : progress.total;
@@ -2316,9 +2326,26 @@ function promoteSettledPipelineCoverageBatch(
 ): void {
   if (spec.verb !== "run" || !spec.pipeline) return;
   if (spec.coverageMode !== "standard" || spec.coverageTarget !== 30 || spec.maxScopes !== 0) return;
+  if (!spec.continueCoverage) return;
   if (progress.pending <= 0) return;
   if (pipelinePostAuditWorkPending(store, projectId, currentResultRunIds, materialBoundary, runs)) return;
   spec.maxScopes = Math.min(30, progress.pending);
+}
+
+function pipelineRoundComplete(
+  spec: LaunchSpec,
+  _progress: Coverage,
+  store: MetadataStore,
+  projectId: number,
+  currentResultRunIds: Set<number>,
+  materialBoundary: Record<string, unknown> | undefined,
+  runs: Array<Record<string, unknown>>,
+): boolean {
+  if (spec.continueCoverage) return false;
+  if (spec.maxScopes !== 0) return false;
+  if (!coverageTargetReached(spec)) return false;
+  if (pipelinePostAuditWorkPending(store, projectId, currentResultRunIds, materialBoundary, runs)) return false;
+  return true;
 }
 
 function pipelinePostAuditWorkPending(
@@ -2741,6 +2768,7 @@ function normalizeLaunchSpec(body: Record<string, unknown>, target: string, verb
     quick: bool(body.quick),
     mockLlm: bool(body.mockLlm),
     pipeline: bool(body.pipeline),
+    continueCoverage: bool(body.continueCoverage),
     verifyFromStart: bool(body.verifyFromStart),
     region: str(body.region),
     scope: str(body.scope),
@@ -4294,6 +4322,11 @@ function launchSpec(store: MetadataStore, project: Record<string, unknown>, body
   const bodyOverrides = runBodyConfigOverrides(body);
   const merged = { ...cfg, ...configOverrides, ...bodyOverrides };
   const explicitRunMaxScopes = configOverrides.maxScopes !== undefined || bodyOverrides.maxScopes !== undefined;
+  const explicitCoverageContinuation =
+    body.continueCoverage === true
+    || configOverrides.scopeCoverageMode !== undefined
+    || bodyOverrides.scopeCoverageMode !== undefined
+    || explicitRunMaxScopes;
   const num = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
   const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
   const backend = (v: unknown): SandboxBackend | undefined => isSandboxBackend(v) ? v : undefined;
@@ -4369,6 +4402,7 @@ function launchSpec(store: MetadataStore, project: Record<string, unknown>, body
     quick: Boolean(body.quick),
     mockLlm: Boolean(body.mockLlm),
     pipeline,
+    continueCoverage: explicitCoverageContinuation,
     verifyFromStart: Boolean(body.verifyFromStart),
     region: str(body.region),
     scope: str(body.scope),
