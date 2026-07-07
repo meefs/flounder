@@ -615,6 +615,64 @@ test("api: standard pipeline continue resumes an interrupted batch before pendin
   });
 });
 
+test("api: successful later coverage clears stale interrupted-batch remainder before confirm readiness", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const created = await json(await post("/api/projects", {
+      name: "standard-pipeline-stale-interrupt-cleared",
+      sourcePaths: ["./src"],
+      config: { scopeCoverageMode: "standard" },
+    }));
+
+    const store = MetadataStore.openForOutput(out);
+    try {
+      store.upsertScopes(created.id, [
+        ...Array.from({ length: 60 }, (_, i) => ({ scopeId: `audited-${i}`, title: `Audited ${i}`, status: "audited", score: 100 - i })),
+        ...Array.from({ length: 12 }, (_, i) => ({ scopeId: `pending-${i}`, title: `Pending ${i}`, status: "pending", score: 12 - i })),
+      ]);
+      const killedRun = store.startRun({ projectId: created.id, kind: "run", runDir: path.join(out, "standard-pipeline-stale-interrupt-killed") });
+      store.updateRunScopes(killedRun, 28, 30);
+      store.finishRun(killedRun, "killed");
+      const laterRun = store.startRun({ projectId: created.id, kind: "audit", runDir: path.join(out, "standard-pipeline-stale-interrupt-later") });
+      store.updateRunScopes(laterRun, 16, 16);
+      store.upsertFindings(created.id, laterRun, [
+        {
+          findingKey: "kgated",
+          title: "Reproduced but still needs submission gating",
+          location: "src/A.sol:1",
+          severity: "high",
+          status: "confirmed-executable",
+          evidence: "local proof",
+        },
+      ], "differential");
+      store.finishRun(laterRun, "done");
+      const confirmRun = store.startRun({ projectId: created.id, kind: "confirm", runDir: path.join(out, "standard-pipeline-stale-interrupt-confirm") });
+      store.upsertConfirmDecisions(created.id, confirmRun, [
+        {
+          bug: "Reproduced but still needs submission gating",
+          reproduced: "yes",
+          recommendation: "needs-human",
+          members: ["kgated"],
+          reproEvidence: "purpose=confirm command reproduced the target effect",
+          humanGates: "Live deployment and payout eligibility need human review.",
+        },
+      ]);
+      store.finishRun(confirmRun, "done");
+    } finally {
+      store.close();
+    }
+
+    const pipeline = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "run", pipeline: true }));
+    assert.equal(pipeline.queued, true);
+    const pipelineJob = (await json(await fetch(base + "/api/jobs/" + pipeline.jobId))).job;
+    const pipelineSpec = JSON.parse(pipelineJob.spec_json);
+    assert.equal(pipelineSpec.pipeline, true);
+    assert.equal(pipelineSpec.maxScopes, 0);
+    assert.equal(pipelineSpec.sandboxConfirmNetwork, "enabled");
+  });
+});
+
 test("api: project prepare defaults leave prepare turns unbounded", async () => {
   await withServer(async (base) => {
     const json = (r) => r.json();
