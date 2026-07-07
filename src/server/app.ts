@@ -2308,9 +2308,10 @@ function latestInterruptedCoverageBatchRemainder(runs: Array<Record<string, unkn
     const kind = stringValue(run.kind);
     if (kind !== "run" && kind !== "audit") continue;
     const status = stringValue(run.status);
-    if (status !== "killed" && status !== "error") continue;
     const target = Math.max(0, Math.floor(numberValue(run.run_scopes_target)));
     const done = Math.max(0, Math.floor(numberValue(run.run_scopes_done)));
+    if (status === "done" && done > 0) return 0;
+    if (status !== "killed" && status !== "error") continue;
     if (target > 0 && done < target) return target - done;
   }
   return 0;
