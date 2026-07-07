@@ -220,6 +220,37 @@ test("confirm-mode bash MAY fork and read live networks (the open-world differen
   assert.equal(analyzeAgentBashCommandSafety(cmd("forge", "test", "--fork-url", "https://eth.llamarpc.com")).blocked, true);
 });
 
+test("confirm-mode bash cannot smuggle remote URLs into generated test files", () => {
+  const pythonWrite = cmd(
+    "python3",
+    "-c",
+    "open('poc/Scarb.toml','w').write('[[tool.snforge.fork]]\\nurl = \"https://rpc.starknet.lava.build\"\\n')",
+  );
+  const nodeWrite = cmd(
+    "node",
+    "-e",
+    "require('fs').writeFileSync('repro/config.json', '{\"rpc\":\"https://mainnet.example\"}')",
+  );
+  for (const c of [pythonWrite, nodeWrite]) {
+    const decision = analyzeConfirmBashCommandSafety(c);
+    assert.equal(decision.blocked, true, `${c.program} ${c.args.join(" ")} must be blocked`);
+    assert.match(decision.reason, /generated test file.*remote URLs/i);
+  }
+
+  assert.equal(
+    analyzeConfirmBashCommandSafety(
+      cmd("python3", "-c", "open('poc/Scarb.toml','w').write('[dependencies]\\nstaking = { path = \"..\" }\\n')"),
+    ).blocked,
+    false,
+  );
+  assert.equal(
+    analyzeConfirmBashCommandSafety(
+      cmd("python3", "-c", "import urllib.request; print(urllib.request.urlopen('https://rpc.starknet.lava.build').status)"),
+    ).blocked,
+    false,
+  );
+});
+
 test("confirm-mode bash still NEVER broadcasts a transaction to a non-local network (white-hat line)", () => {
   for (const c of [
     cmd("cast", "send", "--rpc-url", "https://mainnet.example", "0xabc", "drain()"),

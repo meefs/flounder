@@ -170,6 +170,8 @@ export function analyzeConfirmBashCommandSafety(command: StructuredReproductionC
   if (workspaceDecision.blocked) return workspaceDecision;
   const destructiveDecision = analyzeDestructiveFilesystemCommandSafety(program, args);
   if (destructiveDecision.blocked) return destructiveDecision;
+  const inlineFileDecision = analyzeInlineGeneratedFileWriteSafety(program, args);
+  if (inlineFileDecision.blocked) return inlineFileDecision;
   const rendered = [program, ...args].join(" ");
   const broadcast = findMatch(rendered, CONFIRM_BROADCAST_PATTERNS);
   if (broadcast && targetsNonLocalNetwork(args)) {
@@ -181,6 +183,61 @@ export function analyzeConfirmBashCommandSafety(command: StructuredReproductionC
     };
   }
   return { blocked: false };
+}
+
+function analyzeInlineGeneratedFileWriteSafety(program: string, args: string[]): CommandSafetyDecision {
+  const payload = inlineCommandPayload(program, args);
+  if (!payload) return { blocked: false };
+  const matchedNetwork = firstNonLocalRemoteUrl(payload);
+  if (!matchedNetwork) return { blocked: false };
+  const matchedAction = firstInlineWriteTarget(payload);
+  if (!matchedAction) return { blocked: false };
+  return {
+    blocked: true,
+    reason: `Blocked by flounder guardrail: generated test file ${matchedAction} must not reference remote URLs.`,
+    matchedNetwork,
+    matchedAction,
+  };
+}
+
+function inlineCommandPayload(program: string, args: string[]): string | undefined {
+  const name = program.toLowerCase();
+  if (name === "python" || name === "python3" || name === "node" || name === "deno" || name === "bun") {
+    for (let idx = 0; idx < args.length - 1; idx += 1) {
+      const arg = args[idx];
+      if (arg === "-c" || arg === "-e" || arg === "--eval") return args[idx + 1];
+    }
+  }
+  if (name === "sh" || name === "bash" || name === "zsh") {
+    for (let idx = 0; idx < args.length - 1; idx += 1) {
+      const arg = args[idx] ?? "";
+      if (arg === "-c" || /^[+-]?[a-zA-Z]*c[a-zA-Z]*$/.test(arg)) return args[idx + 1];
+    }
+  }
+  return undefined;
+}
+
+function firstInlineWriteTarget(payload: string): string | undefined {
+  const patterns = [
+    /\bopen\(\s*["']([^"']+)["']\s*,\s*["'][^"']*[wa+][^"']*["']/g,
+    /\b(?:Path|pathlib\.Path)\(\s*["']([^"']+)["']\s*\)\.write_(?:text|bytes)\s*\(/g,
+    /\b(?:fs\.)?(?:writeFile|writeFileSync)\(\s*["']([^"']+)["']/g,
+    />\s*([A-Za-z0-9._/+:-]*(?:poc|repro|harness|verify|verification|flounder)[A-Za-z0-9._/+:-]*)/gi,
+  ];
+  for (const pattern of patterns) {
+    for (const match of payload.matchAll(pattern)) {
+      const target = match[1]?.trim();
+      if (target) return target;
+    }
+  }
+  return undefined;
+}
+
+function firstNonLocalRemoteUrl(input: string): string | undefined {
+  for (const url of input.match(/\bhttps?:\/\/[^\s"'`<>\\]+/gi) ?? []) {
+    if (!isLocalUrl(url)) return url;
+  }
+  return undefined;
 }
 
 /** True if any rpc/network flag points off-localhost, or a remote URL / RPC-secret reference appears in argv. */
