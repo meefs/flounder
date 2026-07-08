@@ -2920,6 +2920,20 @@ small {
   background: color-mix(in srgb, var(--warning) 8%, var(--canvas));
 }
 
+.contest-review {
+  margin: 12px 0 0;
+}
+
+.contest-review.info {
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
+  background: color-mix(in srgb, var(--accent) 6%, var(--canvas));
+}
+
+.contest-review.warning {
+  border-color: color-mix(in srgb, var(--warning) 44%, var(--border));
+  background: color-mix(in srgb, var(--warning) 8%, var(--canvas));
+}
+
 .run-notice.compact {
   margin-top: 0;
 }

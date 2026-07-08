@@ -3,12 +3,14 @@ dist/
 runs/
 out/
 cache/
+tmp/
 .audit-targets/
 .npm-cache/
 .gstack/
 .codex/
 .DS_Store
 *.log
+screenlog.*
 *.pdf
 *.zip
 .env

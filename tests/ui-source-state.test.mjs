@@ -18,7 +18,7 @@ async function loadDomainModule() {
   return import(`data:text/javascript;base64,${Buffer.from(compiled.outputText).toString("base64")}`);
 }
 
-const { phaseState, projectSourceState, runProgress, sortConfirmDecisionsForSubmission } = await loadDomainModule();
+const { contestReviewState, phaseState, projectSourceState, runProgress, sortConfirmDecisionsForSubmission } = await loadDomainModule();
 
 test("ui: source setup is ready when configured source paths exist", () => {
   assert.deepEqual(projectSourceState(null, ["src"]), { kind: "configured", ok: true });
@@ -38,6 +38,64 @@ test("ui: source setup is ready when prepare produced an audit-ready workspace",
 test("ui: source setup stays missing when prepared workspace is unavailable or not audit-ready", () => {
   assert.deepEqual(projectSourceState({ prepareSummary: { quality: "ready", auditReady: true, workspace: { exists: false } } }, []), { kind: "missing", ok: false });
   assert.deepEqual(projectSourceState({ prepareSummary: { quality: "preparing", auditReady: false, workspace: { exists: true } } }, []), { kind: "missing", ok: false });
+});
+
+test("ui: contest review state flags elapsed review windows", () => {
+  const state = contestReviewState({
+    project: { created_at: "2000-01-01T00:00:00.000Z" },
+    runs: [],
+    allFindings: [],
+    progress: { total: 0, audited: 0, pending: 0 },
+  }, {
+    engagement: {
+      kind: "bug-bounty-contest",
+      strategy: { stopAfterHours: 48 },
+    },
+  });
+  assert.equal(state.kind, "review-due");
+  assert.equal(state.tone, "warning");
+});
+
+test("ui: contest review state detects low marginal yield over recent batches", () => {
+  const state = contestReviewState({
+    project: { created_at: "2099-01-01T00:00:00.000Z" },
+    runs: [
+      { id: 3, kind: "run", status: "done", run_scopes_done: 10, started_at: "2026-01-03T00:00:00.000Z" },
+      { id: 2, kind: "run", status: "done", run_scopes_done: 10, started_at: "2026-01-02T00:00:00.000Z" },
+      { id: 1, kind: "run", status: "done", run_scopes_done: 10, started_at: "2026-01-01T00:00:00.000Z" },
+    ],
+    allFindings: [
+      { id: 1, run_id: 1, status: "confirmed-executable" },
+      { id: 2, run_id: 3, status: "suspected" },
+    ],
+    progress: { total: 30, audited: 30, pending: 0 },
+  }, {
+    engagement: {
+      kind: "bug-bounty-contest",
+      strategy: { batchScopes: 10, appendMapWhenExhausted: true },
+    },
+  });
+  assert.equal(state.kind, "low-yield");
+  assert.equal(state.recentAuditedScopes, 20);
+  assert.equal(state.recentConfirmedFindings, 0);
+});
+
+test("ui: contest review state surfaces exhausted inventory before append-map expansion", () => {
+  const state = contestReviewState({
+    project: { created_at: "2099-01-01T00:00:00.000Z" },
+    runs: [
+      { id: 1, kind: "run", status: "done", run_scopes_done: 10, started_at: "2026-01-01T00:00:00.000Z" },
+    ],
+    allFindings: [],
+    progress: { total: 10, audited: 10, pending: 0 },
+  }, {
+    engagement: {
+      kind: "bug-bounty-contest",
+      strategy: { batchScopes: 10, appendMapWhenExhausted: true },
+    },
+  });
+  assert.equal(state.kind, "inventory-exhausted");
+  assert.equal(state.tone, "info");
 });
 
 test("ui: phase cards count report packages by reproduced decision, not linked findings", () => {

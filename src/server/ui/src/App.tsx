@@ -22,6 +22,7 @@ import {
 import { Button, Card, Counter, IconButton, Modal, StateBadge, StatusBadge } from "./components";
 import {
   confirmedDecisions,
+  contestReviewState,
   contestStrategy,
   currentMaterialDetail,
   currentMaterialConfirmDecisions,
@@ -2715,6 +2716,7 @@ function ProjectDetailView(props: {
   const materialRefreshActive = materialRefreshInProgress(detail.material);
   const currentDetail = currentMaterialDetail(detail);
   const phases = phaseState(currentDetail, progress);
+  const contestReview = contestReviewState(currentDetail, config.cfg);
   const currentRuns = currentMaterialRuns(detail.runs, detail.material);
   const topCandidates = topCandidateFindings(allFindings);
   const verifyCandidates = pendingVerifyFindings(allFindings);
@@ -2989,6 +2991,12 @@ function ProjectDetailView(props: {
                   ? "New launches are locked until this run finishes or you stop it."
                 : "No daemon is online, so the run may be stalled until an executor reconnects."} Current progress: {runProgress(runningRun, confirmDecisions)}.
             </span>
+          </div>
+        ) : null}
+        {contestReview ? (
+          <div className={`info-panel contest-review ${contestReview.tone}`}>
+            <strong>{contestReview.label}</strong>
+            <span>{contestReview.detail}</span>
           </div>
         ) : null}
         <div className="pipeline" aria-label="Audit pipeline">
