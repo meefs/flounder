@@ -149,6 +149,8 @@ export async function runSandboxCommand(
   const cwd = command.cwd ? await resolveWorkspacePathForRead(workspaceAbsolute, command.cwd) : workspaceAbsolute;
   const started = Date.now();
   const tmpDir = path.join(workspaceAbsolute, ".tmp");
+  const options = normalizeSandboxExecutionOptions(executionOptions);
+  const executionCommand = hardenNetworkEnabledCommand(command, options.network);
   await mkdir(tmpDir, { recursive: true });
   // A persistent, host-isolated package cache (CARGO_HOME etc.) when provided, so
   // dependency builds are downloaded once and reused across runs. HOME stays the
@@ -156,26 +158,57 @@ export async function runSandboxCommand(
   if (cacheDir) await mkdir(cacheDir, { recursive: true });
   await restoreSandboxToolCaches(workspaceAbsolute, cacheDir);
   const raw = await runWithSelectedBackend({
-    command,
+    command: executionCommand,
     workspaceAbsolute,
     cwdAbsolute: cwd,
     tmpDir,
     ...(cacheDir ? { cacheDir } : {}),
     maxLogBytes,
-    options: normalizeSandboxExecutionOptions(executionOptions),
+    options,
   });
   await persistSandboxToolCaches(workspaceAbsolute, cacheDir);
 
   const redactionScope = [workspaceAbsolute, tmpDir, ...redactPaths, ...machineRedactionPaths()];
   return {
-    command,
+    command: executionCommand,
     exitCode: raw.exitCode,
-    expectedExitCode: command.expectedExitCode ?? 0,
+    expectedExitCode: executionCommand.expectedExitCode ?? 0,
     timedOut: raw.timedOut,
     durationMs: Date.now() - started,
     stdout: redactMachineStrings(redactLocalPaths(raw.stdout, redactionScope)),
     stderr: redactMachineStrings(redactLocalPaths(raw.stderr, redactionScope)),
   };
+}
+
+/**
+ * Network-enabled fetch tools run with framework-owned clean-config and protocol
+ * arguments. The model cannot remove these because they are attached after policy
+ * classification, immediately before the sandbox process is spawned.
+ */
+export function hardenNetworkEnabledCommand(command: ReproductionCommand, network: SandboxNetworkMode): ReproductionCommand {
+  if (network !== "enabled") return command;
+  const program = command.program.trim().toLowerCase();
+  if (program === "curl") {
+    return {
+      ...command,
+      args: ["--disable", "--proto", "=http,https", "--proto-redir", "=http,https", ...command.args],
+    };
+  }
+  if (program === "wget") {
+    return { ...command, args: ["--no-config", ...command.args] };
+  }
+  if (program === "git") {
+    return {
+      ...command,
+      args: [
+        "-c", "core.hooksPath=/dev/null",
+        "-c", "init.templateDir=",
+        "-c", "credential.helper=",
+        ...command.args,
+      ],
+    };
+  }
+  return command;
 }
 
 async function restoreSandboxToolCaches(workspaceAbsolute: string, cacheDir?: string): Promise<void> {
@@ -361,7 +394,7 @@ async function runHostSandboxProcess(input: ProcessRunInput): Promise<{ stdout: 
     program: input.command.program,
     args: input.command.args,
     cwd: input.cwdAbsolute,
-    env: sandboxEnv(input.workspaceAbsolute, input.tmpDir, input.cacheDir),
+    env: sandboxEnv(input.workspaceAbsolute, input.tmpDir, input.cacheDir, input.command, input.options.network),
     timeoutMs: input.command.timeoutMs ?? 120_000,
     maxLogBytes: input.maxLogBytes,
   });
@@ -401,7 +434,7 @@ async function runOciSandboxProcess(input: ProcessRunInput): Promise<{ stdout: s
   }
   if (input.options.memoryMb !== undefined) dockerArgs.push("--memory", `${Math.max(64, Math.floor(input.options.memoryMb))}m`);
   if (input.options.cpus !== undefined) dockerArgs.push("--cpus", String(Math.max(0.1, input.options.cpus)));
-  for (const [key, value] of Object.entries(sandboxEnv("/workspace", "/workspace/.tmp", input.cacheDir ? "/cache" : undefined))) {
+  for (const [key, value] of Object.entries(sandboxEnv("/workspace", "/workspace/.tmp", input.cacheDir ? "/cache" : undefined, input.command, input.options.network))) {
     if (value !== undefined) dockerArgs.push("--env", `${key}=${value}`);
   }
   dockerArgs.push(input.options.image, input.command.program, ...input.command.args);
@@ -459,7 +492,7 @@ async function runAppleContainerSandboxProcess(input: ProcessRunInput): Promise<
   }
   if (input.options.memoryMb !== undefined) containerArgs.push("--memory", `${Math.max(64, Math.floor(input.options.memoryMb))}M`);
   if (input.options.cpus !== undefined) containerArgs.push("--cpus", String(Math.max(0.1, input.options.cpus)));
-  for (const [key, value] of Object.entries(sandboxEnv("/workspace", "/workspace/.tmp", input.cacheDir ? "/cache" : undefined))) {
+  for (const [key, value] of Object.entries(sandboxEnv("/workspace", "/workspace/.tmp", input.cacheDir ? "/cache" : undefined, input.command, input.options.network))) {
     if (value !== undefined) containerArgs.push("--env", `${key}=${value}`);
   }
   containerArgs.push(input.options.image, input.command.program, ...input.command.args);
@@ -883,7 +916,7 @@ function containerClientEnv(): NodeJS.ProcessEnv {
   return out;
 }
 
-function sandboxEnv(workspace: string, tmpDir: string, cacheDir?: string): NodeJS.ProcessEnv {
+function sandboxEnv(workspace: string, tmpDir: string, cacheDir?: string, command?: ReproductionCommand, network: SandboxNetworkMode = "none"): NodeJS.ProcessEnv {
   // HOME is always the per-run workspace (host config/credentials stay hidden).
   // Package caches go to a persistent cacheDir when one is supplied, else the
   // per-run tmpDir (which is discarded with the run).
@@ -905,6 +938,18 @@ function sandboxEnv(workspace: string, tmpDir: string, cacheDir?: string): NodeJ
     NPM_CONFIG_CACHE: path.join(pkgCache, "npm-cache"),
   };
   out.PATH = sandboxToolPath(process.env.PATH);
+  if (network === "enabled") {
+    const program = command?.program.trim().toLowerCase();
+    if (program === "curl") out.CURL_HOME = "/dev/null";
+    if (program === "wget") out.WGETRC = "/dev/null";
+    if (program === "git") {
+      out.GIT_CONFIG_NOSYSTEM = "1";
+      out.GIT_CONFIG_SYSTEM = "/dev/null";
+      out.GIT_CONFIG_GLOBAL = "/dev/null";
+      out.GIT_ALLOW_PROTOCOL = "https";
+      out.GIT_TERMINAL_PROMPT = "0";
+    }
+  }
   if (process.env.LANG !== undefined) out.LANG = process.env.LANG;
   if (process.env.LC_ALL !== undefined) out.LC_ALL = process.env.LC_ALL;
   return out;

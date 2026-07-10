@@ -65,14 +65,19 @@ const DIALOG_FOCUSABLE = [
 
 export function useDialogFocus(onClose: () => void) {
   const dialogRef = useRef<HTMLElement | null>(null);
+  // Capture during render, before React's commit phase applies descendant
+  // autoFocus. A passive effect would otherwise remember the dialog input
+  // instead of the control that opened the dialog.
+  const openerRef = useRef<HTMLElement | null>(
+    typeof document !== "undefined" && document.activeElement instanceof HTMLElement ? document.activeElement : null,
+  );
   useEffect(() => {
-    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const dialog = dialogRef.current;
     if (dialog && !dialog.contains(document.activeElement)) {
       (dialog.querySelector<HTMLElement>(DIALOG_FOCUSABLE) ?? dialog).focus();
     }
     return () => {
-      if (previous?.isConnected) previous.focus();
+      if (openerRef.current?.isConnected) openerRef.current.focus();
     };
   }, []);
 

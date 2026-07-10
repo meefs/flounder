@@ -807,7 +807,18 @@ async function reconcileStaleAuditingScopes(c: Ctx, project: Record<string, unkn
   c.store.resetAuditingScopes(projectId);
 
   const inventoryDir = projectHistoryDir({ outputDir: c.out, targetName: projectName });
-  const inventory = await loadScopeInventory(inventoryDir);
+  let inventory: Awaited<ReturnType<typeof loadScopeInventory>>;
+  try {
+    inventory = await loadScopeInventory(inventoryDir);
+  } catch (error) {
+    // Old releases wrote scopes.json in place, so a process interruption may
+    // leave one historical inventory truncated. Keep strict loading for audit
+    // resume, but isolate dashboard reconciliation to this project so one bad
+    // checkpoint cannot make every project listing fail.
+    const detail = error instanceof Error ? error.message : String(error);
+    console.warn(`[flounder ui] skipped corrupt scope inventory for ${JSON.stringify(projectName)}: ${detail}`);
+    return;
+  }
   let changed = false;
   for (const scope of inventory) {
     if (scope.status !== "auditing") continue;

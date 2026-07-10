@@ -3565,6 +3565,35 @@ test("api: stale auditing scopes recover when no job is active", async () => {
   });
 });
 
+test("api: one corrupt historical scope inventory does not break project listings", async () => {
+  await withServer(async (base, out) => {
+    const json = (response) => response.json();
+    const post = (route, body) => fetch(base + route, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const damaged = await json(await post("/api/projects", { name: "scope-corrupt", sourcePaths: ["./src"] }));
+    const healthy = await json(await post("/api/projects", { name: "scope-healthy", sourcePaths: ["./src"] }));
+    const inventoryDir = projectHistoryDir({ outputDir: out, targetName: damaged.name });
+    await mkdir(inventoryDir, { recursive: true });
+    await writeFile(path.join(inventoryDir, "scopes.json"), "[{\"id\":\"truncated\"");
+
+    const store = MetadataStore.openForOutput(out);
+    try {
+      store.upsertScopes(damaged.id, [{ scopeId: "stale", title: "Stale scope", status: "auditing", score: 10 }]);
+      store.upsertScopes(healthy.id, [{ scopeId: "ready", title: "Ready scope", status: "pending", score: 9 }]);
+    } finally {
+      store.close();
+    }
+
+    const response = await fetch(base + "/api/projects");
+    assert.equal(response.status, 200);
+    const list = await json(response);
+    assert.ok(list.projects.some((project) => project.uuid === damaged.uuid));
+    assert.ok(list.projects.some((project) => project.uuid === healthy.uuid));
+    assert.equal((await fetch(base + `/api/projects/${healthy.uuid}`)).status, 200);
+    assert.equal((await fetch(base + `/api/projects/${damaged.uuid}`)).status, 200);
+    await assert.rejects(loadScopeInventory(inventoryDir), /Could not load scope inventory/);
+  });
+});
+
 test("api: active jobs keep auditing scopes in flight", async () => {
   await withServer(async (base, out) => {
     const json = (r) => r.json();
