@@ -8,6 +8,7 @@ import { writeLastRunPointer } from "../trace/last-run.js";
 import { RunLogger } from "../trace/logger.js";
 import type { Doc } from "../types.js";
 import { publicPath } from "../util/paths.js";
+import { materialFingerprint, phaseInputFingerprint } from "../util/material-fingerprint.js";
 import { ProjectMemory } from "./memory.js";
 import { isPiSessionProvider, runAuditSession } from "./pi-session.js";
 import { buildTools, newSession, type AgentSession, type AgentTool, type ToolContext, type ToolResult } from "./tools.js";
@@ -33,6 +34,7 @@ export interface ReportFindingInput {
   confidence?: number | undefined;
   decisions?: Array<Record<string, unknown>> | undefined;
   linkedFindings?: Array<Record<string, unknown>> | undefined;
+  phaseInputFingerprint?: string | undefined;
 }
 
 export interface ReportRunResult {
@@ -69,6 +71,17 @@ export async function runReport(
     const source = await loadSource(reportCfg.sourcePaths);
     const corpus = reportCfg.corpusPaths.length ? await loadCorpus(reportCfg.corpusPaths) : [];
     if (source.length === 0) throw new Error("flounder report needs readable source paths so the daemon can verify report details");
+    const buildDocs = reportCfg.buildRoot ? await loadSource([reportCfg.buildRoot]) : [];
+    reportCfg.materialFingerprint = materialFingerprint([
+      { label: "source", docs: source },
+      { label: "build", docs: buildDocs },
+      { label: "corpus", docs: corpus },
+    ]);
+    recorder.materialFingerprint?.(reportCfg.materialFingerprint);
+    for (const finding of options.findings) {
+      const attempt = reportAttempt(finding, reportCfg.materialFingerprint);
+      if (attempt) recorder.phaseAttempt?.({ ...attempt, phase: "report", state: "running" });
+    }
 
     const workspaceRoots = reportCfg.buildRoot ? [reportCfg.buildRoot] : reportCfg.sourcePaths;
     const workspace = await prepareSandboxWorkspace(workspaceRoots, logger.runDir, "report/workspace");
@@ -103,15 +116,29 @@ export async function runReport(
 
     const reports = collectReports(options.findings, session.scratchFiles);
     const missing = options.findings.filter((finding) => !reports.some((report) => report.fileName === reportFileName(finding)));
-    if (missing.length > 0) {
-      throw new Error(`report run finished without required report file(s): ${missing.map((finding) => reportFileName(finding)).join(", ")}`);
-    }
+    // Persist every valid report before evaluating completeness. A partial model
+    // response must not discard finished work or force already-written reports to rerun.
     for (const report of reports) await logger.artifact(report.fileName, report.markdown);
     recorder.findingReports(reports.map((report) => ({
       ...(report.findingId !== undefined ? { findingId: report.findingId } : {}),
       ...(report.decisionId !== undefined ? { decisionId: report.decisionId } : {}),
       markdown: report.markdown,
     })));
+    for (const finding of options.findings) {
+      const attempt = reportAttempt(finding, reportCfg.materialFingerprint);
+      if (!attempt) continue;
+      const produced = reports.some((report) => report.fileName === reportFileName(finding));
+      recorder.phaseAttempt?.({
+        ...attempt,
+        phase: "report",
+        state: produced ? "settled" : "blocked",
+        outcome: produced ? "report-written" : "missing-report-file",
+        blocker: produced ? undefined : `report run did not write ${reportFileName(finding)}`,
+      });
+    }
+    if (missing.length > 0) {
+      throw new Error(`report run finished without required report file(s): ${missing.map((finding) => reportFileName(finding)).join(", ")}`);
+    }
     await logger.event("audit_report_done", { stoppedReason: result.stoppedReason, steps: result.steps.length, reports: reports.length });
     recorder.finish(options.signal?.aborted ? "killed" : "done", undefined, reports.length);
     return { runDir: logger.runDir, reports: reports.length };
@@ -120,6 +147,17 @@ export async function runReport(
     recorder.finish(options.signal?.aborted ? "killed" : "error");
     throw error;
   }
+}
+
+function reportAttempt(finding: ReportFindingInput, material: string): { subjectType: "finding" | "decision"; subjectId: number; inputFingerprint: string } | undefined {
+  const subjectType = finding.decisionId !== undefined ? "decision" as const : "finding" as const;
+  const subjectId = finding.decisionId ?? finding.findingId;
+  if (subjectId === undefined) return undefined;
+  return {
+    subjectType,
+    subjectId,
+    inputFingerprint: finding.phaseInputFingerprint ?? phaseInputFingerprint({ phase: "report", material, subjectType, subjectId, findingKey: finding.findingKey, evidenceLevel: finding.evidenceLevel }),
+  };
 }
 
 function buildReportTools(): AgentTool[] {

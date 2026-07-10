@@ -68,10 +68,14 @@ There are no default bug-class, dataflow, checklist, memory, or report tools. If
 
 ### Confirmation
 
-Findings use two base statuses:
+Findings use these audit statuses:
 
 - `suspected`: the agent reported a candidate without a passing cited local test.
+- `confirmed-source`: source-backed evidence exists, but executable verification is still required.
 - `confirmed-executable`: the agent wrote `findings.json` with a `command_id` that cites a confirmation-eligible `bash` record.
+- `confirmed-differential`: the cited exploit also fails after the framework applies the proposed fix to pristine source.
+- `needs-evidence`: local review completed, but external evidence is required to settle the claim.
+- `refuted`: independent review or reproduction disproved the claim.
 
 The framework checks the recorded command result. The model cannot upgrade a finding by assertion. Local execution must stay local: unit tests, fixtures, regtest/devnet, forked local nodes, or isolated harnesses only.
 
@@ -200,7 +204,7 @@ Most users should start from the dashboard or from `flounder run <clue>`. The CL
 
 CLI layout is intentionally split by where the command runs:
 
-- **Workflow verbs stay top-level.** Examples: `flounder prepare`, `flounder run`, `flounder map`, `flounder audit`, `flounder verify`, `flounder confirm`, `flounder report`.
+- **Workflow verbs stay top-level.** Examples: `flounder prepare`, `flounder run`, `flounder map`, `flounder audit`, `flounder verify`, `flounder confirm`, `flounder report`, and durable `flounder group` evaluation workflows.
 - **Server/control-plane resources live under `flounder server ...`.** Examples: `flounder server project list`, `flounder server run list`, `flounder server finding list`, `flounder server daemon list`, `flounder server daemon-token mint`.
 - **Daemon-machine local operations live under `flounder daemon ...`.** Examples: `flounder daemon start --server ... --token ...`, `flounder daemon provider login openai-codex`, `flounder daemon provider check openai-codex`.
 
@@ -212,7 +216,7 @@ The sealed verbs (`run --source`, `map`, and `audit`) share the tools, the confi
 |---|---|
 | `flounder prepare <clue>` | open-world acquisition before map: turn a transaction, address, project, package, repository, or link into staged source, corpus, dependency closure, and deployment-match evidence |
 | `flounder run <clue>` | one-command workflow: prepare the target, run the sealed map -> dig audit, confirm reproduced findings when possible, then generate reports |
-| `flounder run --source <paths...> --target <name>` | source-provided sealed audit: map -> dig in one pass. MAP enumerates and scores a complete scope inventory, then DIG deep-audits selected scopes obligation-by-obligation and execution-confirms. Resumable, never silently drops a scope. (`--quick` runs a single breadth pass instead.) |
+| `flounder run --source <paths...> --target <name>` | source-provided sealed audit: map -> dig -> synthesize -> verify. MAP enumerates the inventory, DIG deep-audits selected scopes, synthesis composes cross-scope candidates, and Verify settles unresolved claims. Resumable, never silently drops a scope. (`--quick` runs a single breadth pass instead.) |
 | `flounder map --target <name> --source <paths...>` | enumerate + persist the scope inventory only (`audit_scopes.json`), no dig — inspect or curate scopes before auditing |
 | `flounder audit <region> --source <paths...>` | deep-audit one region you already care about (skip the map) |
 | `flounder audit --scope <id,...> --source <paths...>` | dig specific inventory items after a `flounder map` (the human-in-the-loop pick over the complete map) |
@@ -220,9 +224,144 @@ The sealed verbs (`run --source`, `map`, and `audit`) share the tools, the confi
 | `flounder verify <findings.json> --source <paths...>` | alias for `audit --verify`; confirm-or-refute existing suspected findings by execution |
 | `flounder confirm <run-dir> --source <paths...>` | open-world: reproduce a run's findings on the real target |
 | `flounder report --project <uuid\|name> [--finding <id>...] [--all]` | generate missing formal reports, regenerate selected reports, or regenerate every current reportable finding |
+| `flounder group create --manifest <file>` | create a durable evaluation, replay, batch, or multi-target group from validated work items |
+| `flounder group start <uuid\|name> [--parallel <n>]` | start or resume bounded work-item scheduling through the existing daemon queue |
+| `flounder group status|pause|cancel|report <uuid\|name>` | inspect or control durable group state, or regenerate its result report without model work |
+| `flounder group retry <work-item-id>` | retry a blocked item after setup repair while preserving prior attempt evidence |
 | `flounder history import-run --target <name> --run <dir>` | import an existing run directory into tracked history |
 
 `prepare` and the sealed verbs are **unbounded by default** (a run ends when the model is done, not at a step count) — a fixed budget silently truncates useful acquisition or a productive dig. Standard coverage caps only the next dig batch to 30 scopes; it does not cap prepare, map, or per-scope dig turns. Cap a phase only when you want to: `--max-steps` for `prepare`, `--map-steps` / `--dig-steps` for map/dig, or `--max-steps` for `run --quick` / `audit <region>`. A killed run **resumes** (it skips MAP and the already-audited scopes), so longer unbounded runs are safe to interrupt.
+
+## Evaluation run groups
+
+Run groups are the durable outer loop around the existing audit kernel. They do
+not add a second audit strategy or confirmation path. Each work item resolves to
+an existing sealed `run` or `audit --verify` job, executes on a daemon, and stores
+lifecycle separately from its evidence outcome:
+
+Each work item gets a hidden tracking project keyed by its durable UUID. This
+keeps Evaluation runs and findings out of the normal Projects and Findings views
+even when a benchmark target has the same display name as a real project. Use
+the Findings source filter to inspect Evaluation evidence explicitly. On a
+shared daemon, queued Project jobs are claimed before queued Evaluation jobs;
+running jobs are allowed to finish.
+
+- lifecycle: `queued -> claimed -> running -> finished|failed|cancelled`;
+- outcome: `confirmed`, `refuted`, `findings_reported`, `no_findings`, `blocked`,
+  or `invalid`;
+- `blocked` covers setup, build, daemon, or resource failure and is never scored
+  as a negative security result;
+- a manifest `command` is descriptive evidence metadata only. It is never run
+  directly; confirmation still requires the normal policy-gated audit tools;
+- group manifests cannot select host execution or open-world access. Real-target
+  work must use `flounder confirm` and its existing no-broadcast policy.
+
+A minimal positive/control manifest looks like:
+
+```json
+{
+  "version": 1,
+  "name": "logic-regression",
+  "kind": "evaluation",
+  "parallelism": 2,
+  "config": {
+    "provider": "openai-codex",
+    "thinking": "xhigh"
+  },
+  "items": [
+    {
+      "itemKey": "positive",
+      "kind": "benchmark-case",
+      "targetBundle": {
+        "target": "eval-c1-f1-s1",
+        "targetClass": "logic",
+        "sourcePaths": ["./fixtures/c1"],
+        "corpusPaths": ["./docs/design.md"]
+      },
+      "materialPolicy": {
+        "posture": "blind",
+        "materials": [
+          {
+            "path": "./docs/design.md",
+            "provenance": "official-docs",
+            "operatorLabel": "design-intent",
+            "policyDecision": "included",
+            "reason": "Answer-free design intent."
+          }
+        ]
+      },
+      "evidenceContract": {
+        "kind": "benchmark-oracle",
+        "expectedOutcome": "detect-positive",
+        "requiresDifferential": true,
+        "requiresRefutation": true,
+        "networkPolicy": "sealed"
+      }
+    },
+    {
+      "itemKey": "safe-control",
+      "kind": "benchmark-case",
+      "targetBundle": {
+        "target": "eval-c1-f2-s1",
+        "targetClass": "logic",
+        "sourcePaths": ["./fixtures/c2"],
+        "corpusPaths": []
+      },
+      "evidenceContract": {
+        "kind": "benchmark-oracle",
+        "expectedOutcome": "reject-positive",
+        "networkPolicy": "sealed"
+      }
+    }
+  ]
+}
+```
+
+Relative material paths are resolved against the manifest directory by the CLI:
+
+```bash
+flounder group create --manifest ./evaluation.json
+flounder group start logic-regression --parallel 2
+flounder group status logic-regression
+flounder group report logic-regression
+```
+
+If setup, build, daemon, or resource failure blocks an item, retry that item by
+its numeric id after fixing the blocker:
+
+```bash
+flounder group retry <work-item-id>
+flounder group start logic-regression
+```
+
+Only blocked failed/cancelled items are retryable. Each dispatch writes an
+immutable attempt row, so retrying never overwrites the prior job, run, error,
+or evidence. A benchmark miss is a real sample, not a retryable infrastructure
+failure; represent repeated samples as separate work items.
+
+Scored items require a terminal `done` run and a `healthy` run-health verdict.
+Positive evidence that requires independent refutation is blocked unless the
+persisted refutation stage completed without errors. This prevents shallow,
+resource-limited, or partially evaluated controls from being counted as safe.
+
+Keep every model-visible target name, directory, filename, comment, and corpus
+entry neutral. Blind benchmark/replay items cannot add a free-form `scopeNote`.
+`itemKey` and `expectedOutcome` stay in the control plane, but a source path
+such as `known-bug-positive/` would leak the answer into the audit and invalidate
+the evaluation.
+
+Every declared corpus path needs one explicit material-policy decision; there
+is no default inclusion. An unresolved `warning` blocks dispatch until the
+operator changes it to `included` or `excluded`, so a warning never silently
+crosses the blind-material boundary.
+
+For a `targetClass` of `capability-surface`, the target bundle must also declare
+neutral `entrypoints`, `inputs`, `effects`, `authorities`, `boundaries`, and
+local fixtures. Flounder supplies the semantic fields as planning context to the
+model; fixture paths remain control-plane metadata and must already be reachable
+under the declared source/build inputs. Neither can confirm a finding by itself.
+Use local fake mail, PR, MCP, browser, or repository fixtures rather than real
+accounts and tokens.
 
 ## Most effective setup
 
@@ -246,7 +385,7 @@ flounder run \
 
 - Set `--build-root` so the dig can execution-confirm — without it you only get `suspected` findings.
 - Give generous budgets and **do not interrupt a dig**; a decisive obligation can surface late in its step budget.
-- `--dig-samples K` unions K independent passes (variance reduction); `--dig-concurrency N` digs N scopes in parallel; `--remap` re-enumerates. Reliability comes from coverage and repetition, not prompt tuning.
+- `--dig-samples K` unions K independent passes (variance reduction); `--dig-concurrency N` digs N scopes in parallel; `--verify-concurrency N` settles N findings in isolated workspaces (default 2); `--remap` re-enumerates. Reliability comes from coverage and repetition, not prompt tuning.
 - The codex provider (`openai-codex`) is the recommended autonomous path; each daemon needs a one-time `flounder daemon provider login openai-codex` unless Flounder imports an existing pi auth entry for that provider.
 
 ## Engagement modes
@@ -419,7 +558,7 @@ Run artifacts are private by default. Redact before sharing outside the trusted 
 
 Every run records its metadata to a local tracking store at `<out>/flounder.db`. The default `<out>` is `~/.flounder`, so a normal install keeps the tracking database at `~/.flounder/flounder.db`, run artifacts at `~/.flounder/<target>-<timestamp>/`, durable history/build cache at `~/.flounder/history/<target>/`, provider auth at `~/.flounder/agent/auth.json`, and the default daemon workspace at `~/.flounder/workspace`. Existing pi provider credentials can be imported from `~/.pi/agent/auth.json` into the Flounder auth file. System temp directories are reserved for short-lived scratch such as CLI subprocess working directories and inline verify payloads.
 
-The tracking store records the project, the run lifecycle, run health, discovery backlog rows, scope coverage (mapped vs audited, updated live), findings and their status transitions (suspect → confirm → refute, on a timeline), and confirm decisions. It holds metadata and **paths** to the on-disk artifacts above, not their content. Inspect it across all projects without reading run dirs:
+The tracking store records the project, run lifecycle, run material fingerprint, run health, discovery backlog, scope coverage, canonical findings, exact occurrences and key aliases, Verify/Confirm/Report attempts, confirm decisions, and Evaluation run groups. Blocked phase work is input-addressed: unchanged inputs stay blocked until materials change or an operator requests a focused retry. It holds metadata and **paths** to on-disk artifacts, not private artifact content. Inspect it across all projects without reading run dirs:
 
 ```bash
 flounder server project list                    # every project: scope coverage, finding counts, latest run
@@ -446,9 +585,11 @@ A web dashboard to track and drive audits across projects, updating live via SSE
 
 Project creation starts with a task/clue composer so the operator can say what the audit should do. The clue is stored as `config.prepareClue` and reused by Prepare unless a launch supplies a new one. Project directories live under the daemon workspace and default to the project UUID, not the display name. The project list defaults to newest-created first, supports pinning, drag ordering, and archive/unarchive; archived projects move to Settings and lose their pin.
 
-A project's detail is the **prepare -> map -> dig -> synthesize -> verify -> confirm -> report** workflow: it shows the current phase, elapsed phase timing, scope coverage, run health, live model activity, and the scope being dug. The project-level **Next Actions** tab turns discovery backlog rows into an agent-owned queue: `agent-runnable` coverage rows can be advanced with Continue, Expand map, or scope prioritization; `agent-resource` setup rows ask the agent to resolve toolchain, sandbox, dependency, source, or auth blockers when possible; and `agent-review` rows ask the agent to inspect ambiguous work and route it to the right safe workflow action. The operator is asked only for explicit credentials, authorization, or unavailable external resources. Below the workflow are the scope queue you can prioritize, skip, or resume; findings that stream in as scopes land and change status through refutation; per-finding workflow state; per-finding tracking; real-target outcomes (`reproduced` / `not-reproduced`); and viewable Markdown reports. The primary button is **Run** before the first pipeline run and **Continue** afterward; the CLI equivalent is `flounder continue --project <uuid|name>`. More actions exposes the individual Prepare, Map, Dig, Verify, Confirm, and Report controls; Verify and Report can target selected findings. **Stop** cooperatively cancels a running job.
+A project's detail is the **prepare -> map -> dig -> synthesize -> verify -> confirm -> report** workflow: it shows the current phase, elapsed timing, coverage, run health, live activity, and the scope being dug. Dig proves claims during discovery; **Verify candidates** handles only unresolved, synthesized, or imported claims, with bounded isolated concurrency. Continue resumes interrupted Dig first, then starts directly at Verify/Confirm/Report when only evidence-tail work remains. Unchanged blocked work is not drained repeatedly; changed inputs reopen it automatically, and finding detail can request a focused retry. Next Actions remains the agent-owned queue for coverage, setup, and routing work.
 
-The cross-project **Findings** view tracks every finding and its submission state. It supports project, audit-status, and tracking filters. The default **Active findings** filter hides rows marked `ignored`, while the **Ignored** view lets an operator recover machine false positives later by changing their tracking state back to `open`. Settings holds provider profiles, daemon CRUD (mint token, rename, revoke), and archived projects.
+The cross-project **Findings** view defaults to real Project findings and their submission state. A row shows only the current workflow phase and blocker/next action, keeping the list compact; opening it reveals occurrences, independent-review state, every local/real-target/report attempt, and phase-specific retry. Its source filter can explicitly show Evaluation evidence or all sources; Evaluation rows link to their group and stay read-only for disclosure tracking. Project findings retain project, audit-status, and tracking filters. The default **Active findings** filter hides `ignored` rows, while the **Ignored** view can restore them to `open`. Settings holds provider profiles, daemon CRUD, and archived projects.
+
+The top-level **Evaluations** view drives durable run groups for audit campaigns, benchmark cases, regression replays, and claim verification. Create a draft, add work items with an explicit target bundle, material policy, and evidence contract, then start, pause, resume, or cancel the group. Each row keeps lifecycle state separate from its evidence verdict: a finished item is not shown as passing unless its persisted result satisfies the contract, while blocked and invalid work never enter the score. Expand an item to inspect source/corpus policy, confirmation requirements, result evidence, and every attempt; blocked failed or cancelled items can be retried without losing earlier attempts. Positive recall and safe-control pass rates appear for evaluation-oriented groups, and the Report action regenerates Markdown from stored evidence without rerunning model work.
 
 Execution is **decoupled** from the dashboard: the `flounder ui` server is a **control plane** (REST API + SQLite + a job queue) and the audit runs on a **daemon**, so the target code and provider keys stay on the daemon's machine. `flounder ui` spawns a co-located daemon by default (rooted at `--workspace`, default `~/.flounder/workspace`) and reuses its local daemon identity across restarts, so projects pinned to the local executor keep claiming queued work. Pass `--no-daemon` and run `flounder daemon start` elsewhere (with a token from `flounder server daemon-token mint`) to execute on a different host. A project's materials are paths **relative to** its directory under the daemon's workspace; resolution checks the effective real path, so symlinks cannot escape that root. The server binds to `127.0.0.1` by default. Every daemon endpoint is bearer-token-authenticated and verifies that the referenced job/run belongs to that daemon before accepting progress, activity, worklist, or terminal-status updates.
 
@@ -470,7 +611,9 @@ curl "localhost:4500/api/projects/$PROJECT_UUID/findings?status=confirmed-differ
 curl "localhost:4500/api/projects/$PROJECT_UUID/confirm-decisions?reproduced=yes"  # the confirmed bugs
 ```
 
-Resources: **project** (CRUD, including selected daemon, provider profile, task/clue, source/build/corpus paths, archive/pin/manual order; project URLs are UUID-only), **provider** (model strategy profiles), **daemon** (CRUD — mint/rename/revoke), **run** (`POST /api/projects/:uuid/runs` enqueues a job a daemon claims; `verb:"run"` is the automatic prepare-if-needed -> map/dig -> synthesize -> verify -> confirm -> report pipeline; `GET /api/runs/:id`; `POST /api/runs/:id/stop`; `GET /api/runs/:id/artifact?name=` reads an allowlisted report or discovery-health artifact), and read-only **scope** / **finding** / **confirm-decision** (paginated + filterable). **Discovery-backlog** rows are project-scoped agent-owned Next Actions: `GET /api/projects/:uuid/backlog?kind=&status=` lists coverage gaps, resource requests, and follow-up scopes with `actionability` (`agent-runnable`, `agent-resource`, `agent-review`), `action_owner`, `recommended_action`, and `primary_action_label`; `PATCH /api/backlog/:id {"status":"resolved"|"ignored"|"stale"|"open"}` updates state without deleting provenance. Agents should try to resolve every open Next Action through the existing project workflow and narrow any truly external dependency to a concrete credential, authorization, or resource request. Operator actions: `PATCH …/scopes/:id {prioritize:true}` reorders the dig queue; `PATCH /api/findings/:id/tracking` advances a finding's submission state, including `ignored` for human-dismissed machine findings; a confirm `POST …/runs {verb:"confirm"}` reproduces all pending findings (or selected findings with `findingId`/`findingIds`); a report `POST …/runs {verb:"report", findingIds:[...]}` regenerates selected reports, `{"verb":"report","regenerateReports":true}` regenerates every current reportable finding, and an unselected report run writes only missing reports. `flounder continue --project <uuid|name>` drives the same Run/Continue project pipeline from the CLI. `flounder report --project <uuid|name>` drives the same project action from the CLI; add `--finding <id>` for selected regeneration or `--all` for full regeneration. `GET /api/bugs` powers the cross-project Findings view and supports `project=<uuid>`, `status=...`, `tracking=active/ignored/...`, `limit`, and `offset`. `GET /api/stream` is an SSE feed for live updates; `GET /api/runs/:id/log` streams a run's live token-level activity, fed by the executing daemon.
+Resources: **project** (CRUD, including selected daemon, provider profile, task/clue, source/build/corpus paths, archive/pin/manual order; project URLs are UUID-only), **provider** (model strategy profiles), **daemon** (CRUD — mint/rename/revoke), **run** (`POST /api/projects/:uuid/runs` enqueues a job a daemon claims; `verb:"run"` is the automatic prepare-if-needed -> map/dig -> synthesize -> verify -> confirm -> report pipeline; `GET /api/runs/:id`; `POST /api/runs/:id/stop`; `GET /api/runs/:id/artifact?name=` reads an allowlisted report or discovery-health artifact), **run-group** / **work-item** (`POST /api/run-groups`, `POST /api/run-groups/:uuid/start`, pause/cancel/report, `GET /api/work-items/:id`, and `POST /api/work-items/:id/retry` for blocked attempts), and read-only **scope** / **finding** / **confirm-decision** (paginated + filterable). **Discovery-backlog** rows are project-scoped agent-owned Next Actions: `GET /api/projects/:uuid/backlog?kind=&status=` lists coverage gaps, resource requests, and follow-up scopes with `actionability` (`agent-runnable`, `agent-resource`, `agent-review`), `action_owner`, `recommended_action`, and `primary_action_label`; `PATCH /api/backlog/:id {"status":"resolved"|"ignored"|"stale"|"open"}` updates state without deleting provenance. Agents should try to resolve every open Next Action through the existing project workflow and narrow any truly external dependency to a concrete credential, authorization, or resource request. Operator actions: `PATCH …/scopes/:id {prioritize:true}` reorders the dig queue; `PATCH /api/findings/:id/tracking` advances a finding's submission state, including `ignored` for human-dismissed machine findings; a confirm `POST …/runs {verb:"confirm"}` reproduces all pending findings (or selected findings with `findingId`/`findingIds`); a report `POST …/runs {verb:"report", findingIds:[...]}` regenerates selected reports, `{"verb":"report","regenerateReports":true}` regenerates every current reportable finding, and an unselected report run writes only missing reports. `flounder continue --project <uuid|name>` drives the same Run/Continue project pipeline from the CLI. `flounder report --project <uuid|name>` drives the same project action from the CLI; add `--finding <id>` for selected regeneration or `--all` for full regeneration. `GET /api/bugs` powers the cross-project Findings view and supports `project=<uuid>`, `status=...`, `tracking=active/ignored/...`, `limit`, and `offset`. `GET /api/stream` is an SSE feed for live updates; `GET /api/runs/:id/log` streams a run's live token-level activity, fed by the executing daemon.
+
+Finding-specific API operations include `GET /api/findings/:id/lifecycle` for the canonical record, timeline, occurrences, attempts, and linked decisions; `POST /api/findings/:id/retry {"phase":"verify"|"confirm"|"report"}` for focused blocked-phase retry; and `PATCH /api/findings/:id/tracking` for disclosure state. `GET /api/bugs` powers the cross-project Findings view with SQL-backed source/project/status/tracking pagination.
 
 ## Library API
 

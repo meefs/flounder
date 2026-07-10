@@ -59,6 +59,9 @@ export interface AuditorConfig {
   // so they cannot corrupt each other's test files, build output, or findings.
   // 1 = sequential (default).
   auditDigConcurrency: number;
+  // How many independent VERIFY claims may execute at once. Every claim still
+  // receives an isolated workspace/session; this only bounds the worker pool.
+  auditVerifyConcurrency: number;
   // Re-enumerate the scope inventory from scratch instead of resuming the
   // persisted one (which would otherwise continue with the next un-audited scopes).
   auditRemap: boolean;
@@ -97,6 +100,12 @@ export interface AuditorConfig {
   // True when the verify worklist intentionally re-checks already locally confirmed
   // findings, not just suspected/source-confirmed candidates.
   auditVerifyFromStart: boolean;
+  // Stable digest of the exact source/build/corpus material used by this phase.
+  // The control plane uses it to avoid stale reuse and idempotent blocked retries.
+  materialFingerprint?: string;
+  // Prior canonical findings are visible only to the post-dig synthesis phase,
+  // never to blind map/dig discovery.
+  auditSynthesisContext?: Array<Record<string, unknown>>;
   // CONFIRM mode (`flounder confirm`): the open-world counterpart to the network-sealed
   // `flounder run`. When set, the bash tool swaps to the network-enabled policy (fork/read
   // live networks, fetch, search — never BROADCAST). This is the only capability
@@ -216,6 +225,7 @@ export function defaultConfig(): AuditorConfig {
     auditMaxScopes: Number.POSITIVE_INFINITY,
     auditDigSamples: 1,
     auditDigConcurrency: 1,
+    auditVerifyConcurrency: 2,
     auditRemap: false,
     auditAppendMap: false,
     auditAppendMapSeedPaths: [],

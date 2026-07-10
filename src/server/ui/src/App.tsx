@@ -6,6 +6,9 @@ import {
   type DaemonRow,
   type DiscoveryBacklogRow,
   type FindingRow,
+  type FindingLifecycle,
+  type FindingPhase,
+  type FindingPhaseAttempt,
   type ProjectDetail,
   type ProjectConfig,
   type ProjectPayload,
@@ -20,6 +23,7 @@ import {
   type ScopeRow,
 } from "./api";
 import { Button, Card, Counter, IconButton, Modal, StateBadge, StatusBadge, useDialogFocus } from "./components";
+import { EvaluationsWorkspace } from "./EvaluationsView";
 import {
   activeFindings,
   bugBountyEngagementLabel,
@@ -73,7 +77,7 @@ import { Icon, type IconName } from "./icons";
 
 const DEFAULT_OPENAI_CODEX_MODEL = "gpt-5.6-sol";
 
-type View = "projects" | "findings" | "settings";
+type View = "projects" | "evaluations" | "findings" | "settings";
 type SettingsPane = "providers" | "daemons" | "archived";
 type ProjectTab = "overview" | "next-actions" | "decisions" | "findings" | "scopes" | "runs" | "activity" | "setup";
 type ModalName = "new-project" | "run" | "edit-project" | "report" | "decision-report" | "run-log" | "artifact" | null;
@@ -94,6 +98,7 @@ const PROJECT_TABS: Array<{ id: ProjectTab; label: string }> = [
 interface RouteState {
   view: View;
   projectUuid?: string;
+  evaluationUuid?: string;
   settingsPane: SettingsPane;
 }
 
@@ -165,6 +170,9 @@ function readRoute(): RouteState {
   const pathname = window.location.pathname;
   const projectMatch = pathname.match(/^\/projects\/([^/]+)\/?$/);
   if (projectMatch) return { view: "projects", projectUuid: decodeURIComponent(projectMatch[1] ?? ""), settingsPane: "providers" };
+  const evaluationMatch = pathname.match(/^\/evaluations\/([^/]+)\/?$/);
+  if (evaluationMatch) return { view: "evaluations", evaluationUuid: decodeURIComponent(evaluationMatch[1] ?? ""), settingsPane: "providers" };
+  if (pathname === "/evaluations" || pathname.startsWith("/evaluations/")) return { view: "evaluations", settingsPane: "providers" };
   if (pathname === "/findings" || pathname.startsWith("/findings/")) return { view: "findings", settingsPane: "providers" };
   if (pathname === "/settings/archived" || pathname.startsWith("/settings/archived/")) return { view: "settings", settingsPane: "archived" };
   if (pathname === "/settings/daemons" || pathname.startsWith("/settings/daemons/")) return { view: "settings", settingsPane: "daemons" };
@@ -739,7 +747,7 @@ function phaseLabel(phase: ProjectPhase): string {
     map: "Map",
     dig: "Dig",
     synthesis: "Synthesize",
-    verify: "Verify",
+    verify: "Verify candidates",
     confirm: "Confirm",
     report: "Report",
   }[phase];
@@ -801,8 +809,8 @@ function projectStatusIcon(project: ProjectSnapshot): IconName {
 }
 
 function runKindLabel(kind: string, run?: RunRow): string {
-  if (runScopeBatchComplete(run)) return isVerifyRun(run) ? "Finalize verification" : "Finalize audit";
-  if (isVerifyRun(run)) return "Verify";
+  if (runScopeBatchComplete(run)) return isVerifyRun(run) ? "Finalize candidate verification" : "Finalize audit";
+  if (isVerifyRun(run)) return "Verify candidates";
   return {
     prepare: "Prepare target",
     run: "Run pipeline",
@@ -888,13 +896,13 @@ function selectedReportDecisions(detail: ProjectDetail, selectedIds: Set<number>
 }
 
 function verifyButtonLabel(count: number): string {
-  return count > 0 ? `Verify (${count})` : "Verify";
+  return count > 0 ? `Verify candidates (${count})` : "Verify candidates";
 }
 
 function verifyButtonTitle(count: number): string {
   return count > 0
     ? `Confirm-or-refute ${plural(count, "candidate")} by local execution before real-target confirmation.`
-    : "No suspected or source-confirmed candidates are waiting for execution verification.";
+    : "No unresolved dig or synthesis candidates are waiting for execution verification.";
 }
 
 function confirmButtonTitle(count: number, locallyVerified: number, launchLocked: boolean): string {
@@ -1581,6 +1589,7 @@ export function App() {
   const [bugsTotal, setBugsTotal] = useState(0);
   const [bugStats, setBugStats] = useState<BugStats>({ total: 0, active: 0, byStatus: {}, byTracking: {} });
   const [bugProject, setBugProject] = useState("");
+  const [bugSource, setBugSource] = useState<"project" | "evaluation" | "all">("project");
   const [bugStatus, setBugStatus] = useState("");
   const [bugTracking, setBugTracking] = useState("active");
   const [bugPage, setBugPage] = useState(1);
@@ -1737,6 +1746,7 @@ export function App() {
       offset: String((bugPage - 1) * bugPageSize),
     });
     if (bugProject) params.set("project", bugProject);
+    params.set("source", bugSource);
     if (bugStatus) params.set("status", bugStatus);
     if (bugTracking) params.set("tracking", bugTracking);
     setBugLoading(true);
@@ -1753,11 +1763,11 @@ export function App() {
         setBugs([]);
       })
       .finally(() => setBugLoading(false));
-  }, [route.view, bugProject, bugStatus, bugTracking, bugPage, bugPageSize, bugReloadKey]);
+  }, [route.view, bugProject, bugSource, bugStatus, bugTracking, bugPage, bugPageSize, bugReloadKey]);
 
   useEffect(() => {
     setBugPage(1);
-  }, [bugProject, bugStatus, bugTracking]);
+  }, [bugProject, bugSource, bugStatus, bugTracking]);
 
   const bugPageCount = Math.max(1, Math.ceil(bugsTotal / bugPageSize));
   useEffect(() => {
@@ -2102,7 +2112,7 @@ export function App() {
         localStorage.setItem("flounder-theme-explicit", "1");
         setTheme(theme === "dark" ? "light" : "dark");
       }} /> : null}
-      <div className={`app-shell view-${route.view}${route.projectUuid ? " has-project" : ""}`}>
+      <div className={`app-shell view-${route.view}${route.projectUuid ? " has-project" : ""}${route.evaluationUuid ? " has-evaluation" : ""}`}>
         {route.view === "projects" ? (
           <>
             <ProjectSidebar
@@ -2170,6 +2180,15 @@ export function App() {
             </main>
           </>
         ) : null}
+        {route.view === "evaluations" ? (
+          <EvaluationsWorkspace
+            selectedUuid={route.evaluationUuid}
+            providers={providers}
+            daemons={daemons}
+            onSelect={(uuid) => go(uuid ? `/evaluations/${encodeURIComponent(uuid)}` : "/evaluations")}
+            onToast={(tone, message) => setToast({ tone, message })}
+          />
+        ) : null}
         {route.view === "findings" ? (
           <GlobalFindingsView
             stats={bugStats}
@@ -2181,15 +2200,22 @@ export function App() {
             loading={bugLoading}
             error={bugError}
             projectUuid={bugProject}
+            source={bugSource}
             status={bugStatus}
             tracking={bugTracking}
             setProjectUuid={setBugProject}
+            setSource={(source) => {
+              setBugSource(source);
+              if (source !== "project") setBugProject("");
+              setBugTracking(source === "evaluation" ? "" : "active");
+            }}
             setStatus={setBugStatus}
             setTracking={setBugTracking}
             setPage={setBugPage}
             setPageSize={setBugPageSize}
             onTracking={updateTracking}
             onOpenProject={(uuid) => go(projectPath(uuid))}
+            onOpenEvaluation={(uuid) => go(`/evaluations/${encodeURIComponent(uuid)}`)}
             onOpenReport={(finding) => {
               setReportFinding(finding);
               setModal("report");
@@ -2293,6 +2319,7 @@ function ShellHeader({ route, running, theme, onTheme, onCommands, onMenu }: { r
       <nav className="topnav desktop-nav" aria-label="Primary">
         <button className={route.view === "projects" ? "sel" : ""} onClick={() => go(route.projectUuid ? projectPath(route.projectUuid) : "/")}>Projects</button>
         <button className={route.view === "findings" ? "sel" : ""} onClick={() => go("/findings")}>Findings</button>
+        <button className={route.view === "evaluations" ? "sel" : ""} onClick={() => go(route.evaluationUuid ? `/evaluations/${encodeURIComponent(route.evaluationUuid)}` : "/evaluations")}>Evaluations</button>
       </nav>
       <div className="topbar-spacer" />
       {running > 0 ? <Counter live>{`${running} running`}</Counter> : null}
@@ -2320,6 +2347,7 @@ function MobileMenu({ route, running, theme, onClose, onTheme }: { route: RouteS
         {running > 0 ? <Counter live>{`${running} running`}</Counter> : null}
         <button className={route.view === "projects" ? "sel" : ""} onClick={() => navigate(route.projectUuid ? projectPath(route.projectUuid) : "/")}>Projects</button>
         <button className={route.view === "findings" ? "sel" : ""} onClick={() => navigate("/findings")}>Findings</button>
+        <button className={route.view === "evaluations" ? "sel" : ""} onClick={() => navigate(route.evaluationUuid ? `/evaluations/${encodeURIComponent(route.evaluationUuid)}` : "/evaluations")}>Evaluations</button>
         <button className={route.view === "settings" ? "sel" : ""} onClick={() => navigate("/settings")}>Settings</button>
         <button onClick={() => { onTheme(); onClose(); }}>{theme === "dark" ? "Light mode" : "Dark mode"}</button>
       </section>
@@ -4545,7 +4573,7 @@ function ProjectFindings(props: {
   const verifyRechecksConfirmed = verifyRunRechecksConfirmed(runningVerify, rawPendingVerify, activeFindings(allFindings).length);
   const journey = [
     {
-      label: "Verify",
+      label: "Verify candidates",
       count: runningVerifyProgress ? runningVerifyProgress.remaining : pendingVerifyFindings(allFindings).length,
       detail: runningVerifyProgress ? `${runningVerifyProgress.done}/${runningVerifyProgress.target} findings checked in the active Verify run.` : "Candidates that still need local execution proof.",
     },
@@ -4750,18 +4778,23 @@ function GlobalFindingsView(props: {
   loading: boolean;
   error: string;
   projectUuid: string;
+  source: "project" | "evaluation" | "all";
   status: string;
   tracking: string;
   setProjectUuid: (projectUuid: string) => void;
+  setSource: (source: "project" | "evaluation" | "all") => void;
   setStatus: (status: string) => void;
   setTracking: (tracking: string) => void;
   setPage: (page: number) => void;
   setPageSize: (pageSize: number) => void;
   onTracking: (finding: FindingRow, status: string) => void;
   onOpenProject: (uuid: string) => void;
+  onOpenEvaluation: (uuid: string) => void;
   onOpenReport: (finding: FindingRow) => void;
 }) {
-  const views = savedBugViews(props.stats);
+  const views = savedBugViews(props.stats)
+    .filter((view) => props.source !== "evaluation" || !["submitted", "accepted", "ignored"].includes(view.id))
+    .map((view) => props.source === "evaluation" ? { ...view, tracking: undefined } : view);
   const activeView = views.find((view) => (view.status ?? "") === props.status && (view.tracking ?? "") === props.tracking)?.id ?? "custom";
   const selectedProject = props.projects.find((project) => project.uuid === props.projectUuid);
   return (
@@ -4769,14 +4802,25 @@ function GlobalFindingsView(props: {
       <Card>
         <div className="page-head">
           <div>
-            <h1>{selectedProject ? `Findings for ${selectedProject.name}` : "Findings across all projects"}</h1>
-            <p>Submission tracking from discovery through real-target confirmation and vendor disclosure.</p>
+            <h1>{selectedProject ? `Findings for ${selectedProject.name}` : props.source === "evaluation" ? "Evaluation findings" : props.source === "all" ? "Findings across all sources" : "Findings across projects"}</h1>
+            <p>{props.source === "evaluation" ? "Execution evidence produced by Evaluation run groups; kept separate from disclosure tracking by default." : "Submission tracking from discovery through real-target confirmation and vendor disclosure."}</p>
           </div>
           <div className="headline-stats">
-            <Stat n={props.stats.active ?? props.stats.total} label="active" />
-            <Stat n={(props.stats.byStatus["confirmed-differential"] ?? 0) + (props.stats.byStatus["confirmed-executable"] ?? 0)} label="audit confirmed" good />
-            <Stat n={props.stats.byTracking.submitted ?? 0} label="submitted" />
-            <Stat n={props.stats.byTracking.ignored ?? 0} label="ignored" />
+            {props.source === "evaluation" ? (
+              <>
+                <Stat n={props.stats.total} label="evidence items" />
+                <Stat n={(props.stats.byStatus["confirmed-differential"] ?? 0) + (props.stats.byStatus["confirmed-executable"] ?? 0)} label="audit confirmed" good />
+                <Stat n={props.stats.byStatus.suspected ?? 0} label="needs triage" />
+                <Stat n={props.stats.byStatus["needs-evidence"] ?? 0} label="needs evidence" />
+              </>
+            ) : (
+              <>
+                <Stat n={props.stats.active ?? props.stats.total} label="active" />
+                <Stat n={(props.stats.byStatus["confirmed-differential"] ?? 0) + (props.stats.byStatus["confirmed-executable"] ?? 0)} label="audit confirmed" good />
+                <Stat n={props.stats.byTracking.submitted ?? 0} label="submitted" />
+                <Stat n={props.stats.byTracking.ignored ?? 0} label="ignored" />
+              </>
+            )}
           </div>
         </div>
         <div className="saved-views">
@@ -4794,21 +4838,30 @@ function GlobalFindingsView(props: {
           ))}
         </div>
         <div className="table-tools">
-          <select value={props.projectUuid} onChange={(event) => props.setProjectUuid(event.target.value)} aria-label="Filter findings by project">
-            <option value="">All projects</option>
-            {props.projects.map((project) => (
-              <option key={project.uuid} value={project.uuid}>{project.name}{project.archived_at ? " (archived)" : ""}</option>
-            ))}
+          <select value={props.source} onChange={(event) => props.setSource(event.target.value as "project" | "evaluation" | "all")} aria-label="Filter findings by source">
+            <option value="project">Project findings</option>
+            <option value="evaluation">Evaluation evidence</option>
+            <option value="all">All sources</option>
           </select>
+          {props.source !== "evaluation" ? (
+            <select value={props.projectUuid} onChange={(event) => props.setProjectUuid(event.target.value)} aria-label="Filter findings by project">
+              <option value="">All projects</option>
+              {props.projects.map((project) => (
+                <option key={project.uuid} value={project.uuid}>{project.name}{project.archived_at ? " (archived)" : ""}</option>
+              ))}
+            </select>
+          ) : null}
           <select value={props.status} onChange={(event) => props.setStatus(event.target.value)}>
             <option value="">All audit statuses</option>
             {STATUSES.map((status) => <option key={status} value={status}>{findingStatusOptionLabel(status)}</option>)}
           </select>
-          <select value={props.tracking} onChange={(event) => props.setTracking(event.target.value)}>
-            <option value="active">Active findings</option>
-            <option value="">All tracking states</option>
-            {TRACKING.map((status) => <option key={status} value={status}>{findingTrackingOptionLabel(status)}</option>)}
-          </select>
+          {props.source !== "evaluation" ? (
+            <select value={props.tracking} onChange={(event) => props.setTracking(event.target.value)}>
+              <option value="active">Active findings</option>
+              <option value="">All tracking states</option>
+              {TRACKING.map((status) => <option key={status} value={status}>{findingTrackingOptionLabel(status)}</option>)}
+            </select>
+          ) : null}
         </div>
       </Card>
       {props.error ? (
@@ -4822,11 +4875,12 @@ function GlobalFindingsView(props: {
             total={props.total}
             page={props.page}
             pageSize={props.pageSize}
-            paginationKey={`${props.projectUuid}:${props.status}:${props.tracking}`}
+            paginationKey={`${props.source}:${props.projectUuid}:${props.status}:${props.tracking}`}
             global
             onPage={props.setPage}
             onPageSize={props.setPageSize}
             onOpenProject={props.onOpenProject}
+            onOpenEvaluation={props.onOpenEvaluation}
             onOpenReport={props.onOpenReport}
             onTracking={props.onTracking}
           />
@@ -4866,6 +4920,48 @@ function FindingList({ findings, compact, empty, onOpenReport }: { findings: Fin
   );
 }
 
+type LifecycleRailState = "done" | "running" | "blocked" | "pending";
+
+function FindingLifecycleRail({ finding, onOpen }: { finding: FindingRow; onOpen: () => void }) {
+  const attempts = finding.phase_attempts ?? [];
+  const verify = latestAttempt(attempts, "verify");
+  const confirm = latestAttempt(attempts, "confirm");
+  const report = latestAttempt(attempts, "report");
+  const localSettled = finding.status === "confirmed-source" || finding.status === "confirmed-executable" || finding.status === "confirmed-differential" || finding.status === "refuted";
+  const disclosureDone = ["submitted", "accepted", "fixed", "rejected", "duplicate"].includes(finding.tracking_status ?? "open");
+  const phases: Array<{ label: string; state: LifecycleRailState; detail: string }> = [
+    { label: "Found", state: "done", detail: (finding.occurrence_count ?? 1) > 1 ? `${finding.occurrence_count} recorded occurrences` : "Canonical finding recorded" },
+    {
+      label: "Local",
+      state: localSettled ? "done" : attemptState(verify),
+      detail: finding.refutation_status === "blocked"
+        ? `Independent review blocked: ${finding.refutation_reason ?? "no verdict"}`
+        : verify?.blocker || (localSettled ? finding.status.replaceAll("-", " ") : "Waiting for executable evidence"),
+    },
+    { label: "Target", state: finding.confirm_status ? "done" : attemptState(confirm), detail: confirm?.blocker || (finding.confirm_status ? `Real target: ${finding.confirm_status}` : "Real-target confirmation pending") },
+    { label: "Report", state: finding.has_report ? "done" : attemptState(report), detail: report?.blocker || (finding.has_report ? "Formal report ready" : "Formal report pending") },
+    { label: "Disclose", state: disclosureDone ? "done" : "pending", detail: disclosureDone ? `Tracking: ${finding.tracking_status}` : "Not yet submitted" },
+  ];
+  const focus = phases.find((phase) => phase.state === "running" || phase.state === "blocked") ?? phases.find((phase) => phase.state === "pending") ?? phases[phases.length - 1]!;
+  return (
+    <button type="button" className="lifecycle-summary-button" onClick={onOpen} aria-label={`Open lifecycle for ${finding.title ?? "finding"}`} title={focus.detail}>
+      <span className={`label lifecycle-state ${focus.state}`}>{focus.label} · {focus.state}</span>
+      <small className={focus.state === "blocked" ? "lifecycle-focus blocked" : "lifecycle-focus"}>{focus.detail}</small>
+    </button>
+  );
+}
+
+function latestAttempt(attempts: FindingPhaseAttempt[], phase: FindingPhase): FindingPhaseAttempt | undefined {
+  return attempts.filter((attempt) => attempt.phase === phase).sort((a, b) => b.attempt_number - a.attempt_number)[0];
+}
+
+function attemptState(attempt?: FindingPhaseAttempt): LifecycleRailState {
+  if (!attempt) return "pending";
+  if (attempt.state === "running") return "running";
+  if (attempt.state === "blocked" || attempt.state === "error") return "blocked";
+  return "done";
+}
+
 function FindingTable({
   rows,
   global,
@@ -4877,6 +4973,7 @@ function FindingTable({
   onPage,
   onPageSize,
   onOpenProject,
+  onOpenEvaluation,
   onOpenReport,
   onTracking,
 }: {
@@ -4890,6 +4987,7 @@ function FindingTable({
   onPage?: (page: number) => void;
   onPageSize?: (pageSize: number) => void;
   onOpenProject?: (uuid: string) => void;
+  onOpenEvaluation?: (uuid: string) => void;
   onOpenReport: (finding: FindingRow) => void;
   onTracking: (finding: FindingRow, status: string) => void;
 }) {
@@ -4917,7 +5015,7 @@ function FindingTable({
         <table className="data-table">
           <thead>
             <tr>
-              {global ? <th>Project</th> : null}
+              {global ? <th>Source</th> : null}
               <th>Finding</th>
               <th>Evidence</th>
               <th>Workflow</th>
@@ -4932,7 +5030,14 @@ function FindingTable({
                 <tr key={finding.id}>
                   {global ? (
                     <td className="project-cell">
-                      {finding.project_uuid ? (
+                      {finding.source === "evaluation" ? (
+                        <>
+                          {finding.evaluation_uuid ? (
+                            <button type="button" className="table-link" onClick={() => onOpenEvaluation?.(finding.evaluation_uuid!)}>{finding.evaluation_name ?? "Evaluation"}</button>
+                          ) : <span>{finding.evaluation_name ?? "Evaluation"}</span>}
+                          <small>Evaluation evidence</small>
+                        </>
+                      ) : finding.project_uuid ? (
                         <button type="button" className="table-link" onClick={() => onOpenProject?.(finding.project_uuid!)}>{finding.project_name}</button>
                       ) : finding.project_name}
                     </td>
@@ -4940,6 +5045,7 @@ function FindingTable({
                   <td className="finding-cell">
                     <strong>{finding.title || "Untitled finding"}</strong>
                     <small>{finding.location || "No location"}{finding.scope_id ? ` · ${finding.scope_id}` : ""}</small>
+                    {(finding.occurrence_count ?? 1) > 1 ? <small className="occurrence-note">Seen in {plural(finding.occurrence_count ?? 1, "run")}</small> : null}
                     {duplicateOfLabel(finding) ? <small>{duplicateOfLabel(finding)}</small> : null}
                   </td>
                   <td className="evidence-cell">
@@ -4951,15 +5057,22 @@ function FindingTable({
                     </span>
                   </td>
                   <td className="workflow-cell">
-                    <span className={`label ${workflow.className}`}>{workflow.label}</span>
-                    <small>{workflow.detail}</small>
+                    {finding.source === "evaluation" ? (
+                      <><span className={`label ${workflow.className}`}>{workflow.label}</span><small>{workflow.detail}</small></>
+                    ) : (
+                      <FindingLifecycleRail finding={finding} onOpen={() => onOpenReport(finding)} />
+                    )}
                   </td>
                   <td className="tracking-cell">
-                    <select value={finding.tracking_status ?? "open"} onChange={(event) => onTracking(finding, event.target.value)} aria-label={`Tracking for ${finding.title ?? "finding"}`}>
-                      {TRACKING.map((status) => <option key={status} value={status}>{findingTrackingOptionLabel(status)}</option>)}
-                    </select>
+                    {finding.source === "evaluation" ? (
+                      <span className="label" title="Evaluation evidence is scored in its run group, not tracked as a disclosure candidate.">Evaluation only</span>
+                    ) : (
+                      <select value={finding.tracking_status ?? "open"} onChange={(event) => onTracking(finding, event.target.value)} aria-label={`Tracking for ${finding.title ?? "finding"}`}>
+                        {TRACKING.map((status) => <option key={status} value={status}>{findingTrackingOptionLabel(status)}</option>)}
+                      </select>
+                    )}
                   </td>
-                  <td className="row-action-cell"><Button size="sm" icon="file" onClick={() => onOpenReport(finding)}>{finding.has_report ? "Open" : "Report"}</Button></td>
+                  <td className="row-action-cell"><Button size="sm" icon="file" onClick={() => onOpenReport(finding)}>{finding.source === "evaluation" ? "Evidence" : finding.has_report ? "Open" : "Report"}</Button></td>
                 </tr>
               );
             })}
@@ -5419,7 +5532,7 @@ function Field({ label, help, children, span }: { label: string; help?: string; 
   );
 }
 
-type BudgetForm = { digSamples: string; mapSteps: string; digSteps: string; digConcurrency: string };
+type BudgetForm = { digSamples: string; mapSteps: string; digSteps: string; digConcurrency: string; verifyConcurrency: string };
 type EngagementKindForm = "" | "bug-bounty" | "bug-bounty-contest";
 type EngagementForm = {
   engagementKind: EngagementKindForm;
@@ -5437,10 +5550,11 @@ function applyBudgetFields(config: ProjectConfig, form: BudgetForm): ProjectConf
   setOptionalNumber(next, "mapSteps", form.mapSteps);
   setOptionalNumber(next, "digSteps", form.digSteps);
   setOptionalNumber(next, "digConcurrency", form.digConcurrency);
+  setOptionalNumber(next, "verifyConcurrency", form.verifyConcurrency);
   return next;
 }
 
-function setOptionalNumber(config: ProjectConfig, key: keyof Pick<ProjectConfig, "digSamples" | "mapSteps" | "digSteps" | "digConcurrency">, value: string): void {
+function setOptionalNumber(config: ProjectConfig, key: keyof Pick<ProjectConfig, "digSamples" | "mapSteps" | "digSteps" | "digConcurrency" | "verifyConcurrency">, value: string): void {
   const parsed = numberOrUndefined(value);
   if (parsed === undefined) delete config[key];
   else config[key] = parsed;
@@ -5582,7 +5696,7 @@ function NewProjectModal({ providers, daemons, onClose, onCreated, onError }: { 
   const [advanced, setAdvanced] = useState(false);
   const [phaseOpen, setPhaseOpen] = useState(false);
   const firstDaemon = daemons.find((daemon) => daemonHealth(daemon) === "online") ?? daemons[0];
-  const [form, setForm] = useState({ intent: "", name: "", runAfterCreate: true, daemonId: firstDaemon?.id ? String(firstDaemon.id) : "", providerId: defaultProjectProviderId(providers), dir: "", sourcePaths: ".", buildRoot: ".", corpusPaths: "docs/specs", coverageMode: "standard" as CoverageMode, maxScopes: "30", digSamples: "1", mapSteps: "", digSteps: "", digConcurrency: "1", engagementKind: "" as EngagementKindForm, contestBatchScopes: "10", contestDigConcurrency: "5", contestStopAfterHours: "48", contestSkipConfirm: true, contestAppendMap: true });
+  const [form, setForm] = useState({ intent: "", name: "", runAfterCreate: true, daemonId: firstDaemon?.id ? String(firstDaemon.id) : "", providerId: defaultProjectProviderId(providers), dir: "", sourcePaths: ".", buildRoot: ".", corpusPaths: "docs/specs", coverageMode: "standard" as CoverageMode, maxScopes: "30", digSamples: "1", mapSteps: "", digSteps: "", digConcurrency: "1", verifyConcurrency: "2", engagementKind: "" as EngagementKindForm, contestBatchScopes: "10", contestDigConcurrency: "5", contestStopAfterHours: "48", contestSkipConfirm: true, contestAppendMap: true });
   const [phaseProviders, setPhaseProviders] = useState<PhaseProviderForm>({ prepare: "", map: "", dig: "", confirm: "" });
   const providerMissing = providers.length === 0;
   const daemonMissing = daemons.length === 0;
@@ -5732,6 +5846,7 @@ function NewProjectModal({ providers, daemons, onClose, onCreated, onError }: { 
               <Field label="Dig turn cap" help="Maximum model turns per scope; empty means unbounded."><input value={form.digSteps} onChange={(event) => setForm({ ...form, digSteps: event.target.value })} placeholder="unbounded" /></Field>
               <Field label="Dig samples" help="Independent dig passes per selected scope; findings are unioned."><input value={form.digSamples} onChange={(event) => setForm({ ...form, digSamples: event.target.value })} /></Field>
               <Field label="Dig concurrency" help="How many scopes run in parallel. 1 keeps digs sequential."><input value={form.digConcurrency} onChange={(event) => setForm({ ...form, digConcurrency: event.target.value })} /></Field>
+              <Field label="Verify concurrency" help="Independent findings verified in parallel; each keeps its own isolated workspace."><input value={form.verifyConcurrency} onChange={(event) => setForm({ ...form, verifyConcurrency: event.target.value })} /></Field>
             </div>
           </FormSection>
         ) : null}
@@ -5759,6 +5874,7 @@ function EditProjectModal({ detail, providers, daemons, onClose, onSaved, onErro
     mapSteps: cfg.cfg.mapSteps != null ? String(cfg.cfg.mapSteps) : "",
     digSteps: cfg.cfg.digSteps != null ? String(cfg.cfg.digSteps) : "",
     digConcurrency: String(cfg.cfg.digConcurrency ?? 1),
+    verifyConcurrency: String(cfg.cfg.verifyConcurrency ?? 2),
     engagementKind: initialEngagementKind,
     contestBatchScopes: String(initialContest.batchScopes),
     contestDigConcurrency: String(initialContest.digConcurrency),
@@ -5880,6 +5996,7 @@ function EditProjectModal({ detail, providers, daemons, onClose, onSaved, onErro
             <Field label="Dig turn cap" help="Maximum model turns per scope; empty means unbounded."><input value={form.digSteps} onChange={(event) => setForm({ ...form, digSteps: event.target.value })} placeholder="unbounded" /></Field>
             <Field label="Dig samples" help="Independent dig passes per selected scope; findings are unioned."><input value={form.digSamples} onChange={(event) => setForm({ ...form, digSamples: event.target.value })} /></Field>
             <Field label="Dig concurrency" help="How many scopes run in parallel. 1 keeps digs sequential."><input value={form.digConcurrency} onChange={(event) => setForm({ ...form, digConcurrency: event.target.value })} /></Field>
+            <Field label="Verify concurrency" help="Independent findings verified in parallel; each keeps its own isolated workspace."><input value={form.verifyConcurrency} onChange={(event) => setForm({ ...form, verifyConcurrency: event.target.value })} /></Field>
           </div>
         </FormSection>
       </form>
@@ -5957,7 +6074,7 @@ function RunModal({ detail, busy, onClose, onLaunch, onUpdateRunTarget, onError 
     { verb: "map-expand", label: "Expand map", detail: detail.progress.total ? `Run MAP with the current ${plural(detail.progress.total, "scope")} visible, append only novel scopes, and preserve audited/deferred status.` : "Disabled until an initial scope inventory exists.", disabled: locked || !detail.progress.total },
     { verb: "map", label: "Remap from scratch", detail: "Rebuild the scope inventory from scratch without digging. This replaces the current scope view; use Expand map to append coverage.", disabled: locked },
     { verb: "audit", label: "Dig pending scopes", detail: pendingScopes ? `Explicitly deep-audit pending mapped scopes without starting another full pipeline round.` : "Disabled until Map scopes creates pending scope inventory.", disabled: locked || pendingScopes === 0 },
-    { verb: "verify", label: verifyButtonLabel(verifiable), detail: verifiable ? `Confirm-or-refute ${plural(verifiable, "candidate")} by local execution.` : "Disabled until synthesis or dig leaves suspected candidates.", disabled: locked || verifiable === 0 },
+    { verb: "verify", label: verifyButtonLabel(verifiable), detail: verifiable ? `Settle ${plural(verifiable, "unresolved candidate")} by local execution.` : "Disabled until dig or synthesis leaves an unresolved candidate.", disabled: locked || verifiable === 0 },
     { verb: "confirm", label: "Confirm", detail: requiresConfirmation ? (confirmable ? `Reproduce ${plural(confirmable, "execution-confirmed finding")} against the real target.` : "Disabled until local execution confirms a finding.") : "Not required for this source-only target.", disabled: locked || confirmable === 0 },
     { verb: "report", label: missingReports ? `Generate reports (${missingReports})` : "Regenerate reports", detail: reportable ? `Write formal Markdown reports for ${plural(reportable, requiresConfirmation ? "real-target decision" : "locally confirmed finding")}.` : requiresConfirmation ? "Disabled until confirm reproduces at least one decision." : "Disabled until local execution confirms at least one finding.", disabled: locked || reportable === 0 },
   ];
@@ -6042,7 +6159,7 @@ function LaunchConfirmModal({ action, detail, busy, onCancel, onConfirm }: { act
       : "Regenerate reports?"
     : isConfirm
       ? "Start real-target confirmation?"
-      : "Verify candidates?";
+      : "Verify unresolved candidates?";
   const buttonIcon: IconName = isReport ? "file" : isConfirm ? "shieldcheck" : "search";
   const buttonLabel = isReport
     ? selectedExistingReports > 0 && selectedMissingReports === 0
@@ -6052,7 +6169,7 @@ function LaunchConfirmModal({ action, detail, busy, onCancel, onConfirm }: { act
         : "Generate reports"
     : isConfirm
       ? "Confirm"
-      : "Verify";
+      : "Verify candidates";
   return (
     <Modal
       title={title}
@@ -6076,7 +6193,7 @@ function LaunchConfirmModal({ action, detail, busy, onCancel, onConfirm }: { act
                 : `${plural(count, requiresConfirmation ? "real-target decision" : "locally confirmed finding")} will be packaged into formal reports.`
             : isConfirm
               ? `${plural(count, "finding")} will be checked against the real target.`
-              : `${plural(count, "candidate")} will be checked by local execution.`}
+              : `${plural(count, "unresolved candidate")} will be settled by local execution.`}
         </strong>
         <p>
           {isReport
@@ -6085,7 +6202,7 @@ function LaunchConfirmModal({ action, detail, busy, onCancel, onConfirm }: { act
               : "The daemon writes one submission-ready Markdown report per selected source-only bug using the local execution evidence. It may inspect source and existing evidence for accuracy, but it must not invent missing details."
             : isConfirm
               ? "This may use network reads and local forks to reproduce already audit-confirmed findings. Flounder still keeps the white-hat boundary: no broadcast and no live-system writes."
-              : "This starts a local confirm-or-refute run for suspected or source-confirmed candidates. It can take time and will write normal run artifacts, but it does not contact real targets."}
+              : "Dig already tries to prove findings as they are discovered. This separate pass handles only unresolved or synthesized candidates, writes normal run artifacts, and never contacts a real target."}
         </p>
         <label className="check-all">
           <input type="checkbox" checked={allSelected} onChange={toggleAll} />
@@ -6224,11 +6341,16 @@ function ReportModal({ finding, onClose }: { finding: FindingRow; onClose: () =>
   const [markdown, setMarkdown] = useState(fallback);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [lifecycle, setLifecycle] = useState<FindingLifecycle | null>(null);
+  const [retrying, setRetrying] = useState<FindingPhase | null>(null);
+  const [retryMessage, setRetryMessage] = useState("");
   useEffect(() => {
     let cancelled = false;
     setMarkdown(fallback);
     setError("");
     setLoading(true);
+    setLifecycle(null);
+    setRetryMessage("");
     void api
       .findingReport(finding.id)
       .then((response) => {
@@ -6240,17 +6362,90 @@ function ReportModal({ finding, onClose }: { finding: FindingRow; onClose: () =>
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
+    void api.findingLifecycle(finding.id).then((response) => {
+      if (!cancelled) setLifecycle(response);
+    }).catch(() => {});
     return () => {
       cancelled = true;
     };
   }, [fallback, finding.id]);
+  async function retryPhase(phase: FindingPhase) {
+    setRetrying(phase);
+    setRetryMessage("");
+    try {
+      await api.retryFindingPhase(finding.id, phase);
+      setRetryMessage(`${lifecyclePhaseLabel(phase)} is reopened and will run on the next Continue.`);
+    } catch (err) {
+      setRetryMessage(String(err instanceof Error ? err.message : err));
+    } finally {
+      setRetrying(null);
+    }
+  }
   return (
-    <Modal title={`Finding report #${finding.id}`} wide onClose={onClose}>
+    <Modal title={finding.source === "evaluation" ? `Evaluation evidence #${finding.id}` : `Finding report #${finding.id}`} wide onClose={onClose}>
       {loading ? <EmptyInline>Loading report...</EmptyInline> : null}
       {!loading && error ? <div className="inline-note">Showing the stored finding summary because the DB report endpoint could not be loaded.</div> : null}
+      {finding.source !== "evaluation" ? <LifecycleEvidencePanel finding={finding} lifecycle={lifecycle} retrying={retrying} retryMessage={retryMessage} onRetry={retryPhase} /> : null}
       <MarkdownReport markdown={markdown} fileName={`finding-${finding.id}.md`} />
     </Modal>
   );
+}
+
+function LifecycleEvidencePanel({
+  finding,
+  lifecycle,
+  retrying,
+  retryMessage,
+  onRetry,
+}: {
+  finding: FindingRow;
+  lifecycle: FindingLifecycle | null;
+  retrying: FindingPhase | null;
+  retryMessage: string;
+  onRetry: (phase: FindingPhase) => void;
+}) {
+  const findingAttempts = lifecycle?.attempts ?? finding.phase_attempts ?? [];
+  const decisionAttempts = lifecycle?.decisions.flatMap((decision) => decision.attempts ?? []) ?? [];
+  const attempts = [...findingAttempts, ...decisionAttempts];
+  const phaseRows: Array<{ phase: FindingPhase; label: string; attempt?: FindingPhaseAttempt }> = [
+    { phase: "verify", label: "Local evidence", attempt: latestAttempt(attempts, "verify") },
+    { phase: "confirm", label: "Real target", attempt: latestAttempt(attempts, "confirm") },
+    { phase: "report", label: "Formal report", attempt: latestAttempt(attempts, "report") },
+  ];
+  return (
+    <section className="lifecycle-panel" aria-label="Finding lifecycle evidence">
+      <div className="lifecycle-panel-head">
+        <div>
+          <strong>Evidence lifecycle</strong>
+          <small>{lifecycle ? `${plural(lifecycle.occurrences.length, "occurrence")} · canonical ${finding.canonical_key ?? finding.finding_key ?? `#${finding.id}`}` : "Loading attempt history..."}</small>
+        </div>
+        {finding.refutation_status ? <span className={`label refutation-${finding.refutation_status}`}>Independent review: {finding.refutation_status}</span> : null}
+      </div>
+      <div className="lifecycle-attempt-grid">
+        {phaseRows.map(({ phase, label, attempt }) => (
+          <div className="lifecycle-attempt" key={phase}>
+            <span className={`lifecycle-dot ${attemptState(attempt)}`} />
+            <div>
+              <strong>{label}</strong>
+              <small>{attempt ? `Attempt ${attempt.attempt_number} · ${attempt.outcome ?? attempt.state}${attempt.updated_at ? ` · ${fmtTime(attempt.updated_at)}` : ""}` : "Not attempted"}</small>
+              {attempt?.blocker ? <p>{attempt.blocker}</p> : null}
+            </div>
+            {attempt && (attempt.state === "blocked" || attempt.state === "error") ? (
+              <Button size="sm" icon="sync" disabled={retrying !== null} onClick={() => onRetry(phase)}>{retrying === phase ? "Reopening..." : `Retry ${lifecyclePhaseLabel(phase)}`}</Button>
+            ) : null}
+          </div>
+        ))}
+      </div>
+      {retryMessage ? <div className="inline-note">{retryMessage}</div> : null}
+      {finding.refutation_reason ? <details className="lifecycle-refutation"><summary>Independent review detail</summary><p>{finding.refutation_reason}</p></details> : null}
+    </section>
+  );
+}
+
+function lifecyclePhaseLabel(phase: FindingPhase): string {
+  if (phase === "verify") return "Verify";
+  if (phase === "confirm") return "Confirm";
+  return "Report";
 }
 
 function DecisionReportModal({ decision, onClose }: { decision: ConfirmDecision; onClose: () => void }) {
@@ -6535,6 +6730,7 @@ function CommandPalette({ projects, currentProjectUuid, onClose, onNewProject, o
     const base = [
       { id: "new", label: "New project", meta: "create", run: onNewProject },
       { id: "findings", label: "Go to Findings", meta: "view", run: () => go("/findings") },
+      { id: "evaluations", label: "Go to Evaluations", meta: "view", run: () => go("/evaluations") },
       { id: "projects", label: "Go to Projects", meta: "view", run: () => go("/") },
       { id: "settings", label: "Settings", meta: "view", run: () => go("/settings") },
       { id: "providers", label: "Provider profiles", meta: "settings", run: () => go("/settings") },

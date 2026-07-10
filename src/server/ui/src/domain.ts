@@ -10,9 +10,9 @@ export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhig
 export const PHASE_DESC: Record<(typeof PHASES)[number], string> = {
   prepare: "Stage source and warm the build sandbox",
   map: "Build the scope inventory",
-  dig: "Audit mapped scopes and confirm locally",
+  dig: "Discover scope findings and attempt local proof",
   synthesis: "Synthesize findings into distinct bug candidates",
-  verify: "Confirm or refute candidates by local execution",
+  verify: "Settle unresolved candidates by local execution",
   confirm: "Reproduce confirmed findings on the real target",
   report: "Prepare one submission package per bug",
 };
@@ -433,6 +433,7 @@ export interface ProjectConfigShape {
   digSteps?: number;
   digSamples?: number;
   digConcurrency?: number;
+  verifyConcurrency?: number;
   phases?: PhaseConfig;
   phaseProviders?: Partial<Record<ProviderPhase, number>>;
   engagement?: EngagementConfig;
@@ -622,7 +623,7 @@ function durSince(value: string | null | undefined): string {
 }
 
 export function isVerifyRun(run: RunRow | undefined): boolean {
-  return Boolean(run && parseJson<{ verify?: boolean }>(run.budgets_json, {}).verify === true);
+  return Boolean(run && (run.kind === "verify" || parseJson<{ verify?: boolean }>(run.budgets_json, {}).verify === true));
 }
 
 export function isVerifyFromStartRun(run: RunRow | undefined): boolean {
@@ -821,7 +822,7 @@ export function phaseState(detail: ProjectDetail, progress: Coverage): PhaseStat
   const pendingVerify = findings.filter((finding) => finding.status === "suspected" || finding.status === "confirmed-source").length;
   const locallyVerified = findings.filter(isExecutionConfirmedFinding).length;
   const needsEvidence = findings.filter((finding) => finding.status === "needs-evidence").length;
-  const audit = runs.find((r) => r.status === "running" && ["run", "audit", "map"].includes(r.kind));
+  const audit = runs.find((r) => r.status === "running" && ["run", "audit", "map", "verify"].includes(r.kind));
   const auditLatest = latest("run", "audit", "map");
   const coverageTimelineRun = latestCoverageTimelineRun(runs);
   const verifyLatest = runs.find((run) => isVerifyRun(run));
@@ -829,10 +830,10 @@ export function phaseState(detail: ProjectDetail, progress: Coverage): PhaseStat
   const reportRunning = reportLatest?.status === "running";
   const reportError = reportLatest?.status === "error";
   const activeScope = (detail.activeScopeCount ?? 0) > 0 || Boolean((detail.scopes ?? []).some((scope) => scope.status === "auditing"));
-  const digStarted = Boolean(audit && audit.run_scopes_target != null);
-  const mapRunning = Boolean(audit && audit.kind !== "audit" && !digStarted);
-  const batchDone = runScopeBatchComplete(audit);
   const isVerify = isVerifyRun(audit);
+  const digStarted = Boolean(audit && audit.run_scopes_target != null);
+  const mapRunning = Boolean(audit && !isVerify && audit.kind !== "audit" && !digStarted);
+  const batchDone = runScopeBatchComplete(audit);
   const verifyProgress = verifyRunProgress(audit);
   const verifyRechecksConfirmed = verifyRunRechecksConfirmed(audit, pendingVerify, findings.length);
   const pendingConfirm = verifyRechecksConfirmed ? 0 : pendingConfirmRaw;
@@ -867,7 +868,7 @@ export function phaseState(detail: ProjectDetail, progress: Coverage): PhaseStat
     dig: {
       status: digRunning ? "running" : progress.audited > 0 ? (progress.pending > 0 && !finishedSelectedDigBatch ? "partial" : "done") : progress.total > 0 ? "pending" : "none",
       stat: finalizingAudit
-          ? `Verifying candidates · ${progress.audited}/${progress.total} scopes audited${detail.findingsTotal ? ` · ${detail.findingsTotal} in project` : ""}`
+          ? `Finalizing local evidence · ${progress.audited}/${progress.total} scopes audited${detail.findingsTotal ? ` · ${detail.findingsTotal} in project` : ""}`
           : progress.total > 0
             ? `${progress.audited}/${progress.total} scopes audited · ${progress.pending} pending${detail.findingsTotal ? ` · ${detail.findingsTotal} ${detail.findingsTotal === 1 ? "finding" : "findings"}` : ""}${thisRun}`
             : "Not started",

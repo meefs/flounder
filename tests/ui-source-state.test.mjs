@@ -18,8 +18,9 @@ async function loadTsModule(relativePath) {
   return import(`data:text/javascript;base64,${Buffer.from(compiled.outputText).toString("base64")}`);
 }
 
-const { bugBountyEngagementLabel, contestReviewState, phaseState, projectSourceState, runProgress, sortConfirmDecisionsForSubmission } = await loadTsModule("../src/server/ui/src/domain.ts");
+const { bugBountyEngagementLabel, contestReviewState, isVerifyRun, phaseState, projectSourceState, runProgress, sortConfirmDecisionsForSubmission } = await loadTsModule("../src/server/ui/src/domain.ts");
 const { nextDialogFocusIndex } = await loadTsModule("../src/server/ui/src/dialog-focus.ts");
+const appSource = readFileSync(new URL("../src/server/ui/src/App.tsx", import.meta.url), "utf8");
 
 test("ui: modal focus traversal wraps in both directions", () => {
   assert.equal(nextDialogFocusIndex(0, 3, false), 1);
@@ -32,6 +33,42 @@ test("ui: modal focus traversal wraps in both directions", () => {
 
 test("ui: source setup is ready when configured source paths exist", () => {
   assert.deepEqual(projectSourceState(null, ["src"]), { kind: "configured", ok: true });
+});
+
+test("ui: verify runs use the explicit run kind while preserving legacy metadata", () => {
+  assert.equal(isVerifyRun({ kind: "verify", status: "running" }), true);
+  assert.equal(isVerifyRun({ kind: "audit", status: "done", budgets_json: JSON.stringify({ verify: true }) }), true);
+  assert.equal(isVerifyRun({ kind: "audit", status: "done", budgets_json: "{}" }), false);
+
+  const phases = phaseState({
+    runs: [{ id: 2, kind: "verify", status: "running", run_scopes_target: 2, run_scopes_done: 1 }],
+    material: {},
+    scopes: [],
+    activeScopeCount: 0,
+    findingsTotal: 1,
+    statusCounts: { suspected: 1 },
+    allFindings: [{ id: 1, status: "suspected" }],
+    confirmDecisions: [],
+  }, { total: 0, audited: 0, deferred: 0, pending: 0 });
+  assert.equal(phases.verify.status, "running");
+  assert.match(phases.verify.stat, /Verifying 1\/2 findings/);
+});
+
+test("ui: global findings default to project evidence and expose explicit evaluation provenance", () => {
+  assert.match(appSource, /useState<"project" \| "evaluation" \| "all">\("project"\)/);
+  assert.match(appSource, /<option value="evaluation">Evaluation evidence<\/option>/);
+  assert.match(appSource, /finding\.source === "evaluation"/);
+  assert.match(appSource, />Evaluation only<\/span>/);
+});
+
+test("ui: findings expose a compact lifecycle summary and focused blocked-phase retry", () => {
+  assert.match(appSource, /function FindingLifecycleRail/);
+  assert.match(appSource, /Found.*Local.*Target.*Report.*Disclose/s);
+  assert.match(appSource, /lifecycle-summary-button/);
+  assert.doesNotMatch(appSource, /className="lifecycle-rail"/);
+  assert.match(appSource, /function LifecycleEvidencePanel/);
+  assert.match(appSource, /api\.retryFindingPhase/);
+  assert.match(appSource, /will run on the next Continue/);
 });
 
 test("ui: source setup is ready when prepare produced an audit-ready workspace", () => {

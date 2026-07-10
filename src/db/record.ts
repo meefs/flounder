@@ -11,7 +11,7 @@ import type { AuditorConfig } from "../config.js";
 import type { AgentFinding, AuditScope } from "../agent/tools.js";
 import type { CoverageGap, ResourceRequest, RunHealth } from "../agent/discovery-artifacts.js";
 import type { RankedFinding } from "../types.js";
-import { MetadataStore, type Coverage, type DiscoveryBacklogInput, type FindingRow, type FindingStatus, type RunKind, type RunStatus, type ScopeRow } from "./store.js";
+import { MetadataStore, type Coverage, type DiscoveryBacklogInput, type FindingPhaseAttemptInput, type FindingRow, type FindingStatus, type RunKind, type RunStatus, type ScopeRow } from "./store.js";
 
 export interface RunLoggerLike {
   event(kind: string, data?: Record<string, unknown>): Promise<void>;
@@ -51,6 +51,7 @@ export interface RunTracker {
   scopes(scopes: AuditScope[]): void;
   /** This run's dig batch: how many scopes it is digging (target) + how many done so far. */
   runScopes(done: number, target: number): void;
+  materialFingerprint?(fingerprint: string): void;
   findings(findings: AgentFinding[], runDir: string, reason?: string): void;
   /** Record one post-dig stage's outcome (synthesis / differential / refutation / discharge-challenge). */
   stage(name: string, info: Record<string, unknown>): void;
@@ -60,6 +61,7 @@ export interface RunTracker {
   backlog?(rows: DiscoveryBacklogInput[]): void;
   confirmDecisions(rows: ConfirmDecisionInput[], decisionPath?: string): void;
   findingReports(reports: FindingReportInput[]): void;
+  phaseAttempt?(input: FindingPhaseAttemptInput): void;
   finish(status: RunStatus, coverage?: Coverage, findingsTotal?: number): void;
 }
 
@@ -100,6 +102,7 @@ export class RunRecorder implements RunTracker {
         // Mark a verify run (in the run's budgets only, not the project config) so the dashboard can
         // show "verifying N/M findings" instead of mislabeling it as a dig.
         budgets: cfg.auditVerify ? { ...configSnapshot(cfg), verify: true, ...(cfg.auditVerifyFromStart ? { verifyFromStart: true } : {}) } : configSnapshot(cfg),
+        materialFingerprint: cfg.materialFingerprint,
         // The OS pid lets a supervising run-manager correlate this DB row to the process
         // it spawned (and reconcile status if the process dies before finalize).
         pid: process.pid,
@@ -132,6 +135,15 @@ export class RunRecorder implements RunTracker {
       this.store!.updateRunScopes(this.runId!, done, target);
     } catch (error) {
       this.disable("run-scopes", error);
+    }
+  }
+
+  materialFingerprint(fingerprint: string): void {
+    if (!this.ready()) return;
+    try {
+      this.store!.updateRunMaterialFingerprint(this.runId!, fingerprint);
+    } catch (error) {
+      this.disable("material-fingerprint", error);
     }
   }
 
@@ -193,6 +205,15 @@ export class RunRecorder implements RunTracker {
       }
     } catch (error) {
       this.disable("finding-reports", error);
+    }
+  }
+
+  phaseAttempt(input: FindingPhaseAttemptInput): void {
+    if (!this.ready()) return;
+    try {
+      this.store!.recordFindingPhaseAttempt(this.projectId!, this.runId!, input);
+    } catch (error) {
+      this.disable("phase-attempt", error);
     }
   }
 
@@ -275,8 +296,11 @@ export function toFindingRow(finding: AgentFinding, runDir: string, targetName =
     exploitSketch: finding.exploitSketch,
     fix: finding.fix,
     confidence: finding.confidence,
+    refutationStatus: finding.refutationStatus,
+    refutationReason: finding.refutationReason ?? finding.refutation?.reason,
     // VERIFY provenance: when set, the verdict flips the original suspected row instead of inserting.
     originId: finding.originId,
+    phaseAttempt: finding.phaseAttempt,
   };
 }
 
@@ -383,5 +407,6 @@ export function configSnapshot(cfg: AuditorConfig): Record<string, unknown> {
     maxScopes: finite(cfg.auditMaxScopes),
     digSamples: cfg.auditDigSamples,
     digConcurrency: cfg.auditDigConcurrency,
+    verifyConcurrency: cfg.auditVerifyConcurrency,
   };
 }

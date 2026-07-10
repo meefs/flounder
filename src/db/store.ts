@@ -14,7 +14,15 @@ import { createRequire } from "node:module";
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
-import { enforceSubmissionReadiness } from "../util/submission-readiness.js";
+import { enforceSubmissionReadiness, needsSubmissionReadinessWork } from "../util/submission-readiness.js";
+import { canonicalFindingKey } from "../util/finding-identity.js";
+import { phaseInputFingerprint } from "../util/material-fingerprint.js";
+import type {
+  RunGroupState,
+  WorkItemInput as EvaluationWorkItemInput,
+  WorkItemOutcome,
+  WorkItemState,
+} from "../evaluation/contracts.js";
 
 // A static `import ... from "node:sqlite"` emits the builtin's ExperimentalWarning at link
 // time, before sqlite-quiet's body can install the filter. Loading it via require() during
@@ -28,12 +36,14 @@ export type FindingStatus =
   | "suspected"
   | "needs-evidence"
   | "discharged"
+  | "confirmed-source"
   | "confirmed-executable"
   | "confirmed-differential"
   | "refuted";
 
 export interface ProjectInput {
   name: string;
+  origin?: "project" | "evaluation" | undefined; // evaluation tracking projects stay out of the normal project surface
   sourcePaths?: string[] | undefined; // relative to the project dir
   buildRoot?: string | undefined; // relative to the project dir
   corpusPaths?: string[] | undefined; // relative to the project dir
@@ -45,6 +55,7 @@ export interface ProjectInput {
 
 export interface ProjectListOptions {
   archived?: boolean | "all" | undefined;
+  origin?: "project" | "evaluation" | "all" | undefined;
   limit?: number | undefined;
   offset?: number | undefined;
   search?: string | undefined;
@@ -59,6 +70,7 @@ export interface RunInput {
   thinking?: string | undefined;
   budgets?: unknown;
   pid?: number | undefined;
+  materialFingerprint?: string | undefined;
 }
 
 export interface ScopeRow {
@@ -93,6 +105,26 @@ export interface FindingRow {
   // VERIFY: the DB id of the original suspected finding this row's verdict resolves. When set,
   // upsertFindings UPDATES that existing row in place (cross-run) instead of inserting a new one.
   originId?: number | undefined;
+  refutationStatus?: "pending" | "running" | "passed" | "refuted" | "blocked" | undefined;
+  refutationReason?: string | undefined;
+  phaseAttempt?: FindingPhaseAttemptRef | undefined;
+}
+
+export type FindingPhase = "verify" | "confirm" | "report";
+export type FindingPhaseAttemptState = "running" | "settled" | "blocked" | "error";
+
+export interface FindingPhaseAttemptRef {
+  subjectType: "finding" | "decision";
+  subjectId: number;
+  inputFingerprint: string;
+}
+
+export interface FindingPhaseAttemptInput extends FindingPhaseAttemptRef {
+  phase: FindingPhase;
+  state: FindingPhaseAttemptState;
+  outcome?: string | undefined;
+  blocker?: string | undefined;
+  metrics?: unknown;
 }
 
 export interface ConfirmRow {
@@ -182,6 +214,9 @@ export interface ProviderProfile {
 export interface FindingFilter {
   status?: string | undefined; // exact status, e.g. "confirmed-differential"
   search?: string | undefined; // substring match on title or location
+  tracking?: string | undefined; // exact state, or "active" to exclude ignored
+  runIds?: number[] | undefined;
+  reportable?: boolean | undefined;
 }
 
 export interface FindingQuery extends FindingFilter {
@@ -189,7 +224,15 @@ export interface FindingQuery extends FindingFilter {
   offset?: number | undefined;
 }
 
-const SCHEMA_VERSION = 4;
+export interface RunGroupInput {
+  name: string;
+  kind?: string | undefined;
+  parallelism?: number | undefined;
+  config?: unknown;
+  budget?: unknown;
+}
+
+const SCHEMA_VERSION = 7;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -198,6 +241,7 @@ CREATE TABLE IF NOT EXISTS project(
   id INTEGER PRIMARY KEY,
   uuid TEXT NOT NULL,
   name TEXT UNIQUE NOT NULL,
+  origin TEXT NOT NULL DEFAULT 'project', -- project | evaluation; evaluation rows are internal run tracking
   source_paths TEXT,              -- now RELATIVE to the project dir (was absolute)
   build_root TEXT,                -- relative to the project dir
   corpus_paths TEXT,              -- relative to the project dir
@@ -223,6 +267,7 @@ CREATE TABLE IF NOT EXISTS run(
   model TEXT,
   thinking TEXT,
   budgets_json TEXT,
+  material_fingerprint TEXT,
   stages_json TEXT,               -- post-dig stage outcomes (synthesis / differential / refutation / discharge-challenge) for the funnel view
   health_status TEXT,             -- latest run-health verdict emitted by the audit kernel
   health_reasons_json TEXT,       -- human-readable reasons for the health verdict
@@ -278,9 +323,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_backlog_run_item ON discovery_backlog(run_
 
 CREATE TABLE IF NOT EXISTS finding(
   id INTEGER PRIMARY KEY,
+  uuid TEXT,
   project_id INTEGER NOT NULL REFERENCES project(id),
   run_id INTEGER REFERENCES run(id),
   finding_key TEXT NOT NULL,
+  canonical_key TEXT,
+  occurrence_count INTEGER NOT NULL DEFAULT 1,
   title TEXT,
   location TEXT,
   severity TEXT,
@@ -295,11 +343,42 @@ CREATE TABLE IF NOT EXISTS finding(
   exploit_sketch TEXT,
   fix TEXT,
   confidence REAL,
+  refutation_status TEXT,
+  refutation_reason TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE(run_id, finding_key)
 );
 CREATE INDEX IF NOT EXISTS idx_finding_project ON finding(project_id);
+
+CREATE TABLE IF NOT EXISTS finding_occurrence(
+  id INTEGER PRIMARY KEY,
+  finding_id INTEGER NOT NULL REFERENCES finding(id) ON DELETE CASCADE,
+  project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+  run_id INTEGER REFERENCES run(id) ON DELETE SET NULL,
+  finding_key TEXT NOT NULL,
+  title TEXT,
+  location TEXT,
+  scope_id TEXT,
+  status TEXT NOT NULL,
+  reason TEXT,
+  payload_json TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(run_id, finding_key)
+);
+CREATE INDEX IF NOT EXISTS idx_finding_occurrence_finding ON finding_occurrence(finding_id, created_at);
+
+CREATE TABLE IF NOT EXISTS finding_key_alias(
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+  alias_key TEXT NOT NULL,
+  finding_id INTEGER NOT NULL REFERENCES finding(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(project_id, alias_key)
+);
+CREATE INDEX IF NOT EXISTS idx_finding_alias_finding ON finding_key_alias(finding_id);
 
 CREATE TABLE IF NOT EXISTS finding_status_event(
   id INTEGER PRIMARY KEY,
@@ -311,6 +390,36 @@ CREATE TABLE IF NOT EXISTS finding_status_event(
   ts TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_fse_finding ON finding_status_event(finding_id);
+
+CREATE TABLE IF NOT EXISTS finding_phase_attempt(
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+  subject_type TEXT NOT NULL,
+  subject_id INTEGER NOT NULL,
+  phase TEXT NOT NULL,
+  input_fingerprint TEXT NOT NULL,
+  attempt_number INTEGER NOT NULL,
+  run_id INTEGER REFERENCES run(id) ON DELETE SET NULL,
+  state TEXT NOT NULL,
+  outcome TEXT,
+  blocker TEXT,
+  metrics_json TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  started_at TEXT,
+  ended_at TEXT,
+  UNIQUE(subject_type, subject_id, phase, run_id)
+);
+CREATE INDEX IF NOT EXISTS idx_finding_phase_subject ON finding_phase_attempt(project_id, subject_type, subject_id, phase, attempt_number);
+
+CREATE TABLE IF NOT EXISTS phase_retry_request(
+  project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+  subject_type TEXT NOT NULL,
+  subject_id INTEGER NOT NULL,
+  phase TEXT NOT NULL,
+  requested_at TEXT NOT NULL,
+  PRIMARY KEY(project_id, subject_type, subject_id, phase)
+);
 
 CREATE TABLE IF NOT EXISTS confirm_decision(
   id INTEGER PRIMARY KEY,
@@ -375,9 +484,74 @@ CREATE TABLE IF NOT EXISTS provider(
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS run_group(
+  id INTEGER PRIMARY KEY,
+  uuid TEXT UNIQUE NOT NULL,
+  name TEXT UNIQUE NOT NULL,
+  kind TEXT NOT NULL,
+  state TEXT NOT NULL,
+  parallelism INTEGER NOT NULL DEFAULT 1,
+  config_json TEXT,
+  budget_json TEXT,
+  summary_json TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  started_at TEXT,
+  ended_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS work_item(
+  id INTEGER PRIMARY KEY,
+  uuid TEXT UNIQUE NOT NULL,
+  run_group_id INTEGER NOT NULL REFERENCES run_group(id) ON DELETE CASCADE,
+  item_key TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  state TEXT NOT NULL,
+  outcome TEXT,
+  target_bundle_json TEXT NOT NULL,
+  material_policy_json TEXT NOT NULL,
+  evidence_contract_json TEXT NOT NULL,
+  result_json TEXT,
+  project_id INTEGER REFERENCES project(id) ON DELETE SET NULL,
+  run_id INTEGER REFERENCES run(id) ON DELETE SET NULL,
+  job_id INTEGER REFERENCES job(id) ON DELETE SET NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  started_at TEXT,
+  ended_at TEXT,
+  UNIQUE(run_group_id, item_key)
+);
+CREATE INDEX IF NOT EXISTS idx_work_item_group_state ON work_item(run_group_id, state);
+CREATE INDEX IF NOT EXISTS idx_work_item_project ON work_item(project_id);
+CREATE INDEX IF NOT EXISTS idx_work_item_run ON work_item(run_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_work_item_job ON work_item(job_id) WHERE job_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS work_item_attempt(
+  id INTEGER PRIMARY KEY,
+  work_item_id INTEGER NOT NULL REFERENCES work_item(id) ON DELETE CASCADE,
+  attempt_number INTEGER NOT NULL,
+  job_id INTEGER NOT NULL,
+  run_id INTEGER REFERENCES run(id) ON DELETE SET NULL,
+  state TEXT NOT NULL,
+  outcome TEXT,
+  result_json TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  started_at TEXT,
+  ended_at TEXT,
+  UNIQUE(work_item_id, attempt_number),
+  UNIQUE(job_id)
+);
+CREATE INDEX IF NOT EXISTS idx_work_item_attempt_item ON work_item_attempt(work_item_id, attempt_number);
+CREATE INDEX IF NOT EXISTS idx_work_item_attempt_run ON work_item_attempt(run_id);
 `;
 
 const ADDITIVE_COLUMNS = [
+  ["project", "origin", "ALTER TABLE project ADD COLUMN origin TEXT NOT NULL DEFAULT 'project'"],
   ["project", "provider_id", "ALTER TABLE project ADD COLUMN provider_id INTEGER"],
   ["project", "daemon_id", "ALTER TABLE project ADD COLUMN daemon_id INTEGER"],
   ["project", "dir", "ALTER TABLE project ADD COLUMN dir TEXT"],
@@ -387,11 +561,15 @@ const ADDITIVE_COLUMNS = [
   ["project", "sort_order", "ALTER TABLE project ADD COLUMN sort_order INTEGER"],
   ["daemon", "workspace", "ALTER TABLE daemon ADD COLUMN workspace TEXT"],
   ["run", "run_scopes_target", "ALTER TABLE run ADD COLUMN run_scopes_target INTEGER"],
+  ["run", "material_fingerprint", "ALTER TABLE run ADD COLUMN material_fingerprint TEXT"],
   ["run", "run_scopes_done", "ALTER TABLE run ADD COLUMN run_scopes_done INTEGER"],
   ["run", "dig_started_at", "ALTER TABLE run ADD COLUMN dig_started_at TEXT"],
   ["scope", "dig_seconds", "ALTER TABLE scope ADD COLUMN dig_seconds INTEGER"],
   ["scope", "priority", "ALTER TABLE scope ADD COLUMN priority INTEGER DEFAULT 0"],
   ["finding", "tracking_status", "ALTER TABLE finding ADD COLUMN tracking_status TEXT"],
+  ["finding", "uuid", "ALTER TABLE finding ADD COLUMN uuid TEXT"],
+  ["finding", "canonical_key", "ALTER TABLE finding ADD COLUMN canonical_key TEXT"],
+  ["finding", "occurrence_count", "ALTER TABLE finding ADD COLUMN occurrence_count INTEGER NOT NULL DEFAULT 1"],
   ["finding", "confirm_status", "ALTER TABLE finding ADD COLUMN confirm_status TEXT"],
   ["finding", "duplicate_of_finding_id", "ALTER TABLE finding ADD COLUMN duplicate_of_finding_id INTEGER REFERENCES finding(id)"],
   ["finding", "report_markdown", "ALTER TABLE finding ADD COLUMN report_markdown TEXT"],
@@ -400,6 +578,8 @@ const ADDITIVE_COLUMNS = [
   ["finding", "exploit_sketch", "ALTER TABLE finding ADD COLUMN exploit_sketch TEXT"],
   ["finding", "fix", "ALTER TABLE finding ADD COLUMN fix TEXT"],
   ["finding", "confidence", "ALTER TABLE finding ADD COLUMN confidence REAL"],
+  ["finding", "refutation_status", "ALTER TABLE finding ADD COLUMN refutation_status TEXT"],
+  ["finding", "refutation_reason", "ALTER TABLE finding ADD COLUMN refutation_reason TEXT"],
   ["run", "stages_json", "ALTER TABLE run ADD COLUMN stages_json TEXT"],
   ["run", "health_status", "ALTER TABLE run ADD COLUMN health_status TEXT"],
   ["run", "health_reasons_json", "ALTER TABLE run ADD COLUMN health_reasons_json TEXT"],
@@ -672,6 +852,28 @@ function decisionEvidenceInput(row: {
   };
 }
 
+const CANONICAL_STATUS_RANK: Record<string, number> = {
+  discharged: 0,
+  refuted: 1,
+  "needs-evidence": 2,
+  suspected: 3,
+  "confirmed-source": 4,
+  "confirmed-executable": 5,
+  "confirmed-differential": 6,
+};
+
+function compareCanonicalRows(a: Record<string, unknown>, b: Record<string, unknown>): number {
+  const status = (CANONICAL_STATUS_RANK[String(b.status)] ?? -1) - (CANONICAL_STATUS_RANK[String(a.status)] ?? -1);
+  if (status !== 0) return status;
+  const report = Number(Boolean(b.report_markdown)) - Number(Boolean(a.report_markdown));
+  if (report !== 0) return report;
+  return String(b.updated_at ?? "").localeCompare(String(a.updated_at ?? "")) || Number(a.id) - Number(b.id);
+}
+
+function findingStatusRank(status: string): number {
+  return CANONICAL_STATUS_RANK[status] ?? -1;
+}
+
 export class MetadataStore {
   private readonly db: InstanceType<typeof DatabaseSync>;
 
@@ -693,8 +895,11 @@ export class MetadataStore {
       for (const [table, column, alter] of ADDITIVE_COLUMNS) {
         if (!this.hasColumn(table, column)) this.db.exec(alter);
       }
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_project_origin ON project(origin)");
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_finding_project_canonical ON finding(project_id, canonical_key)");
     }, "immediate");
     this.ensureProjectUuids();
+    this.ensureFindingIdentities();
     this.reconcileConfirmStatuses();
     this.runDataMigrations();
     this.db
@@ -707,6 +912,73 @@ export class MetadataStore {
     const update = this.db.prepare("UPDATE project SET uuid = ? WHERE id = ?");
     for (const row of rows) update.run(randomUUID(), row.id);
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_project_uuid ON project(uuid)");
+  }
+
+  private ensureFindingIdentities(): void {
+    const needsBackfill = this.db.prepare(
+      "SELECT 1 AS yes FROM finding WHERE uuid IS NULL OR uuid = '' OR canonical_key IS NULL OR canonical_key = '' LIMIT 1",
+    ).get();
+    if (!needsBackfill) {
+      this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_finding_uuid ON finding(uuid)");
+      return;
+    }
+    this.transaction(() => {
+      const rows = this.db
+        .prepare("SELECT id, project_id, run_id, finding_key, title, location, scope_id, status, created_at, updated_at, uuid, canonical_key FROM finding ORDER BY id")
+        .all() as Array<Record<string, unknown>>;
+      const updateIdentity = this.db.prepare("UPDATE finding SET uuid = ?, canonical_key = ? WHERE id = ?");
+      for (const row of rows) {
+        const uuid = typeof row.uuid === "string" && row.uuid ? row.uuid : randomUUID();
+        const canonical = typeof row.canonical_key === "string" && row.canonical_key
+          ? row.canonical_key
+          : canonicalFindingKey(row.title, row.location, row.finding_key);
+        updateIdentity.run(uuid, canonical, Number(row.id));
+      }
+
+      // Older schemas allowed the same exact finding identity once per run. Collapse
+      // only exact normalized title+location identities; semantic similarity is never
+      // inferred. Every removed row survives as an occurrence + key alias.
+      const refreshed = this.db.prepare("SELECT * FROM finding ORDER BY project_id, canonical_key, id").all() as Array<Record<string, unknown>>;
+      const groups = new Map<string, Array<Record<string, unknown>>>();
+      for (const row of refreshed) {
+        const key = `${row.project_id}:${row.canonical_key}`;
+        const group = groups.get(key) ?? [];
+        group.push(row);
+        groups.set(key, group);
+      }
+      const insertOccurrence = this.db.prepare(
+        `INSERT OR IGNORE INTO finding_occurrence(finding_id, project_id, run_id, finding_key, title, location, scope_id, status, reason, payload_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'identity migration', ?, ?, ?)`,
+      );
+      const upsertAlias = this.db.prepare(
+        `INSERT INTO finding_key_alias(project_id, alias_key, finding_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(project_id, alias_key) DO UPDATE SET finding_id = excluded.finding_id, updated_at = excluded.updated_at`,
+      );
+      for (const group of groups.values()) {
+        const primary = [...group].sort(compareCanonicalRows)[0]!;
+        const ts = now();
+        for (const row of group) {
+          insertOccurrence.run(Number(primary.id), Number(row.project_id), row.run_id == null ? null : Number(row.run_id), String(row.finding_key), row.title == null ? null : String(row.title), row.location == null ? null : String(row.location), row.scope_id == null ? null : String(row.scope_id), String(row.status), jsonOrNull(row), String(row.created_at ?? ts), String(row.updated_at ?? ts));
+          upsertAlias.run(Number(row.project_id), String(row.finding_key).toLowerCase(), Number(primary.id), ts, ts);
+          if (row.id === primary.id) continue;
+          this.db.prepare("UPDATE finding_status_event SET finding_id = ? WHERE finding_id = ?").run(Number(primary.id), Number(row.id));
+          this.db.prepare("UPDATE finding SET duplicate_of_finding_id = ? WHERE duplicate_of_finding_id = ?").run(Number(primary.id), Number(row.id));
+          this.db.prepare("UPDATE finding_occurrence SET finding_id = ? WHERE finding_id = ?").run(Number(primary.id), Number(row.id));
+          this.db.prepare(
+            `UPDATE finding SET
+               report_path = COALESCE(report_path, ?), report_markdown = COALESCE(NULLIF(report_markdown, ''), ?),
+               description = COALESCE(NULLIF(description, ''), ?), evidence = COALESCE(NULLIF(evidence, ''), ?),
+               exploit_sketch = COALESCE(NULLIF(exploit_sketch, ''), ?), fix = COALESCE(NULLIF(fix, ''), ?),
+               confidence = COALESCE(confidence, ?), confirm_status = COALESCE(confirm_status, ?), updated_at = MAX(updated_at, ?)
+             WHERE id = ?`,
+          ).run(sqlText(row.report_path), sqlText(row.report_markdown), sqlText(row.description), sqlText(row.evidence), sqlText(row.exploit_sketch), sqlText(row.fix), row.confidence == null ? null : Number(row.confidence), sqlText(row.confirm_status), String(row.updated_at ?? ts), Number(primary.id));
+          this.db.prepare("DELETE FROM finding WHERE id = ?").run(Number(row.id));
+        }
+      }
+      this.db.exec("UPDATE finding SET occurrence_count = (SELECT COUNT(*) FROM finding_occurrence fo WHERE fo.finding_id = finding.id)");
+    }, "immediate");
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_finding_uuid ON finding(uuid)");
   }
 
   private reconcileConfirmStatuses(): void {
@@ -728,7 +1000,7 @@ export class MetadataStore {
         novelty: string | null;
       }>;
     if (rows.length === 0) return;
-    const update = this.db.prepare("UPDATE finding SET confirm_status = ? WHERE project_id = ? AND finding_key = ? AND confirm_status IS NULL");
+    const update = this.db.prepare("UPDATE finding SET confirm_status = ? WHERE project_id = ? AND id = ? AND confirm_status IS NULL");
     for (const row of rows) {
       const members = jsonParseOrNull(row.members_json);
       if (!Array.isArray(members)) continue;
@@ -737,13 +1009,27 @@ export class MetadataStore {
       if (!outcome) continue;
       for (const member of members) {
         if (typeof member !== "string") continue;
-        for (const key of confirmMemberKeys(member)) update.run(outcome, row.project_id, key);
+        for (const key of confirmMemberKeys(member)) {
+          const finding = this.resolveFindingByKey(row.project_id, key);
+          if (finding) update.run(outcome, row.project_id, Number(finding.id));
+        }
       }
     }
   }
 
   private runDataMigrations(): void {
     this.transaction(() => {
+      this.db.exec("UPDATE work_item SET project_id = (SELECT project_id FROM run WHERE run.id = work_item.run_id) WHERE project_id IS NULL AND run_id IS NOT NULL");
+      this.db.exec("UPDATE project SET origin = 'evaluation' WHERE origin = 'project' AND name LIKE 'evaluation:%' AND EXISTS (SELECT 1 FROM work_item WHERE work_item.project_id = project.id)");
+      this.db.exec(`UPDATE project AS p SET origin = 'evaluation'
+        WHERE p.origin = 'project'
+          AND EXISTS (SELECT 1 FROM run r_any WHERE r_any.project_id = p.id)
+          AND NOT EXISTS (
+            SELECT 1 FROM run r_normal
+             WHERE r_normal.project_id = p.id
+               AND NOT EXISTS (SELECT 1 FROM work_item wi_run WHERE wi_run.run_id = r_normal.id)
+               AND NOT EXISTS (SELECT 1 FROM work_item_attempt wia_run WHERE wia_run.run_id = r_normal.id)
+          )`);
       this.reconcileFindingReportRunIds();
       this.reconcileRefutedVerifyArtifacts();
       this.reconcileConfirmDecisionReports();
@@ -919,8 +1205,8 @@ export class MetadataStore {
     const insertSortOrder = this.nextProjectSortOrder();
     this.db
       .prepare(
-        `INSERT INTO project(uuid, name, source_paths, build_root, corpus_paths, config_json, provider_id, daemon_id, dir, sort_order, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO project(uuid, name, origin, source_paths, build_root, corpus_paths, config_json, provider_id, daemon_id, dir, sort_order, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(name) DO UPDATE SET
            source_paths = excluded.source_paths,
            build_root   = excluded.build_root,
@@ -936,6 +1222,7 @@ export class MetadataStore {
       .run(
         projectUuid,
         input.name,
+        input.origin ?? "project",
         jsonOrNull(input.sourcePaths),
         input.buildRoot ?? null,
         jsonOrNull(input.corpusPaths),
@@ -978,7 +1265,7 @@ export class MetadataStore {
   }
 
   private nextProjectSortOrder(): number {
-    const row = this.db.prepare("SELECT MIN(sort_order) AS min_order FROM project WHERE archived_at IS NULL").get() as { min_order: number | null } | undefined;
+    const row = this.db.prepare("SELECT MIN(sort_order) AS min_order FROM project WHERE archived_at IS NULL AND origin = 'project'").get() as { min_order: number | null } | undefined;
     return typeof row?.min_order === "number" ? row.min_order - 10 : 0;
   }
 
@@ -1048,6 +1335,8 @@ export class MetadataStore {
     if (!project) return false;
     const id = Number(project.id);
     this.transaction(() => {
+      this.db.prepare("DELETE FROM phase_retry_request WHERE project_id = ?").run(id);
+      this.db.prepare("DELETE FROM finding_phase_attempt WHERE project_id = ?").run(id);
       this.db.prepare("DELETE FROM finding_status_event WHERE finding_id IN (SELECT id FROM finding WHERE project_id = ?)").run(id);
       this.db.prepare("DELETE FROM finding WHERE project_id = ?").run(id);
       this.db.prepare("DELETE FROM scope WHERE project_id = ?").run(id);
@@ -1066,8 +1355,8 @@ export class MetadataStore {
   startRun(input: RunInput): number {
     const info = this.db
       .prepare(
-        `INSERT INTO run(project_id, kind, run_dir, status, pid, provider, model, thinking, budgets_json, started_at)
-         VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO run(project_id, kind, run_dir, status, pid, provider, model, thinking, budgets_json, material_fingerprint, started_at)
+         VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.projectId,
@@ -1078,9 +1367,14 @@ export class MetadataStore {
         input.model ?? null,
         input.thinking ?? null,
         jsonOrNull(input.budgets),
+        input.materialFingerprint ?? null,
         now(),
       );
     return Number(info.lastInsertRowid);
+  }
+
+  updateRunMaterialFingerprint(runId: number, fingerprint: string): void {
+    this.db.prepare("UPDATE run SET material_fingerprint = ? WHERE id = ?").run(fingerprint, runId);
   }
 
   finishRun(runId: number, status: RunStatus, coverage?: Coverage, findingsTotal?: number): void {
@@ -1210,6 +1504,7 @@ export class MetadataStore {
   deleteRun(id: number): boolean {
     if (!this.getRun(id)) return false;
     this.transaction(() => {
+      this.db.prepare("DELETE FROM finding_phase_attempt WHERE run_id = ?").run(id);
       this.db.prepare("DELETE FROM finding_status_event WHERE finding_id IN (SELECT id FROM finding WHERE run_id = ?)").run(id);
       this.db.prepare("DELETE FROM finding WHERE run_id = ?").run(id);
       this.db.prepare("DELETE FROM discovery_backlog WHERE run_id = ?").run(id);
@@ -1464,76 +1759,88 @@ export class MetadataStore {
     this.transaction(() => {
       for (const f of findings) {
         const ts = now();
-        // VERIFY verdict: flip the ORIGINAL suspected finding in place (cross-run). The link is
-        // carried (originId = that finding's DB id), so a verify session that renamed the title still
-        // updates the right row — status + the PoC writeup — instead of inserting a duplicate.
-        if (f.originId != null) {
-          const orig = this.db.prepare("SELECT id, status FROM finding WHERE id = ?").get(f.originId) as { id: number; status: string } | undefined;
-          if (orig) {
-            this.db
-              .prepare(
-                `UPDATE finding SET run_id = ?, finding_key = ?, title = ?, location = ?, severity = ?, status = ?,
-                   report_path = COALESCE(?, report_path), scope_id = ?,
-                   report_markdown = COALESCE(NULLIF(?, ''), report_markdown),
-                   description = COALESCE(NULLIF(?, ''), description), evidence = COALESCE(NULLIF(?, ''), evidence),
-                   exploit_sketch = COALESCE(NULLIF(?, ''), exploit_sketch), fix = COALESCE(NULLIF(?, ''), fix),
-                   confidence = COALESCE(?, confidence), updated_at = ? WHERE id = ?`,
-              )
-              .run(
-                runId,
-                f.findingKey,
-                f.title ?? null,
-                f.location ?? null,
-                f.severity ?? null,
-                f.status,
-                f.reportPath ?? null,
-                f.scopeId ?? null,
-                f.reportMarkdown ?? null,
-                f.description ?? null,
-                f.evidence ?? null,
-                f.exploitSketch ?? null,
-                f.fix ?? null,
-                f.confidence ?? null,
-                ts,
-                orig.id,
-              );
-            if (orig.status !== f.status) this.recordStatusEvent(orig.id, orig.status, f.status, reason, runId, ts);
-            continue;
-          }
-          // stale origin id (the row was deleted) -> fall through and capture the verdict as its own row
-        }
-        const existing = this.db
-          .prepare("SELECT id, status FROM finding WHERE run_id = ? AND finding_key = ?")
-          .get(runId, f.findingKey) as { id: number; status: string } | undefined;
+        const canonicalKey = canonicalFindingKey(f.title, f.location, f.findingKey);
+        const origin = f.originId != null
+          ? this.db.prepare("SELECT * FROM finding WHERE id = ? AND project_id = ?").get(f.originId, projectId) as Record<string, unknown> | undefined
+          : undefined;
+        const alias = !origin
+          ? this.db.prepare("SELECT f.* FROM finding_key_alias a JOIN finding f ON f.id = a.finding_id WHERE a.project_id = ? AND a.alias_key = ?")
+            .get(projectId, f.findingKey.toLowerCase()) as Record<string, unknown> | undefined
+          : undefined;
+        const canonical = !origin && !alias
+          ? this.db.prepare("SELECT * FROM finding WHERE project_id = ? AND canonical_key = ? ORDER BY id LIMIT 1").get(projectId, canonicalKey) as Record<string, unknown> | undefined
+          : undefined;
+        const existing = origin ?? alias ?? canonical;
         if (!existing) {
           const info = this.db
             .prepare(
-              `INSERT INTO finding(project_id, run_id, finding_key, title, location, severity, status, report_path, report_markdown, scope_id, description, evidence, exploit_sketch, fix, confidence, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              `INSERT INTO finding(uuid, project_id, run_id, finding_key, canonical_key, occurrence_count,
+                 title, location, severity, status, report_path, report_markdown, scope_id, description,
+                 evidence, exploit_sketch, fix, confidence, refutation_status, refutation_reason, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             )
-            .run(projectId, runId, f.findingKey, f.title ?? null, f.location ?? null, f.severity ?? null, f.status, f.reportPath ?? null, f.reportMarkdown ?? null, f.scopeId ?? null, f.description ?? null, f.evidence ?? null, f.exploitSketch ?? null, f.fix ?? null, f.confidence ?? null, ts, ts);
-          this.recordStatusEvent(Number(info.lastInsertRowid), null, f.status, reason, runId, ts);
+            .run(randomUUID(), projectId, runId, f.findingKey, canonicalKey, f.title ?? null, f.location ?? null, f.severity ?? null, f.status, f.reportPath ?? null, f.reportMarkdown ?? null, f.scopeId ?? null, f.description ?? null, f.evidence ?? null, f.exploitSketch ?? null, f.fix ?? null, f.confidence ?? null, f.refutationStatus ?? null, f.refutationReason ?? null, ts, ts);
+          const findingId = Number(info.lastInsertRowid);
+          this.recordStatusEvent(findingId, null, f.status, reason, runId, ts);
+          this.recordFindingOccurrence(findingId, projectId, runId, f, reason, ts);
+          this.upsertFindingAlias(projectId, f.findingKey, findingId, ts);
         } else {
+          const findingId = Number(existing.id);
+          const previousStatus = String(existing.status);
+          const sameRun = Number(existing.run_id) === runId;
+          const authoritative = Boolean(origin) || sameRun;
+          const nextStatus = authoritative || findingStatusRank(f.status) >= findingStatusRank(previousStatus) ? f.status : previousStatus as FindingStatus;
           // COALESCE(NULLIF(?, ''), col): keep the stored content when a later re-persist (a status
           // flip through differential / refutation / appeal) carries an empty value, so detail is
           // never wiped — mirrors the dig_seconds keep-on-omit rule.
           this.db
             .prepare(
-              `UPDATE finding SET title = ?, location = ?, severity = ?, status = ?, report_path = ?, report_markdown = COALESCE(NULLIF(?, ''), report_markdown), scope_id = ?,
+              `UPDATE finding SET run_id = ?,
+                 title = CASE WHEN ? THEN COALESCE(NULLIF(?, ''), title) ELSE title END,
+                 location = CASE WHEN ? THEN COALESCE(NULLIF(?, ''), location) ELSE location END,
+                 severity = CASE WHEN ? THEN COALESCE(?, severity) ELSE severity END,
+                 status = ?, report_path = COALESCE(?, report_path), report_markdown = COALESCE(NULLIF(?, ''), report_markdown), scope_id = COALESCE(?, scope_id),
                  description = COALESCE(NULLIF(?, ''), description),
                  evidence = COALESCE(NULLIF(?, ''), evidence),
                  exploit_sketch = COALESCE(NULLIF(?, ''), exploit_sketch),
                  fix = COALESCE(NULLIF(?, ''), fix),
                  confidence = COALESCE(?, confidence),
+                 refutation_status = COALESCE(?, refutation_status),
+                 refutation_reason = COALESCE(NULLIF(?, ''), refutation_reason),
                  updated_at = ? WHERE id = ?`,
             )
-            .run(f.title ?? null, f.location ?? null, f.severity ?? null, f.status, f.reportPath ?? null, f.reportMarkdown ?? null, f.scopeId ?? null, f.description ?? null, f.evidence ?? null, f.exploitSketch ?? null, f.fix ?? null, f.confidence ?? null, ts, existing.id);
-          if (existing.status !== f.status) {
-            this.recordStatusEvent(existing.id, existing.status, f.status, reason, runId, ts);
+            .run(runId, authoritative ? 1 : 0, f.title ?? null, authoritative ? 1 : 0, f.location ?? null, authoritative || findingStatusRank(f.status) >= findingStatusRank(previousStatus) ? 1 : 0, f.severity ?? null, nextStatus, f.reportPath ?? null, f.reportMarkdown ?? null, f.scopeId ?? null, f.description ?? null, f.evidence ?? null, f.exploitSketch ?? null, f.fix ?? null, f.confidence ?? null, f.refutationStatus ?? null, f.refutationReason ?? null, ts, findingId);
+          if (previousStatus !== nextStatus) {
+            this.recordStatusEvent(findingId, previousStatus, nextStatus, reason, runId, ts);
           }
+          this.recordFindingOccurrence(findingId, projectId, runId, f, reason, ts);
+          this.upsertFindingAlias(projectId, f.findingKey, findingId, ts);
+        }
+        if (f.phaseAttempt) {
+          this.recordFindingPhaseAttempt(projectId, runId, { ...f.phaseAttempt, phase: "verify", state: "settled", outcome: f.status });
         }
       }
     });
+  }
+
+  private upsertFindingAlias(projectId: number, key: string, findingId: number, ts: string): void {
+    this.db.prepare(
+      `INSERT INTO finding_key_alias(project_id, alias_key, finding_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(project_id, alias_key) DO UPDATE SET finding_id = excluded.finding_id, updated_at = excluded.updated_at`,
+    ).run(projectId, key.toLowerCase(), findingId, ts, ts);
+  }
+
+  private recordFindingOccurrence(findingId: number, projectId: number, runId: number, finding: FindingRow, reason: string | undefined, ts: string): void {
+    this.db.prepare(
+      `INSERT INTO finding_occurrence(finding_id, project_id, run_id, finding_key, title, location, scope_id, status, reason, payload_json, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(run_id, finding_key) DO UPDATE SET
+         finding_id = excluded.finding_id, title = excluded.title, location = excluded.location,
+         scope_id = excluded.scope_id, status = excluded.status, reason = excluded.reason,
+         payload_json = excluded.payload_json, updated_at = excluded.updated_at`,
+    ).run(findingId, projectId, runId, finding.findingKey, finding.title ?? null, finding.location ?? null, finding.scopeId ?? null, finding.status, reason ?? null, jsonOrNull(finding), ts, ts);
+    this.db.prepare("UPDATE finding SET occurrence_count = (SELECT COUNT(*) FROM finding_occurrence WHERE finding_id = ?) WHERE id = ?").run(findingId, findingId);
   }
 
   private recordStatusEvent(findingId: number, from: string | null, to: string, reason: string | undefined, runId: number, ts: string): void {
@@ -1547,34 +1854,36 @@ export class MetadataStore {
   }
 
   getFinding(id: number): Record<string, unknown> | undefined {
-    return this.db.prepare("SELECT f.*, p.name AS project_name, p.uuid AS project_uuid FROM finding f JOIN project p ON p.id = f.project_id WHERE f.id = ?").get(id) as Record<string, unknown> | undefined;
+    return this.db.prepare(globalFindingSelect("WHERE f.id = ?") + " LIMIT 1").get(id) as Record<string, unknown> | undefined;
   }
 
   // --- global (cross-project) bug view -------------------------------------
 
-  /** Findings across ALL projects (joined with the project name), newest first, optionally
-   * filtered by project, status, and/or tracking state. The "Bugs" dashboard's table. */
-  listGlobalFindings(opts: { projectUuid?: string | undefined; status?: string | undefined; tracking?: string | undefined; limit?: number | undefined; offset?: number | undefined } = {}): Array<Record<string, unknown>> {
-    const cond: string[] = [], params: Array<string | number> = [];
-    if (opts.projectUuid) { cond.push("p.uuid = ?"); params.push(opts.projectUuid); }
-    if (opts.status) { cond.push("f.status = ?"); params.push(opts.status); }
-    if (opts.tracking) { cond.push("COALESCE(f.tracking_status, 'open') = ?"); params.push(opts.tracking); }
-    const where = cond.length ? "WHERE " + cond.join(" AND ") : "";
+  /** Findings across tracked projects, newest first. Evaluation findings are excluded by
+   * default so benchmark evidence cannot silently enter the product finding registry. */
+  listGlobalFindings(opts: { projectUuid?: string | undefined; status?: string | undefined; tracking?: string | undefined; source?: "project" | "evaluation" | "all" | undefined; limit?: number | undefined; offset?: number | undefined } = {}): Array<Record<string, unknown>> {
+    const { where, params } = globalFindingWhere(opts);
     const limit = Math.max(1, Math.floor(opts.limit ?? 200));
     const offset = Math.max(0, Math.floor(opts.offset ?? 0));
     return this.db
-      .prepare("SELECT f.*, p.name AS project_name, p.uuid AS project_uuid FROM finding f JOIN project p ON p.id = f.project_id " + where + " ORDER BY f.updated_at DESC LIMIT ? OFFSET ?")
+      .prepare(globalFindingSelect(where) + " ORDER BY f.updated_at DESC LIMIT ? OFFSET ?")
       .all(...params, limit, offset) as Array<Record<string, unknown>>;
+  }
+
+  countGlobalFindings(opts: { projectUuid?: string | undefined; status?: string | undefined; tracking?: string | undefined; source?: "project" | "evaluation" | "all" | undefined } = {}): number {
+    const { where, params } = globalFindingWhere(opts);
+    return Number((this.db.prepare(`SELECT COUNT(*) AS n FROM finding f JOIN project p ON p.id = f.project_id ${where}`).get(...params) as { n: number }).n);
   }
 
   /** Aggregate counts for the Bugs dashboard: total findings, a breakdown by status, and a
    * breakdown by tracking state (untracked findings count as 'open'). */
-  globalFindingStats(): { total: number; byStatus: Record<string, number>; byTracking: Record<string, number> } {
+  globalFindingStats(opts: { projectUuid?: string | undefined; source?: "project" | "evaluation" | "all" | undefined } = {}): { total: number; byStatus: Record<string, number>; byTracking: Record<string, number> } {
+    const { where, params } = globalFindingWhere(opts);
     const byStatus: Record<string, number> = {};
-    for (const r of this.db.prepare("SELECT status, COUNT(*) AS n FROM finding GROUP BY status").all() as Array<{ status: string; n: number }>) byStatus[r.status] = Number(r.n);
+    for (const r of this.db.prepare(`SELECT f.status AS status, COUNT(*) AS n FROM finding f JOIN project p ON p.id = f.project_id ${where} GROUP BY f.status`).all(...params) as Array<{ status: string; n: number }>) byStatus[r.status] = Number(r.n);
     const byTracking: Record<string, number> = {};
-    for (const r of this.db.prepare("SELECT COALESCE(tracking_status, 'open') AS t, COUNT(*) AS n FROM finding GROUP BY t").all() as Array<{ t: string; n: number }>) byTracking[r.t] = Number(r.n);
-    const total = Number((this.db.prepare("SELECT COUNT(*) AS n FROM finding").get() as { n: number }).n);
+    for (const r of this.db.prepare(`SELECT COALESCE(f.tracking_status, 'open') AS t, COUNT(*) AS n FROM finding f JOIN project p ON p.id = f.project_id ${where} GROUP BY t`).all(...params) as Array<{ t: string; n: number }>) byTracking[r.t] = Number(r.n);
+    const total = Number((this.db.prepare(`SELECT COUNT(*) AS n FROM finding f JOIN project p ON p.id = f.project_id ${where}`).get(...params) as { n: number }).n);
     return { total, byStatus, byTracking };
   }
 
@@ -1642,9 +1951,19 @@ export class MetadataStore {
   /** Set a finding's real-target confirm state, addressed by its content key within a project
    * (the same key the confirm work list carries). Does not touch updated_at. */
   setFindingConfirmStatus(projectId: number, findingKey: string, confirmStatus: string | null): boolean {
-    return this.db
-      .prepare("UPDATE finding SET confirm_status = ? WHERE project_id = ? AND finding_key = ?")
-      .run(confirmStatus, projectId, findingKey).changes > 0;
+    const finding = this.resolveFindingByKey(projectId, findingKey);
+    if (!finding) return false;
+    return this.db.prepare("UPDATE finding SET confirm_status = ? WHERE project_id = ? AND id = ?")
+      .run(confirmStatus, projectId, Number(finding.id)).changes > 0;
+  }
+
+  private resolveFindingByKey(projectId: number, findingKey: string): Record<string, unknown> | undefined {
+    return this.db.prepare(
+      `SELECT f.* FROM finding f
+       LEFT JOIN finding_key_alias a ON a.finding_id = f.id AND a.project_id = f.project_id
+       WHERE f.project_id = ? AND (LOWER(f.finding_key) = LOWER(?) OR LOWER(a.alias_key) = LOWER(?))
+       ORDER BY f.id LIMIT 1`,
+    ).get(projectId, findingKey, findingKey) as Record<string, unknown> | undefined;
   }
 
   /** Finding counts per status — one GROUP BY, for the dashboard + filter chips. */
@@ -1667,12 +1986,87 @@ export class MetadataStore {
     const limit = Math.max(1, Math.floor(opts.limit ?? 50));
     const offset = Math.max(0, Math.floor(opts.offset ?? 0));
     return this.db
-      .prepare("SELECT * FROM finding " + where.sql + " ORDER BY updated_at DESC LIMIT ? OFFSET ?")
+      .prepare("SELECT * FROM finding " + where.sql + " ORDER BY CASE LOWER(COALESCE(severity,'')) WHEN 'critical' THEN 5 WHEN 'high' THEN 4 WHEN 'medium' THEN 3 WHEN 'low' THEN 2 WHEN 'info' THEN 1 ELSE 0 END DESC, updated_at DESC LIMIT ? OFFSET ?")
       .all(...where.params, limit, offset) as Array<Record<string, unknown>>;
   }
 
   findingTimeline(findingId: number): Array<Record<string, unknown>> {
     return this.db.prepare("SELECT * FROM finding_status_event WHERE finding_id = ? ORDER BY ts ASC").all(findingId) as Array<Record<string, unknown>>;
+  }
+
+  findingOccurrences(findingId: number): Array<Record<string, unknown>> {
+    return this.db.prepare("SELECT * FROM finding_occurrence WHERE finding_id = ? ORDER BY created_at ASC, id ASC").all(findingId) as Array<Record<string, unknown>>;
+  }
+
+  recordFindingPhaseAttempt(projectId: number, runId: number, input: FindingPhaseAttemptInput): number {
+    const ts = now();
+    const existing = this.db.prepare(
+      "SELECT id, attempt_number FROM finding_phase_attempt WHERE subject_type = ? AND subject_id = ? AND phase = ? AND run_id = ?",
+    ).get(input.subjectType, input.subjectId, input.phase, runId) as { id: number; attempt_number: number } | undefined;
+    const terminal = input.state !== "running";
+    if (existing) {
+      this.db.prepare(
+        `UPDATE finding_phase_attempt SET input_fingerprint = ?, state = ?, outcome = ?, blocker = ?, metrics_json = ?,
+           updated_at = ?, started_at = COALESCE(started_at, ?), ended_at = ? WHERE id = ?`,
+      ).run(input.inputFingerprint, input.state, input.outcome ?? null, input.blocker ?? null, jsonOrNull(input.metrics), ts, ts, terminal ? ts : null, existing.id);
+      if (input.state === "running") this.clearFindingPhaseRetry(projectId, input.subjectType, input.subjectId, input.phase);
+      return existing.id;
+    }
+    const previous = this.db.prepare(
+      "SELECT COALESCE(MAX(attempt_number), 0) AS n FROM finding_phase_attempt WHERE project_id = ? AND subject_type = ? AND subject_id = ? AND phase = ?",
+    ).get(projectId, input.subjectType, input.subjectId, input.phase) as { n: number };
+    const info = this.db.prepare(
+      `INSERT INTO finding_phase_attempt(project_id, subject_type, subject_id, phase, input_fingerprint, attempt_number,
+         run_id, state, outcome, blocker, metrics_json, created_at, updated_at, started_at, ended_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(projectId, input.subjectType, input.subjectId, input.phase, input.inputFingerprint, Number(previous.n) + 1, runId, input.state, input.outcome ?? null, input.blocker ?? null, jsonOrNull(input.metrics), ts, ts, ts, terminal ? ts : null);
+    if (input.state === "running") this.clearFindingPhaseRetry(projectId, input.subjectType, input.subjectId, input.phase);
+    return Number(info.lastInsertRowid);
+  }
+
+  listFindingPhaseAttempts(subjectType: "finding" | "decision", subjectId: number): Array<Record<string, unknown>> {
+    return this.db.prepare(
+      "SELECT * FROM finding_phase_attempt WHERE subject_type = ? AND subject_id = ? ORDER BY phase, attempt_number",
+    ).all(subjectType, subjectId) as Array<Record<string, unknown>>;
+  }
+
+  latestFindingPhaseAttempt(subjectType: "finding" | "decision", subjectId: number, phase: FindingPhase): Record<string, unknown> | undefined {
+    return this.db.prepare(
+      "SELECT * FROM finding_phase_attempt WHERE subject_type = ? AND subject_id = ? AND phase = ? ORDER BY attempt_number DESC LIMIT 1",
+    ).get(subjectType, subjectId, phase) as Record<string, unknown> | undefined;
+  }
+
+  latestFindingPhaseAttempts(subjectType: "finding" | "decision", subjectIds: number[]): Array<Record<string, unknown>> {
+    const ids = [...new Set(subjectIds.filter(Number.isFinite))];
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => "?").join(",");
+    const sql = "SELECT a.* FROM finding_phase_attempt a JOIN (SELECT subject_id, phase, MAX(attempt_number) AS attempt_number FROM finding_phase_attempt WHERE subject_type = ? AND subject_id IN (" + placeholders + ") GROUP BY subject_id, phase) latest ON latest.subject_id = a.subject_id AND latest.phase = a.phase AND latest.attempt_number = a.attempt_number WHERE a.subject_type = ?";
+    return this.db.prepare(sql).all(subjectType, ...ids, subjectType) as Array<Record<string, unknown>>;
+  }
+
+  phaseEligible(projectId: number, subjectType: "finding" | "decision", subjectId: number, phase: FindingPhase, inputFingerprint: string): boolean {
+    const retry = this.db.prepare(
+      "SELECT 1 AS yes FROM phase_retry_request WHERE project_id = ? AND subject_type = ? AND subject_id = ? AND phase = ?",
+    ).get(projectId, subjectType, subjectId, phase);
+    if (retry) return true;
+    const latest = this.latestFindingPhaseAttempt(subjectType, subjectId, phase);
+    return !(latest?.state === "blocked" && latest.input_fingerprint === inputFingerprint);
+  }
+
+  requestFindingPhaseRetry(projectId: number, subjectType: "finding" | "decision", subjectId: number, phase: FindingPhase): boolean {
+    const subject = subjectType === "finding" ? this.getFinding(subjectId) : this.getConfirmDecision(subjectId);
+    if (!subject || Number(subject.project_id) !== projectId) return false;
+    this.db.prepare(
+      `INSERT INTO phase_retry_request(project_id, subject_type, subject_id, phase, requested_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(project_id, subject_type, subject_id, phase) DO UPDATE SET requested_at = excluded.requested_at`,
+    ).run(projectId, subjectType, subjectId, phase, now());
+    return true;
+  }
+
+  private clearFindingPhaseRetry(projectId: number, subjectType: "finding" | "decision", subjectId: number, phase: FindingPhase): void {
+    this.db.prepare("DELETE FROM phase_retry_request WHERE project_id = ? AND subject_type = ? AND subject_id = ? AND phase = ?")
+      .run(projectId, subjectType, subjectId, phase);
   }
 
   // --- confirm decisions ----------------------------------------------------
@@ -1697,13 +2091,24 @@ export class MetadataStore {
       // back to findings: reflect each decision's real-target outcome into its findings'
       // confirm_status (reproduced -> reproduced, settled-but-not -> not-reproduced). This is what
       // makes confirm finding-grained + resumable (a later confirm skips non-NULL confirm_status).
-      const setConfirm = this.db.prepare("UPDATE finding SET confirm_status = ? WHERE project_id = ? AND finding_key = ?");
-      const findingsByKey = new Map<string, { severity?: string }>();
-      for (const row of this.db.prepare("SELECT finding_key, severity FROM finding WHERE project_id = ?").all(projectId) as Array<{ finding_key: string | null; severity: string | null }>) {
+      const setConfirm = this.db.prepare("UPDATE finding SET confirm_status = ? WHERE project_id = ? AND id = ?");
+      type ConfirmFindingMetadata = { id: number; severity?: string; updatedAt?: string; canonicalKey?: string; status?: string; confirmStatus?: string | null; runId?: number };
+      const findingsByKey = new Map<string, ConfirmFindingMetadata>();
+      for (const row of this.db.prepare("SELECT id, run_id, finding_key, canonical_key, severity, status, confirm_status, updated_at FROM finding WHERE project_id = ?").all(projectId) as Array<{ id: number; run_id: number | null; finding_key: string | null; canonical_key: string | null; severity: string | null; status: string | null; confirm_status: string | null; updated_at: string | null }>) {
         if (!row.finding_key) continue;
-        const metadata: { severity?: string } = {};
+        const metadata: ConfirmFindingMetadata = { id: row.id, confirmStatus: row.confirm_status };
         if (row.severity) metadata.severity = row.severity;
+        if (row.updated_at) metadata.updatedAt = row.updated_at;
+        if (row.canonical_key) metadata.canonicalKey = row.canonical_key;
+        if (row.status) metadata.status = row.status;
+        if (row.run_id != null) metadata.runId = row.run_id;
         findingsByKey.set(row.finding_key.toLowerCase(), metadata);
+      }
+      const byId = new Map<number, ConfirmFindingMetadata>();
+      for (const metadata of findingsByKey.values()) byId.set(metadata.id, metadata);
+      for (const alias of this.db.prepare("SELECT alias_key, finding_id FROM finding_key_alias WHERE project_id = ?").all(projectId) as Array<{ alias_key: string; finding_id: number }>) {
+        const canonical = byId.get(alias.finding_id);
+        if (canonical) findingsByKey.set(alias.alias_key.toLowerCase(), canonical);
       }
       for (const r of readyRows) {
         const linked = linkedFindingMetadata(findingsByKey, r.members ?? []);
@@ -1733,10 +2138,36 @@ export class MetadataStore {
           ts,
         );
         const outcome = decisionConfirmOutcome(r, evidenceLevel);
+        const linkedIds = new Set<number>();
         for (const member of r.members ?? []) {
           for (const key of confirmMemberKeys(member)) {
-            if (outcome) setConfirm.run(outcome, projectId, key);
+            const finding = findingsByKey.get(key.toLowerCase());
+            if (!finding) continue;
+            linkedIds.add(finding.id);
+            if (outcome) setConfirm.run(outcome, projectId, finding.id);
           }
+        }
+        const blocked = r.reproduced === "could-not-set-up" || r.reproduced === "unknown" || needsSubmissionReadinessWork(r);
+        for (const findingId of linkedIds) {
+          const metadata = byId.get(findingId);
+          const sourceRun = metadata?.runId !== undefined ? this.getRun(metadata.runId) : undefined;
+          this.recordFindingPhaseAttempt(projectId, runId, {
+            subjectType: "finding",
+            subjectId: findingId,
+            phase: "confirm",
+            inputFingerprint: phaseInputFingerprint({
+              phase: "confirm",
+              material: sourceRun?.material_fingerprint ?? null,
+              findingId,
+              canonicalKey: metadata?.canonicalKey ?? null,
+              status: metadata?.status ?? null,
+              updatedAt: metadata?.updatedAt ?? null,
+            }),
+            state: blocked ? "blocked" : "settled",
+            outcome: r.reproduced ?? "unknown",
+            blocker: blocked ? (r.humanGates || `confirmation ended as ${r.reproduced ?? "unknown"}`) : undefined,
+            metrics: { evidenceLevel, recommendation: r.recommendation },
+          });
         }
       }
     });
@@ -1757,10 +2188,15 @@ export class MetadataStore {
   }
 
   listConfirmDecisionsForFinding(projectId: number, findingKey: string): Array<Record<string, unknown>> {
-    const key = findingKey.toLowerCase();
+    const finding = this.resolveFindingByKey(projectId, findingKey);
+    const keys = new Set<string>([findingKey.toLowerCase()]);
+    if (finding) {
+      keys.add(String(finding.finding_key).toLowerCase());
+      for (const alias of this.db.prepare("SELECT alias_key FROM finding_key_alias WHERE finding_id = ?").all(Number(finding.id)) as Array<{ alias_key: string }>) keys.add(alias.alias_key.toLowerCase());
+    }
     return this.listConfirmDecisions(projectId).filter((row) => {
       const members = parseJsonArray(row.members_json);
-      return members.some((member) => confirmMemberKeys(String(member)).some((candidate) => candidate.toLowerCase() === key));
+      return members.some((member) => confirmMemberKeys(String(member)).some((candidate) => keys.has(candidate.toLowerCase())));
     });
   }
 
@@ -1773,6 +2209,259 @@ export class MetadataStore {
           AND reproduced = 'yes'
           AND evidence_level IN ('real-target-reproduced', 'fork-reproduced', 'local-fork-reproduced')`,
     ).get(projectId) as { n: number }).n);
+  }
+
+  // --- run groups + independently resumable work items ---------------------
+
+  createRunGroup(input: RunGroupInput): Record<string, unknown> {
+    const ts = now();
+    const uuid = randomUUID();
+    const parallelism = Math.max(1, Math.floor(input.parallelism ?? 1));
+    const info = this.db
+      .prepare(
+        `INSERT INTO run_group(uuid, name, kind, state, parallelism, config_json, budget_json, created_at, updated_at)
+         VALUES (?, ?, ?, 'draft', ?, ?, ?, ?, ?)`,
+      )
+      .run(uuid, input.name, input.kind ?? "evaluation", parallelism, jsonOrNull(input.config), jsonOrNull(input.budget), ts, ts);
+    return this.getRunGroupById(Number(info.lastInsertRowid))!;
+  }
+
+  getRunGroupById(id: number): Record<string, unknown> | undefined {
+    return this.db.prepare("SELECT * FROM run_group WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+  }
+
+  getRunGroupByUuid(uuid: string): Record<string, unknown> | undefined {
+    return this.db.prepare("SELECT * FROM run_group WHERE uuid = ?").get(uuid) as Record<string, unknown> | undefined;
+  }
+
+  getRunGroupByName(name: string): Record<string, unknown> | undefined {
+    return this.db.prepare("SELECT * FROM run_group WHERE name = ?").get(name) as Record<string, unknown> | undefined;
+  }
+
+  listRunGroups(limit = 100, offset = 0): Array<Record<string, unknown>> {
+    return this.db
+      .prepare("SELECT * FROM run_group ORDER BY created_at DESC LIMIT ? OFFSET ?")
+      .all(Math.max(1, Math.floor(limit)), Math.max(0, Math.floor(offset))) as Array<Record<string, unknown>>;
+  }
+
+  countRunGroups(): number {
+    return Number((this.db.prepare("SELECT COUNT(*) AS n FROM run_group").get() as { n: number }).n);
+  }
+
+  addWorkItems(runGroupId: number, items: EvaluationWorkItemInput[]): Array<Record<string, unknown>> {
+    const insert = this.db.prepare(
+      `INSERT INTO work_item(uuid, run_group_id, item_key, kind, state, target_bundle_json, material_policy_json,
+                             evidence_contract_json, project_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)`,
+    );
+    const ts = now();
+    this.transaction(() => {
+      for (const item of items) {
+        insert.run(
+          randomUUID(),
+          runGroupId,
+          item.itemKey,
+          item.kind,
+          JSON.stringify(item.targetBundle),
+          JSON.stringify(item.materialPolicy),
+          JSON.stringify(item.evidenceContract),
+          item.projectId ?? null,
+          ts,
+          ts,
+        );
+      }
+      this.db.prepare("UPDATE run_group SET updated_at = ? WHERE id = ?").run(ts, runGroupId);
+    });
+    return this.listWorkItems(runGroupId);
+  }
+
+  listWorkItems(runGroupId: number): Array<Record<string, unknown>> {
+    return this.db.prepare("SELECT * FROM work_item WHERE run_group_id = ? ORDER BY id").all(runGroupId) as Array<Record<string, unknown>>;
+  }
+
+  getWorkItem(id: number): Record<string, unknown> | undefined {
+    return this.db.prepare("SELECT * FROM work_item WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+  }
+
+  getWorkItemByJob(jobId: number): Record<string, unknown> | undefined {
+    return this.db.prepare("SELECT * FROM work_item WHERE job_id = ?").get(jobId) as Record<string, unknown> | undefined;
+  }
+
+  listWorkItemAttempts(workItemId: number): Array<Record<string, unknown>> {
+    return this.db
+      .prepare("SELECT * FROM work_item_attempt WHERE work_item_id = ? ORDER BY attempt_number")
+      .all(workItemId) as Array<Record<string, unknown>>;
+  }
+
+  runGroupForJob(jobId: number): Record<string, unknown> | undefined {
+    return this.db
+      .prepare("SELECT rg.* FROM run_group rg JOIN work_item wi ON wi.run_group_id = rg.id WHERE wi.job_id = ?")
+      .get(jobId) as Record<string, unknown> | undefined;
+  }
+
+  startRunGroup(uuid: string, parallelism?: number): boolean {
+    const group = this.getRunGroupByUuid(uuid);
+    if (!group || group.state === "finished" || group.state === "cancelled" || group.state === "failed") return false;
+    const nextParallelism = Math.max(1, Math.floor(parallelism ?? (Number(group.parallelism) || 1)));
+    const ts = now();
+    return Number(this.db
+      .prepare("UPDATE run_group SET state = 'running', parallelism = ?, started_at = COALESCE(started_at, ?), ended_at = NULL, updated_at = ? WHERE id = ?")
+      .run(nextParallelism, ts, ts, Number(group.id)).changes) > 0;
+  }
+
+  setRunGroupState(uuid: string, state: RunGroupState): boolean {
+    const terminal = state === "finished" || state === "failed" || state === "cancelled";
+    const ts = now();
+    return Number(this.db
+      .prepare("UPDATE run_group SET state = ?, ended_at = CASE WHEN ? THEN COALESCE(ended_at, ?) ELSE NULL END, updated_at = ? WHERE uuid = ?")
+      .run(state, terminal ? 1 : 0, ts, ts, uuid).changes) > 0;
+  }
+
+  pendingRunGroupDispatch(runGroupId: number, limit: number): Array<Record<string, unknown>> {
+    const group = this.getRunGroupById(runGroupId);
+    if (!group || group.state !== "running") return [];
+    const active = Number((this.db
+      .prepare("SELECT COUNT(*) AS n FROM work_item WHERE run_group_id = ? AND job_id IS NOT NULL AND state IN ('queued','claimed','running')")
+      .get(runGroupId) as { n: number }).n);
+    const available = Math.max(0, Math.min(Math.max(1, Math.floor(limit)), Number(group.parallelism) - active));
+    if (available === 0) return [];
+    return this.db
+      .prepare("SELECT * FROM work_item WHERE run_group_id = ? AND state = 'queued' AND job_id IS NULL ORDER BY id LIMIT ?")
+      .all(runGroupId, available) as Array<Record<string, unknown>>;
+  }
+
+  attachWorkItemJob(workItemId: number, jobId: number): boolean {
+    const ts = now();
+    let attached = false;
+    this.transaction(() => {
+      const info = this.db
+        .prepare("UPDATE work_item SET job_id = ?, attempts = attempts + 1, updated_at = ? WHERE id = ? AND state = 'queued' AND job_id IS NULL")
+        .run(jobId, ts, workItemId);
+      if (Number(info.changes) === 0) return;
+      const item = this.getWorkItem(workItemId)!;
+      this.db
+        .prepare(
+          `INSERT INTO work_item_attempt(work_item_id, attempt_number, job_id, state, created_at, updated_at)
+           VALUES (?, ?, ?, 'queued', ?, ?)`,
+        )
+        .run(workItemId, Number(item.attempts), jobId, ts, ts);
+      attached = true;
+    });
+    return attached;
+  }
+
+  markWorkItemClaimed(jobId: number): void {
+    const ts = now();
+    // claimJob already holds an IMMEDIATE transaction; keep these statements in
+    // that transaction instead of trying to nest another SQLite transaction.
+    this.db.prepare("UPDATE work_item SET state = 'claimed', updated_at = ? WHERE job_id = ? AND state = 'queued'").run(ts, jobId);
+    this.db.prepare("UPDATE work_item_attempt SET state = 'claimed', updated_at = ? WHERE job_id = ? AND state = 'queued'").run(ts, jobId);
+  }
+
+  markWorkItemRunning(jobId: number, runId: number): void {
+    const ts = now();
+    this.transaction(() => {
+      this.db
+        .prepare("UPDATE work_item SET state = 'running', run_id = ?, project_id = (SELECT project_id FROM run WHERE id = ?), started_at = COALESCE(started_at, ?), updated_at = ? WHERE job_id = ? AND state IN ('queued','claimed')")
+        .run(runId, runId, ts, ts, jobId);
+      this.db
+        .prepare("UPDATE work_item_attempt SET state = 'running', run_id = ?, started_at = COALESCE(started_at, ?), updated_at = ? WHERE job_id = ? AND state IN ('queued','claimed')")
+        .run(runId, ts, ts, jobId);
+    });
+  }
+
+  settleWorkItemByJob(
+    jobId: number,
+    state: Extract<WorkItemState, "finished" | "failed" | "cancelled">,
+    outcome: WorkItemOutcome,
+    result: unknown,
+    error?: string,
+  ): boolean {
+    const ts = now();
+    let settled = false;
+    this.transaction(() => {
+      const info = this.db
+        .prepare(
+          `UPDATE work_item SET state = ?, outcome = ?, result_json = ?, last_error = ?, ended_at = ?, updated_at = ?
+            WHERE job_id = ? AND state IN ('queued','claimed','running')`,
+        )
+        .run(state, outcome, jsonOrNull(result), error ?? null, ts, ts, jobId);
+      if (Number(info.changes) === 0) return;
+      this.db
+        .prepare(
+          `UPDATE work_item_attempt SET state = ?, outcome = ?, result_json = ?, error = ?, ended_at = ?, updated_at = ?
+            WHERE job_id = ? AND state IN ('queued','claimed','running')`,
+        )
+        .run(state, outcome, jsonOrNull(result), error ?? null, ts, ts, jobId);
+      settled = true;
+    });
+    return settled;
+  }
+
+  failUnscheduledWorkItem(workItemId: number, outcome: Extract<WorkItemOutcome, "invalid" | "blocked">, error: string): boolean {
+    const ts = now();
+    return Number(this.db
+      .prepare("UPDATE work_item SET state = 'failed', outcome = ?, result_json = ?, last_error = ?, ended_at = ?, updated_at = ? WHERE id = ? AND state = 'queued' AND job_id IS NULL")
+      .run(outcome, JSON.stringify({ accepted: false, reason: outcome, error }), error, ts, ts, workItemId).changes) > 0;
+  }
+
+  cancelRunGroupItems(runGroupId: number): number[] {
+    const activeJobs = (this.db
+      .prepare("SELECT job_id FROM work_item WHERE run_group_id = ? AND job_id IS NOT NULL AND state IN ('queued','claimed','running')")
+      .all(runGroupId) as Array<{ job_id: number }>).map((row) => Number(row.job_id));
+    const ts = now();
+    this.transaction(() => {
+      this.db
+        .prepare("UPDATE work_item_attempt SET state = 'cancelled', outcome = COALESCE(outcome, 'blocked'), error = COALESCE(error, 'run group cancelled'), ended_at = COALESCE(ended_at, ?), updated_at = ? WHERE job_id IN (SELECT job_id FROM work_item WHERE run_group_id = ? AND job_id IS NOT NULL AND state IN ('queued','claimed','running'))")
+        .run(ts, ts, runGroupId);
+      this.db
+        .prepare("UPDATE work_item SET state = 'cancelled', outcome = COALESCE(outcome, 'blocked'), last_error = COALESCE(last_error, 'run group cancelled'), ended_at = COALESCE(ended_at, ?), updated_at = ? WHERE run_group_id = ? AND state IN ('queued','claimed','running')")
+        .run(ts, ts, runGroupId);
+    });
+    return activeJobs;
+  }
+
+  retryBlockedWorkItem(workItemId: number): boolean {
+    const item = this.getWorkItem(workItemId);
+    if (!item || (item.state !== "failed" && item.state !== "cancelled") || item.outcome !== "blocked") return false;
+    const group = this.getRunGroupById(Number(item.run_group_id));
+    if (!group || group.state === "cancelled") return false;
+    const ts = now();
+    let retried = false;
+    this.transaction(() => {
+      const info = this.db
+        .prepare(
+          `UPDATE work_item
+              SET state = 'queued', outcome = NULL, result_json = NULL, job_id = NULL, run_id = NULL,
+                  last_error = NULL, started_at = NULL, ended_at = NULL, updated_at = ?
+            WHERE id = ? AND state IN ('failed','cancelled') AND outcome = 'blocked'`,
+        )
+        .run(ts, workItemId);
+      if (Number(info.changes) === 0) return;
+      if (group.state === "finished" || group.state === "failed") {
+        this.db.prepare("UPDATE run_group SET state = 'paused', ended_at = NULL, updated_at = ? WHERE id = ?").run(ts, Number(group.id));
+      } else {
+        this.db.prepare("UPDATE run_group SET updated_at = ? WHERE id = ?").run(ts, Number(group.id));
+      }
+      retried = true;
+    });
+    return retried;
+  }
+
+  refreshRunGroupCompletion(runGroupId: number): Record<string, unknown> | undefined {
+    const group = this.getRunGroupById(runGroupId);
+    if (!group) return undefined;
+    const rows = this.listWorkItems(runGroupId);
+    const counts: Record<string, number> = {};
+    for (const row of rows) counts[String(row.outcome ?? row.state)] = (counts[String(row.outcome ?? row.state)] ?? 0) + 1;
+    const summary = { totalItems: rows.length, counts };
+    const active = rows.some((row) => row.state === "queued" || row.state === "claimed" || row.state === "running");
+    const ts = now();
+    const state = group.state === "running" && !active ? "finished" : String(group.state);
+    this.db
+      .prepare("UPDATE run_group SET state = ?, summary_json = ?, ended_at = CASE WHEN ? = 'finished' THEN COALESCE(ended_at, ?) ELSE ended_at END, updated_at = ? WHERE id = ?")
+      .run(state, JSON.stringify(summary), state, ts, ts, runGroupId);
+    return this.getRunGroupById(runGroupId);
   }
 
   // --- daemons + job queue (control plane for remote execution) -------------
@@ -1848,15 +2537,26 @@ export class MetadataStore {
     return Number(info.lastInsertRowid);
   }
 
-  /** Atomically claim the oldest queued job for a daemon (dispatched). Returns it (spec parsed) or undefined. */
+  /** Atomically claim queued work for a daemon. Operator-launched project work takes priority
+   * over background evaluation work; FIFO is preserved inside each class. Running work is never
+   * preempted, so a claimed evaluation keeps its isolated workspace until it settles. */
   claimJob(daemonId: number): { id: number; project: string; spec: unknown } | undefined {
     let claimed: { id: number; project: string; spec_json: string } | undefined;
     this.transaction(() => {
-      const row = this.db.prepare("SELECT id, project, spec_json FROM job WHERE status = 'queued' AND (daemon_id IS NULL OR daemon_id = ?) ORDER BY created_at LIMIT 1").get(daemonId) as
+      const row = this.db.prepare(
+        `SELECT j.id, j.project, j.spec_json
+           FROM job j
+          WHERE j.status = 'queued' AND (j.daemon_id IS NULL OR j.daemon_id = ?)
+          ORDER BY CASE WHEN EXISTS (SELECT 1 FROM work_item wi WHERE wi.job_id = j.id) THEN 1 ELSE 0 END,
+                   j.created_at,
+                   j.id
+          LIMIT 1`,
+      ).get(daemonId) as
         | { id: number; project: string; spec_json: string }
         | undefined;
       if (!row) return;
       this.db.prepare("UPDATE job SET status = 'dispatched', daemon_id = ?, updated_at = ? WHERE id = ?").run(daemonId, now(), row.id);
+      this.markWorkItemClaimed(row.id);
       claimed = row;
     });
     return claimed ? { id: claimed.id, project: claimed.project, spec: jsonParseOrNull(claimed.spec_json) } : undefined;
@@ -1864,6 +2564,7 @@ export class MetadataStore {
 
   setJobRun(jobId: number, runId: number): void {
     this.db.prepare("UPDATE job SET run_id = ?, status = 'running', updated_at = ? WHERE id = ?").run(runId, now(), jobId);
+    this.markWorkItemRunning(jobId, runId);
   }
 
   setJobStatus(jobId: number, status: string, error?: string): void {
@@ -2012,6 +2713,10 @@ function jsonOrNull(value: unknown): string | null {
   return JSON.stringify(value);
 }
 
+function sqlText(value: unknown): string | null {
+  return value === undefined || value === null ? null : String(value);
+}
+
 function jsonParseOrNull(value: string): unknown {
   try {
     return JSON.parse(value);
@@ -2105,9 +2810,59 @@ function toProviderProfile(row: Record<string, unknown>): ProviderProfile {
   };
 }
 
+const FINDING_SOURCE_SQL = `CASE
+  WHEN p.origin = 'evaluation'
+    OR EXISTS (SELECT 1 FROM work_item wi_source WHERE wi_source.run_id = f.run_id)
+    OR EXISTS (SELECT 1 FROM work_item_attempt wia_source WHERE wia_source.run_id = f.run_id)
+  THEN 'evaluation'
+  ELSE 'project'
+END`;
+
+function globalFindingWhere(opts: { projectUuid?: string | undefined; status?: string | undefined; tracking?: string | undefined; source?: "project" | "evaluation" | "all" | undefined }): { where: string; params: Array<string | number> } {
+  const cond: string[] = ["f.status <> 'discharged'", "(LOWER(COALESCE(f.severity, '')) <> 'info' OR f.status IN ('confirmed-source','confirmed-executable','confirmed-differential'))"];
+  const params: Array<string | number> = [];
+  if (opts.projectUuid) { cond.push("p.uuid = ?"); params.push(opts.projectUuid); }
+  if (opts.status === "execution-confirmed") cond.push("f.status IN ('confirmed-executable','confirmed-differential')");
+  else if (opts.status) { cond.push("f.status = ?"); params.push(opts.status); }
+  if (opts.tracking === "active") cond.push("COALESCE(f.tracking_status, 'open') <> 'ignored'");
+  else if (opts.tracking) { cond.push("COALESCE(f.tracking_status, 'open') = ?"); params.push(opts.tracking); }
+  const source = opts.source ?? "project";
+  if (source !== "all") { cond.push(`${FINDING_SOURCE_SQL} = ?`); params.push(source); }
+  return { where: cond.length ? "WHERE " + cond.join(" AND ") : "", params };
+}
+
+function evaluationGroupFieldSql(field: "name" | "uuid"): string {
+  return `(SELECT rg_source.${field}
+    FROM work_item wi_group
+    JOIN run_group rg_source ON rg_source.id = wi_group.run_group_id
+   WHERE wi_group.project_id = p.id
+      OR wi_group.run_id = f.run_id
+      OR EXISTS (
+        SELECT 1 FROM work_item_attempt wia_group
+         WHERE wia_group.work_item_id = wi_group.id AND wia_group.run_id = f.run_id
+      )
+   ORDER BY wi_group.id DESC
+   LIMIT 1)`;
+}
+
+function globalFindingSelect(where: string): string {
+  return `SELECT f.*, p.name AS project_name, p.uuid AS project_uuid,
+      ${FINDING_SOURCE_SQL} AS source,
+      ${evaluationGroupFieldSql("name")} AS evaluation_name,
+      ${evaluationGroupFieldSql("uuid")} AS evaluation_uuid
+    FROM finding f
+    JOIN project p ON p.id = f.project_id
+    ${where}`;
+}
+
 function projectListWhere(options: ProjectListOptions): { where: string; args: string[] } {
   const clauses: string[] = [];
   const args: string[] = [];
+  const origin = options.origin ?? "project";
+  if (origin !== "all") {
+    clauses.push("origin = ?");
+    args.push(origin);
+  }
   if (options.archived !== "all") clauses.push(options.archived === true ? "archived_at IS NOT NULL" : "archived_at IS NULL");
   const search = typeof options.search === "string" ? options.search.trim().toLowerCase() : "";
   if (search) {
@@ -2121,14 +2876,32 @@ function projectListWhere(options: ProjectListOptions): { where: string; args: s
 function findingWhere(projectId: number, filter: FindingFilter): { sql: string; params: Array<string | number> } {
   const clauses = ["project_id = ?"];
   const params: Array<string | number> = [projectId];
-  if (filter.status) {
+  if (filter.status === "execution-confirmed") {
+    clauses.push("status IN ('confirmed-executable','confirmed-differential')");
+  } else if (filter.status) {
     clauses.push("status = ?");
     params.push(filter.status);
   }
   if (filter.search) {
-    clauses.push("(title LIKE ? OR location LIKE ?)");
-    const like = `%${filter.search}%`;
-    params.push(like, like);
+    const id = filter.search.trim().match(/^#?(\d+)$/)?.[1];
+    if (id) {
+      clauses.push("id = ?");
+      params.push(Number(id));
+    } else {
+      clauses.push("(title LIKE ? OR location LIKE ?)");
+      const like = `%${filter.search}%`;
+      params.push(like, like);
+    }
   }
+  if (filter.tracking === "active") clauses.push("COALESCE(tracking_status, 'open') <> 'ignored'");
+  else if (filter.tracking) { clauses.push("COALESCE(tracking_status, 'open') = ?"); params.push(filter.tracking); }
+  if (filter.runIds) {
+    if (filter.runIds.length === 0) clauses.push("1 = 0");
+    else {
+      clauses.push(`run_id IN (${filter.runIds.map(() => "?").join(",")})`);
+      params.push(...filter.runIds);
+    }
+  }
+  if (filter.reportable) clauses.push("status <> 'discharged' AND (LOWER(COALESCE(severity, '')) <> 'info' OR status IN ('confirmed-source','confirmed-executable','confirmed-differential'))");
   return { sql: "WHERE " + clauses.join(" AND "), params };
 }

@@ -21,6 +21,7 @@ export interface ProjectSnapshot {
   id?: number;
   uuid: string;
   name: string;
+  origin?: "project" | "evaluation" | string;
   provider_id?: number | null;
   daemon_id?: number | null;
   dir?: string | null;
@@ -55,6 +56,7 @@ export interface ProjectRow {
   id: number;
   uuid: string;
   name: string;
+  origin?: "project" | "evaluation" | string;
   source_paths?: string | null;
   build_root?: string | null;
   corpus_paths?: string | null;
@@ -161,11 +163,17 @@ export interface DiscoveryBacklogRow {
 
 export interface FindingRow {
   id: number;
+  uuid?: string;
   project_name?: string;
   project_uuid?: string;
+  source?: "project" | "evaluation" | string;
+  evaluation_name?: string | null;
+  evaluation_uuid?: string | null;
   project_id?: number;
   run_id?: number | null;
   finding_key?: string;
+  canonical_key?: string;
+  occurrence_count?: number;
   title?: string | null;
   location?: string | null;
   severity?: string | null;
@@ -182,9 +190,53 @@ export interface FindingRow {
   exploit_sketch?: string | null;
   fix?: string | null;
   confidence?: number | null;
+  refutation_status?: "pending" | "running" | "passed" | "refuted" | "blocked" | null;
+  refutation_reason?: string | null;
+  phase_attempts?: FindingPhaseAttempt[];
   created_at?: string | null;
   updated_at?: string | null;
   timeline?: FindingStatusEvent[];
+}
+
+export type FindingPhase = "verify" | "confirm" | "report";
+
+export interface FindingPhaseAttempt {
+  id: number;
+  subject_type: "finding" | "decision";
+  subject_id: number;
+  phase: FindingPhase;
+  input_fingerprint: string;
+  attempt_number: number;
+  run_id?: number | null;
+  state: "running" | "settled" | "blocked" | "error";
+  outcome?: string | null;
+  blocker?: string | null;
+  metrics_json?: string | null;
+  started_at?: string | null;
+  ended_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface FindingOccurrence {
+  id: number;
+  finding_id: number;
+  run_id?: number | null;
+  finding_key: string;
+  title?: string | null;
+  location?: string | null;
+  scope_id?: string | null;
+  status: string;
+  reason?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface FindingLifecycle {
+  finding: FindingRow;
+  timeline: FindingStatusEvent[];
+  occurrences: FindingOccurrence[];
+  attempts: FindingPhaseAttempt[];
+  decisions: Array<ConfirmDecision & { attempts?: FindingPhaseAttempt[] }>;
 }
 
 export interface FindingStatusEvent {
@@ -360,6 +412,154 @@ export interface DaemonRow {
   last_seen_at?: string | null;
 }
 
+export type RunGroupState = "draft" | "queued" | "running" | "paused" | "finished" | "failed" | "cancelled" | string;
+export type WorkItemState = "queued" | "claimed" | "running" | "finished" | "failed" | "cancelled" | string;
+export type WorkItemOutcome = "reproduced" | "confirmed" | "not_reproduced" | "refuted" | "blocked" | "invalid" | "no_findings" | "findings_reported" | string;
+export type ExpectedOutcome = "detect-positive" | "reject-positive";
+
+export interface CapabilitySurfacePayload {
+  entrypoints: string[];
+  inputs: string[];
+  effects: string[];
+  authorities: string[];
+  boundaries: string[];
+  localFixtures: string[];
+}
+
+export interface TargetBundlePayload {
+  target: string;
+  targetClass: "memory-safety" | "logic" | "crypto-zk" | "capability-surface" | "general";
+  sourcePaths: string[];
+  corpusPaths: string[];
+  buildRoot?: string;
+  scopeNote?: string;
+  provider?: string;
+  model?: string;
+  thinking?: string;
+  daemonId?: number;
+  maxScopes?: number;
+  digSamples?: number;
+  digConcurrency?: number;
+  verifyConcurrency?: number;
+  capabilitySurface?: CapabilitySurfacePayload;
+  claim?: unknown;
+}
+
+export interface MaterialEntryPayload {
+  path: string;
+  provenance: string;
+  operatorLabel: string;
+  policyDecision: "included" | "excluded" | "warning";
+  reason: string;
+}
+
+export interface MaterialPolicyPayload {
+  posture: "blind" | "informed" | "private" | "open-world";
+  materials: MaterialEntryPayload[];
+}
+
+export interface EvidenceContractPayload {
+  kind: "confirmation-command" | "benchmark-oracle" | "replay-package" | "manual-review";
+  command?: string;
+  successPatterns?: string[];
+  failurePatterns?: string[];
+  requiresDifferential: boolean;
+  requiresRefutation: boolean;
+  networkPolicy: "sealed" | "local-only" | "open-world-read";
+  expectedOutcome?: ExpectedOutcome;
+}
+
+export interface WorkItemPayload {
+  itemKey: string;
+  kind: "audit-target" | "verify-claim" | "benchmark-case" | "regression-replay" | "custom";
+  targetBundle: TargetBundlePayload;
+  materialPolicy: MaterialPolicyPayload;
+  evidenceContract: EvidenceContractPayload;
+  projectId?: number;
+}
+
+export interface WorkItemAttemptRow {
+  id: number;
+  work_item_id: number;
+  attempt_number: number;
+  job_id: number;
+  run_id?: number | null;
+  state: WorkItemState;
+  outcome?: WorkItemOutcome | null;
+  result_json?: string | null;
+  result?: Record<string, unknown> | null;
+  error?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  started_at?: string | null;
+  ended_at?: string | null;
+}
+
+export interface WorkItemRow {
+  id: number;
+  uuid: string;
+  run_group_id: number;
+  item_key: string;
+  kind: WorkItemPayload["kind"];
+  state: WorkItemState;
+  outcome?: WorkItemOutcome | null;
+  project_id?: number | null;
+  run_id?: number | null;
+  job_id?: number | null;
+  attempts: number;
+  last_error?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  started_at?: string | null;
+  ended_at?: string | null;
+  targetBundle: TargetBundlePayload;
+  materialPolicy: MaterialPolicyPayload;
+  evidenceContract: EvidenceContractPayload;
+  result?: Record<string, unknown> | null;
+  attemptHistory: WorkItemAttemptRow[];
+}
+
+export interface RunGroupRow {
+  id: number;
+  uuid: string;
+  name: string;
+  kind: string;
+  state: RunGroupState;
+  parallelism: number;
+  config?: Record<string, unknown> | null;
+  budget?: Record<string, unknown> | null;
+  summary?: Record<string, unknown> | null;
+  items: WorkItemRow[];
+  created_at?: string | null;
+  updated_at?: string | null;
+  started_at?: string | null;
+  ended_at?: string | null;
+  scheduled?: number;
+}
+
+export interface RunGroupListResponse {
+  runGroups: RunGroupRow[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface RunGroupReportResponse {
+  group: Record<string, unknown>;
+  summary: Record<string, unknown>;
+  markdown: string;
+}
+
+export interface RunGroupCreatePayload {
+  version?: 1;
+  name: string;
+  kind?: string;
+  parallelism?: number;
+  config?: Record<string, unknown>;
+  budget?: Record<string, unknown>;
+  items?: WorkItemPayload[];
+}
+
 export interface ActivityRecord {
   kind: string;
   delta?: string;
@@ -407,6 +607,7 @@ export interface ProjectConfig {
   digSteps?: number;
   digSamples?: number;
   digConcurrency?: number;
+  verifyConcurrency?: number;
   phases?: PhaseConfig;
   phaseProviders?: PhaseProviderConfig;
   engagement?: EngagementConfig;
@@ -530,9 +731,20 @@ export const api = {
   createDaemon: (name: string) => postJson<{ id: number; name: string; token: string }>("/api/daemons", { name }),
   renameDaemon: (id: number, name: string) => patchJson<unknown>(`/api/daemons/${id}`, { name }),
   deleteDaemon: (id: number) => fetchJson<unknown>(`/api/daemons/${id}`, { method: "DELETE" }),
+  runGroups: (params = new URLSearchParams({ limit: "500" })) => fetchJson<RunGroupListResponse>(`/api/run-groups?${params.toString()}`),
+  runGroup: (uuid: string) => fetchJson<RunGroupRow>(`/api/run-groups/${encodeURIComponent(uuid)}`),
+  createRunGroup: (body: RunGroupCreatePayload) => postJson<RunGroupRow>("/api/run-groups", body),
+  addRunGroupItems: (uuid: string, items: WorkItemPayload[]) => postJson<RunGroupRow>(`/api/run-groups/${encodeURIComponent(uuid)}/items`, { items }),
+  startRunGroup: (uuid: string, parallelism?: number) => postJson<RunGroupRow>(`/api/run-groups/${encodeURIComponent(uuid)}/start`, parallelism === undefined ? {} : { parallelism }),
+  pauseRunGroup: (uuid: string) => postJson<RunGroupRow>(`/api/run-groups/${encodeURIComponent(uuid)}/pause`, {}),
+  cancelRunGroup: (uuid: string) => postJson<RunGroupRow>(`/api/run-groups/${encodeURIComponent(uuid)}/cancel`, {}),
+  runGroupReport: (uuid: string) => fetchJson<RunGroupReportResponse>(`/api/run-groups/${encodeURIComponent(uuid)}/report`),
+  retryWorkItem: (id: number) => postJson<RunGroupRow>(`/api/work-items/${id}/retry`, {}),
   bugs: (params: URLSearchParams) =>
     fetchJson<{ findings: FindingRow[]; total: number; limit: number; offset: number; stats: { total: number; active: number; byStatus: Record<string, number>; byTracking: Record<string, number> } }>(`/api/bugs?${params.toString()}`),
   findingReport: (id: number) => fetchJson<{ markdown: string; source: "db" | "generated" }>(`/api/findings/${id}/report`),
+  findingLifecycle: (id: number) => fetchJson<FindingLifecycle>(`/api/findings/${id}/lifecycle`),
+  retryFindingPhase: (id: number, phase: FindingPhase) => postJson<{ ok: true; phase: FindingPhase }>(`/api/findings/${id}/retry`, { phase }),
   decisionReport: (id: number) => fetchJson<{ markdown: string; source: "db" | "generated" }>(`/api/confirm-decisions/${id}/report`),
   trackFinding: (id: number, status: string, opts?: { duplicateOfFindingId?: number | null }) =>
     patchJson<unknown>(`/api/findings/${id}/tracking`, { status, duplicateOfFindingId: opts?.duplicateOfFindingId ?? null }),

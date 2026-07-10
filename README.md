@@ -50,6 +50,7 @@ The installed skill should trigger from requests about Flounder audits, public-s
 - **Blind discovery plus capability-scoped reproduction.** Discovery runs network-sealed, so findings are derived from the target material rather than copied from disclosures. During `flounder confirm`, only explicit read/fork/fetch commands receive egress for white-hat reproduction and novelty checks; arbitrary model code remains network-sealed.
 - **Sandboxed execution boundary.** Model-generated code, PoCs, dependency installs, and local tests run in a copied workspace, not directly in the host checkout. The default OCI backend refuses silent host execution, bind-mounts only the copied workspace and package cache, drops Linux capabilities, uses `no-new-privileges`, read-only root filesystems and tmpfs temp dirs, applies process/memory/CPU limits when configured, and disables network for sealed audit commands. This reduces the blast radius of malicious dependencies, unsafe PoCs, and model mistakes before they can pollute the host machine.
 - **Multiple audit scenarios.** Use the same product for blind capability audits, incident investigation from suspicious on-chain evidence, open-world bug-bounty audits, targeted follow-up on suspected findings, and disclosure preparation. Whether Flounder prepares the target itself or you provide source paths is an input path, not the scenario.
+- **Durable evaluation groups.** `flounder group` runs validated positive, negative, control, replay, and multi-target work items through the same daemon queue and audit kernel. Group concurrency, attempts, blocked setup, evidence outcomes, and reports survive control-plane restarts. Manifest-provided commands are never executed directly, host execution is rejected, and lifecycle state stays separate from security/scoring outcomes.
 - **Strong fit for Solidity and ZK.** Solidity/EVM targets work well because local forks and Foundry/Hardhat tests can prove real on-chain effects. ZK/proof-system targets work well because local prover and constraint harnesses can turn subtle missing constraints into executable counterexamples. These are high-signal examples, not hard-coded limits.
 - **Designed for agent tooling.** Flounder exposes the audit workflow through a CLI, React dashboard, self-describing REST API, pi extension, provider profiles, and daemon execution plane. Codex-style and Claude Code-style providers can be routed through the same sandbox and audit contract.
 - **Local control of code and credentials.** The UI server is a control plane. Audits run on a daemon, optionally on another machine, so target code and provider credentials stay on the executor host.
@@ -106,8 +107,9 @@ Flounder is built for the parts of security work that usually require a human to
 | Sandboxed execution | Runs model-generated tests and PoCs away from the host source tree, credentials, and user environment. |
 | Execution proof | Runs the proof locally and only upgrades findings when command evidence exists. |
 | Discovery health | Writes run-health and backlog artifacts so a zero-finding run can be distinguished from a shallow run, a missing-resource blocker, or coverage that still needs a later dig. Toolchain warm-up failures are captured as resource requests even when the model did not write one itself, and backlog rows are classified for the project Next Actions queue. |
+| Evaluation and replay | Runs positive, negative, control, regression, and multi-target work items with durable concurrency and evidence accounting; regenerates group reports without rerunning model work. |
 | Real-target confirmation | Reproduces confirmed findings against real-world ground truth, such as a local fork of a deployed target. |
-| Reporting | Tracks status, artifacts, confirm decisions, formal reports, and submission state across projects. |
+| Reporting | Tracks one canonical record per exact finding, every occurrence and phase attempt, confirm decisions, formal reports, and submission state across projects. |
 
 ## Quickstart
 
@@ -316,9 +318,9 @@ The tracked workflow is:
 
 1. **Prepare**: acquire or stage source, corpus, dependency closure, and deployment-match evidence when the run starts from a clue.
 2. **Map**: enumerate and score the audit surface without producing findings.
-3. **Dig**: deep-audit selected scopes, construct PoCs, and execution-confirm findings locally.
+3. **Dig**: deep-audit selected scopes and attempt to prove each new finding locally while its source context is still active.
 4. **Synthesize**: compose per-scope findings into distinct cross-scope bug candidates.
-5. **Verify**: confirm or refute suspected and synthesized candidates by local execution.
+5. **Verify candidates**: settle only the suspected or synthesized candidates that Dig did not already prove or refute. Each claim runs in an isolated workspace with bounded concurrency; an unchanged blocked attempt waits for changed materials or an explicit retry instead of draining again. Standalone `verify` also accepts imported prior claims.
 6. **Confirm**: reproduce confirmed findings on real-world ground truth and decide whether they are submission candidates.
 7. **Report**: generate formal Markdown reports for reproduced or source-provided locally confirmed bugs.
 
@@ -358,6 +360,8 @@ A finding's status is the framework's verdict from execution:
 | --- | --- |
 | `confirmed-differential` | The exploit ran and the model's minimal fix blocked it while the test still ran. |
 | `confirmed-executable` | A cited local confirmation test triggered the bug. |
+| `confirmed-source` | Source-backed evidence is present, but local executable verification is still required. |
+| `needs-evidence` | Local review completed, but the claim needs external evidence to settle. |
 | `suspected` | Credible but not execution-proven, or downgraded by refutation. |
 | `refuted` | A skeptic or real-target reproduction broke the claim. |
 
@@ -365,7 +369,7 @@ A finding's status is the framework's verdict from execution:
 
 A run produces private artifacts under the output directory. By default, Flounder keeps local state under `~/.flounder`:
 
-- `~/.flounder/flounder.db`: local tracking database for projects, runs, scopes, findings, discovery backlog, daemon tokens, and jobs.
+- `~/.flounder/flounder.db`: local tracking database for projects, runs, scopes, canonical findings and occurrences, phase attempts, evaluations, discovery backlog, daemon tokens, and jobs.
 - `~/.flounder/<target>-<timestamp>/`: run artifacts, copied workspaces, logs, transcripts, findings, and reports.
 - `~/.flounder/history/<target>/`: durable memory, scope inventory, build cache, and project history.
 - `~/.flounder/workspace/`: default daemon workspace for project directories.
@@ -387,13 +391,15 @@ The dashboard stores metadata, run health, discovery backlog rows, and artifact 
 
 ## Dashboard
 
-`flounder ui` is a local control plane and dashboard for projects, daemons, provider profiles, runs, scopes, findings, reports, and live activity. A project is pinned to an execution daemon and a default provider profile, with optional per-phase provider overrides for prepare, map, dig, and confirm. The selected daemon must be authenticated for every provider profile the project can use. New projects start from a prominent task/clue input, can run immediately after creation, and default their daemon workspace directory to the project UUID.
+`flounder ui` is a local control plane and dashboard for projects, evaluations, daemons, provider profiles, runs, scopes, findings, reports, and live activity. A project is pinned to an execution daemon and a default provider profile, with optional per-phase provider overrides for prepare, map, dig, and confirm. The selected daemon must be authenticated for every provider profile the project can use. New projects start from a prominent task/clue input, can run immediately after creation, and default their daemon workspace directory to the project UUID.
 
-The project view shows the prepare -> map -> dig -> synthesize -> verify -> confirm -> report workflow, current phase, scope coverage, run health, a **Next Actions** queue, live model activity, findings as they land, per-finding confirm actions, real-target reproduction status, and reports. Next Actions is an agent-owned work queue: coverage work can Continue, Expand map, or prioritize scopes; setup work asks the agent to resolve toolchain, sandbox, dependency, source, or auth blockers when possible; routing work asks the agent to inspect ambiguous rows and choose the next safe workflow action. The operator is asked only for explicit credentials, authorization, or unavailable external resources. The primary action is **Run** before the first pipeline run and **Continue** after one exists; finer-grained Prepare, Map, Dig, Verify, Confirm, and Report actions live under More actions. The project list can pin projects, archive them to Settings, unarchive them later, and drag active projects into a manual order.
+The project view shows the prepare -> map -> dig -> synthesize -> verify -> confirm -> report workflow, current phase, scope coverage, run health, a **Next Actions** queue, live model activity, findings as they land, per-finding confirm actions, real-target reproduction status, and reports. Dig attempts local proof during discovery; **Verify candidates** is the explicit follow-up for unresolved or synthesized claims, not a second full audit. Continue resumes an interrupted Dig batch first, but when only verify/confirm/report work remains it starts directly at that evidence tail instead of creating an empty Dig run. Next Actions is an agent-owned work queue: coverage work can Continue, Expand map, or prioritize scopes; setup work asks the agent to resolve toolchain, sandbox, dependency, source, or auth blockers when possible; routing work asks the agent to inspect ambiguous rows and choose the next safe workflow action. The operator is asked only for explicit credentials, authorization, or unavailable external resources. The primary action is **Run** before the first pipeline run and **Continue** after one exists; finer-grained Prepare, Map, Dig, Verify candidates, Confirm, and Report actions live under More actions. The project list can pin projects, archive them to Settings, unarchive them later, and drag active projects into a manual order.
 
-A cross-project Findings view tracks every finding through submission states. It supports project, audit-status, and tracking filters; the default Active view hides findings marked `ignored`, and the Ignored view lets an operator recover machine-reported false positives later by changing them back to `open`.
+A cross-project Findings view tracks every project finding through submission states. Each row shows only the current phase and its blocker or next action; opening the workflow/report detail reveals the full local-verification, real-target, and formal-report attempt history plus focused retry controls. Evaluation evidence is excluded by default and can be inspected with the explicit source filter; those rows link back to their Evaluation and do not expose disclosure tracking controls.
 
-Every UI operation is also a REST call. `GET /api` returns the API catalog, `GET /api/projects/:uuid/backlog` lists discovery backlog rows with `actionability`, `action_owner`, and `recommended_action` metadata, `PATCH /api/backlog/:id` updates their operator state, and `GET /api/runs/:id/log` streams the executing daemon's live model output, tool calls, and milestones.
+The Evaluations view creates and operates durable audit, benchmark, regression, and verification run groups. It shows group progress, blocked setup, score-eligible evidence, positive/control rates where relevant, per-item material and evidence contracts, attempt history, blocked-only retry, and reports rebuilt from persisted results. Each item uses a hidden tracking project so target-name collisions cannot mix benchmark runs into operator Projects. Project jobs are claimed ahead of queued Evaluation jobs on a shared daemon; already-running work is never preempted. Lifecycle completion is never presented as an evidence pass by itself.
+
+Every UI operation is also a REST call. `GET /api` returns the API catalog, `GET /api/projects/:uuid/backlog` lists discovery backlog rows with `actionability`, `action_owner`, and `recommended_action` metadata, `GET /api/findings/:id/lifecycle` returns occurrences and phase attempts, `POST /api/findings/:id/retry` reopens one blocked phase, `PATCH /api/backlog/:id` updates operator state, and `GET /api/runs/:id/log` streams the executing daemon's live model output, tool calls, and milestones.
 
 ## White-Hat Boundary
 

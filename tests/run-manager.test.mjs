@@ -86,6 +86,13 @@ test("buildArgs: verify-from-start is an explicit run pipeline flag", () => {
   assert.equal(specToConfig({ verb: "run", target: "p", sourcePaths: ["./s"], verifyFromStart: true }, "runs").auditVerifyFromStart, true);
 });
 
+test("verify concurrency is preserved across launch config and CLI args", () => {
+  const spec = { verb: "run", target: "p", sourcePaths: ["./s"], verifyConcurrency: 3 };
+  assert.equal(specToConfig(spec, "runs").auditVerifyConcurrency, 3);
+  const args = buildArgs(spec);
+  assert.deepEqual(args.slice(args.indexOf("--verify-concurrency"), args.indexOf("--verify-concurrency") + 2), ["--verify-concurrency", "3"]);
+});
+
 test("specToConfig: launch next actions are preserved for the audit prompt", () => {
   const cfg = specToConfig({
     verb: "run",

@@ -2,10 +2,11 @@
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { defaultConfig, defaultOutputDir, defaultWorkspaceDir, normalizeProjectContext, normalizeRoleModels, type AuditorConfig } from "./config.js";
 import { CLI_CONFIG_KEYS, configFilePath, getCliConfigValue, isCliConfigKey, loadCliConfig, setCliConfigValue, unsetCliConfigValue, type CliConfigKey } from "./config-file.js";
-import { launchProjectRunViaApi, launchViaApi, ran, resolveServer, fetchArtifact } from "./cli-client.js";
+import { launchProjectRunViaApi, launchViaApi, ran, resolveServer, fetchArtifact, requestControlPlane } from "./cli-client.js";
 import { buildProjectContinueBody } from "./cli-project.js";
 import { deriveScopeNote } from "./scope-note.js";
 import type { LaunchSpec } from "./server/run-manager.js";
@@ -15,6 +16,7 @@ import { startUiServer } from "./server/app.js";
 import { runDaemon } from "./server/daemon.js";
 import { isSandboxBackend } from "./security/sandbox.js";
 import { knownRuntimeProviders, loginProvider, printProviderCheck, providerAuthStatus } from "./provider-auth.js";
+import { absolutizeRunGroupManifest, normalizeRunGroupManifest } from "./evaluation/contracts.js";
 
 async function main(argv: string[]): Promise<void> {
   const [cmd, ...rest] = argv;
@@ -35,6 +37,11 @@ async function main(argv: string[]): Promise<void> {
 
   if (cmd === "config") {
     runConfigCommand(rest);
+    return;
+  }
+
+  if (cmd === "group") {
+    await runGroupCommand(rest);
     return;
   }
 
@@ -270,6 +277,7 @@ async function parseConfig(args: string[]): Promise<{ cfg: AuditorConfig }> {
   cfg.auditDigSteps = readIntFlag(args, "--dig-steps") ?? cfg.auditDigSteps;
   cfg.auditDigSamples = readIntFlag(args, "--dig-samples") ?? cfg.auditDigSamples;
   cfg.auditDigConcurrency = readIntFlag(args, "--dig-concurrency") ?? cfg.auditDigConcurrency;
+  cfg.auditVerifyConcurrency = readIntFlag(args, "--verify-concurrency") ?? cfg.auditVerifyConcurrency;
   if (args.includes("--remap")) cfg.auditRemap = true;
   if (args.includes("--append-map") || args.includes("--expand-map")) cfg.auditAppendMap = true;
   cfg.auditAppendMapSeedPaths = readMultiFlag(args, "--append-map-seed");
@@ -342,6 +350,8 @@ function applyConfigOverrides(cfg: AuditorConfig, raw: Record<string, unknown>):
   if (typeof rawDigSamples === "number" && Number.isFinite(rawDigSamples)) cfg.auditDigSamples = Math.max(1, Math.floor(rawDigSamples));
   const rawDigConcurrency = raw.auditDigConcurrency ?? raw.audit_dig_concurrency;
   if (typeof rawDigConcurrency === "number" && Number.isFinite(rawDigConcurrency)) cfg.auditDigConcurrency = Math.max(1, Math.floor(rawDigConcurrency));
+  const rawVerifyConcurrency = raw.auditVerifyConcurrency ?? raw.audit_verify_concurrency;
+  if (typeof rawVerifyConcurrency === "number" && Number.isFinite(rawVerifyConcurrency)) cfg.auditVerifyConcurrency = Math.max(1, Math.floor(rawVerifyConcurrency));
   if (raw.thinkingLevel === "off" || raw.thinkingLevel === "minimal" || raw.thinkingLevel === "low" || raw.thinkingLevel === "medium" || raw.thinkingLevel === "high" || raw.thinkingLevel === "xhigh") {
     cfg.thinkingLevel = raw.thinkingLevel;
   }
@@ -587,6 +597,7 @@ function buildAuditSpec(cmd: "run" | "map" | "audit", rest: string[], cfg: Audit
   cap("--max-scopes", (n) => (spec.maxScopes = n));
   cap("--dig-samples", (n) => (spec.digSamples = n));
   cap("--dig-concurrency", (n) => (spec.digConcurrency = n));
+  cap("--verify-concurrency", (n) => (spec.verifyConcurrency = n));
   return spec;
 }
 
@@ -614,8 +625,9 @@ function safeJsonParse(text: string): unknown {
 
 // `flounder run <clue>` — the one-command pipeline. Orchestrates the distinct phases as SEPARATE
 // tracked runs (so each stays resumable + UI-visible and the dig stays network-sealed), feeding
-// each phase's output to the next: prepare (acquire, open-world) → run (map→dig, sealed) on the
-// staged source → confirm (reproduce, open-world) if the dig found anything. The user runs one
+// each phase's output to the next: prepare (acquire, open-world) → run
+// (map→dig→synthesize→verify, sealed) on the staged source → confirm (reproduce, open-world)
+// if the audit found anything. The user runs one
 // command and reads the final trail. --no-confirm stops after the dig; --posture/--no-match-deployed/
 // --endpoint tune prepare; --max-scopes/--dig-* tune the dig (via buildAuditSpec).
 async function runPipeline(rest: string[], cfg: AuditorConfig, clue: string): Promise<void> {
@@ -627,7 +639,7 @@ async function runPipeline(rest: string[], cfg: AuditorConfig, clue: string): Pr
   const endpoint = readFlag(rest, "--endpoint") ?? readFlag(rest, "--rpc");
   const noConfirm = rest.includes("--no-confirm");
   if (!noConfirm) {
-    console.log(`=== flounder run pipeline · target "${target}" · prepare → map → dig → confirm → report ===`);
+    console.log(`=== flounder run pipeline · target "${target}" · prepare → map → dig → synthesize → verify → confirm → report ===`);
     const spec: LaunchSpec = { verb: "run", target, sourcePaths: [], provider: cfg.provider, model: cfg.auditModel, thinking: cfg.thinkingLevel, clue, posture, matchDeployed, pipeline: true, out: cfg.outputDir, ...sandboxSpec(cfg) };
     if (endpoint !== undefined) spec.endpoint = endpoint;
     const result = await launchViaApi(server, spec);
@@ -736,7 +748,7 @@ function firstPositional(args: string[]): string | undefined {
     "--config", "--provider", "--audit-model", "--model", "--thinking", "--out",
     "--history-dir", "--server", "--clue", "--posture", "--endpoint", "--rpc",
     "--max-steps", "--map-steps", "--dig-steps", "--max-scopes", "--dig-samples",
-    "--dig-concurrency", "--scope", "--scope-note", "--max-tokens", "--repro-timeout-ms",
+    "--dig-concurrency", "--verify-concurrency", "--scope", "--scope-note", "--max-tokens", "--repro-timeout-ms",
     "--sandbox-backend", "--sandbox-image", "--prepare-network", "--confirm-network",
     "--sandbox-memory-mb", "--sandbox-cpus", "--prepare-timeout-ms", "--scope-coverage-mode",
     "--coverage", "--append-map-seed",
@@ -771,6 +783,106 @@ function canonicalVerifyArgs(args: string[], verifyFile: string, removePositiona
     out.push(token);
   }
   return ["--verify", verifyFile, ...out];
+}
+
+async function runGroupCommand(args: string[]): Promise<void> {
+  const [subcommand, ref, ...rest] = args;
+  if (!subcommand || subcommand === "help" || subcommand === "--help" || subcommand === "-h") {
+    printGroupHelp();
+    return;
+  }
+  const allArgs = ref ? [ref, ...rest] : rest;
+  const server = resolveServer(readFlag(allArgs, "--server"));
+  if (subcommand === "create") {
+    const manifestPath = readFlag(allArgs, "--manifest");
+    const nameOverride = readFlag(allArgs, "--name");
+    const parallelismOverride = readIntFlag(allArgs, "--parallel");
+    let body: Record<string, unknown>;
+    if (manifestPath) {
+      const absoluteManifest = path.resolve(manifestPath);
+      const manifest = absolutizeRunGroupManifest(
+        normalizeRunGroupManifest(JSON.parse(await readFile(absoluteManifest, "utf8"))),
+        path.dirname(absoluteManifest),
+      );
+      body = {
+        ...manifest,
+        ...(nameOverride ? { name: nameOverride } : {}),
+        ...(parallelismOverride !== undefined ? { parallelism: parallelismOverride } : {}),
+      };
+    } else {
+      const name = nameOverride ?? (ref && !ref.startsWith("--") ? ref : undefined);
+      if (!name) throw new Error("flounder group create needs --name <name> or --manifest <file>");
+      body = { name, ...(parallelismOverride !== undefined ? { parallelism: parallelismOverride } : {}) };
+    }
+    const created = await requestControlPlane(server, "POST", "/api/run-groups", body);
+    console.log(`created run group ${String(created.name)} (${String(created.uuid)}) with ${Array.isArray(created.items) ? created.items.length : 0} item(s)`);
+    return;
+  }
+  if (subcommand === "retry") {
+    const workItemId = ref && !ref.startsWith("--") ? Number(ref) : Number(readFlag(rest, "--item"));
+    if (!Number.isInteger(workItemId) || workItemId < 1) throw new Error("flounder group retry needs a positive work-item id");
+    const result = await requestControlPlane(server, "POST", `/api/work-items/${workItemId}/retry`, {});
+    printRunGroupStatus(result);
+    return;
+  }
+  const groupRef = ref && !ref.startsWith("--") ? ref : readFlag(rest, "--group");
+  if (!groupRef) throw new Error(`flounder group ${subcommand} needs a group UUID or name`);
+  const uuid = await resolveRunGroupUuid(server, groupRef);
+  if (subcommand === "start") {
+    const parallelism = readIntFlag(rest, "--parallel");
+    const result = await requestControlPlane(server, "POST", `/api/run-groups/${encodeURIComponent(uuid)}/start`, parallelism === undefined ? {} : { parallelism });
+    printRunGroupStatus(result);
+    return;
+  }
+  if (subcommand === "pause" || subcommand === "cancel") {
+    const result = await requestControlPlane(server, "POST", `/api/run-groups/${encodeURIComponent(uuid)}/${subcommand}`, {});
+    printRunGroupStatus(result);
+    return;
+  }
+  if (subcommand === "status") {
+    printRunGroupStatus(await requestControlPlane(server, "GET", `/api/run-groups/${encodeURIComponent(uuid)}`));
+    return;
+  }
+  if (subcommand === "report") {
+    const report = await requestControlPlane(server, "GET", `/api/run-groups/${encodeURIComponent(uuid)}/report`);
+    console.log(typeof report.markdown === "string" ? report.markdown : JSON.stringify(report, null, 2));
+    return;
+  }
+  throw new Error(`Unknown group command "${subcommand}". Use: flounder group create|start|status|pause|cancel|retry|report`);
+}
+
+async function resolveRunGroupUuid(server: string, ref: string): Promise<string> {
+  const response = await requestControlPlane(server, "GET", "/api/run-groups?limit=500");
+  const groups = Array.isArray(response.runGroups) ? response.runGroups as Array<Record<string, unknown>> : [];
+  const matches = groups.filter((group) => group.uuid === ref || group.name === ref);
+  if (matches.length === 1 && typeof matches[0]!.uuid === "string") return matches[0]!.uuid;
+  if (matches.length > 1) throw new Error(`run-group name "${ref}" is ambiguous; use the UUID`);
+  return ref;
+}
+
+function printRunGroupStatus(group: Record<string, unknown>): void {
+  const items = Array.isArray(group.items) ? group.items as Array<Record<string, unknown>> : [];
+  console.log(`${String(group.name ?? group.uuid)} [${String(group.state ?? "unknown")}] ${items.length} item(s)${typeof group.scheduled === "number" ? ` · ${group.scheduled} newly scheduled` : ""}`);
+  for (const item of items) {
+    console.log(`  ${String(item.item_key)}  ${String(item.kind)}  [${String(item.state)}]  ${String(item.outcome ?? "-")}`);
+  }
+}
+
+function printGroupHelp(): void {
+  console.log(`flounder group — durable batch/evaluation run groups.
+
+Usage:
+  flounder group create --manifest <file> [--name <name>] [--parallel <n>]
+  flounder group create --name <name>
+  flounder group start <uuid|name> [--parallel <n>]
+  flounder group status <uuid|name>
+  flounder group pause <uuid|name>
+  flounder group cancel <uuid|name>
+  flounder group retry <work-item-id>
+  flounder group report <uuid|name>
+
+Manifests contain validated work items, target bundles, material policies, and evidence
+contracts. They cannot enable host execution or bypass the normal sandbox/confirmation gate.`);
 }
 
 async function runHistoryCommand(args: string[]): Promise<void> {
@@ -1010,7 +1122,7 @@ function printHelp(): void {
 
 Usage:
   flounder prepare <clue> [--posture blind|informed] [--no-match-deployed] [--endpoint <url>]   open-world: clue (tx/address/project/repo/link) -> complete, deployment-matched scope; runs BEFORE map
-  flounder run     <clue>                                                         ONE-COMMAND PIPELINE from a tx/address/link: prepare -> map -> dig -> confirm -> report (--no-confirm to stop after the dig)
+  flounder run     <clue>                                                         ONE-COMMAND PIPELINE from a tx/address/link: prepare -> map -> dig -> synthesize -> verify -> confirm -> report (--no-confirm stops after the sealed audit)
   flounder run     --source <paths...> --target <name> [--corpus <paths...>]      sealed audit only: map -> dig on given source (--quick = one breadth pass)
   flounder map     --target <name> --source <paths...> [--corpus <paths...>]      enumerate the scope inventory only (writes audit_scopes.json)
   flounder audit   [<region> | --scope <id,...> | --verify <file>] --source ...   deep-audit a region, inventory scopes, or given claims
@@ -1018,6 +1130,7 @@ Usage:
   flounder confirm <run-dir> --source <paths...>                                  open-world: reproduce a run's findings on the real target
   flounder report  --project <uuid|name> [--finding <id>...] [--all]              generate missing reports or regenerate selected/all formal reports
   flounder continue --project <uuid|name>                                         finish the stored project pipeline round (same as the UI Continue button)
+  flounder group create|start|status|pause|cancel|retry|report                    durable evaluation, replay, and multi-target work groups
   flounder history import-run --target <name> --run <dir>
   flounder server project list                                                   list tracked projects
   flounder server run list [--project <name>]                                    list run history globally or for one project
@@ -1105,6 +1218,7 @@ run / map / audit deep-phase options:
   --dig-steps <n>         cap each scope's dig (default: UNBOUNDED; the dig stops when its obligations are discharged)
   --dig-samples <n>       independent dig passes per scope, findings unioned (raises recall), default 1
   --dig-concurrency <n>   scopes deep-audited in parallel (isolated workspaces), default 1
+  --verify-concurrency <n> findings verified in parallel (isolated workspaces), default 2
   --max-scopes <n>        one-run cap for un-audited scopes; UI Standard defaults to auditing until 30 project scopes are done
   --remap                 re-enumerate scopes from scratch (default resumes the persisted inventory)
   --append-map            expand the persisted inventory by asking MAP for novel scopes, preserving existing scope status
@@ -1181,6 +1295,7 @@ Options:
   --max-steps <n>           one-off global turn cap
   --dig-samples <n>         one-off samples per scope
   --dig-concurrency <n>     one-off parallel scopes
+  --verify-concurrency <n>  one-off parallel Verify findings
   --mock-llm                use the deterministic mock model on the daemon
   --server <url>            control plane URL`);
 }

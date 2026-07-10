@@ -27,8 +27,11 @@ import { projectHistoryDir } from "../trace/history.js";
 import { loadScopeInventory, saveScopeInventory } from "../agent/scope-store.js";
 import { deriveScopeNote } from "../scope-note.js";
 import { confirmSelectorsForFinding } from "../util/confirm-selector.js";
+import { phaseInputFingerprint } from "../util/material-fingerprint.js";
 import { isResumeSettledDecision, isSubmissionReadyDecision, needsSubmissionReadinessWork } from "../util/submission-readiness.js";
 import { isSandboxBackend, type SandboxBackend } from "../security/sandbox.js";
+import { normalizeRunGroupManifest, normalizeWorkItemInput } from "../evaluation/contracts.js";
+import { buildWorkItemLaunchSpec, evaluationTrackingProjectName, renderRunGroupReport, settleWorkItem } from "../evaluation/run-groups.js";
 
 const UI_HTML_PATH = fileURLToPath(new URL("./public/index.html", import.meta.url));
 const UI_PUBLIC_DIR = path.dirname(UI_HTML_PATH);
@@ -190,19 +193,23 @@ const ROUTES: Route[] = [
 
   route({
     method: "GET", path: "/api/projects",
-    summary: "List projects with a live snapshot (scope coverage, finding counts, confirmed-bug count, latest run, active runs). Paginated with ?limit/&offset; pass ?archived=1 to list archived projects for Settings; pass ?status=running|needs-work|done|failed|not-started to filter by computed project status.",
+    summary: "List operator projects with a live snapshot (scope coverage, finding counts, confirmed-bug count, latest run, active runs). Evaluation tracking projects are hidden by default; pass ?origin=evaluation|all only for provenance/debugging.",
     query: {
       archived: "boolean? — when true, return archived projects instead of active projects",
       limit: "number? (default 100)",
       offset: "number? (default 0)",
       q: "string? — case-insensitive project-name search",
       status: "string? — one of running, needs-work, done, failed, not-started",
+      origin: "project|evaluation|all? — default project; evaluation rows are internal tracking",
     },
     handler: async (c) => {
       const limit = clampInt(c.url.searchParams.get("limit"), 100, 1, 500);
       const offset = clampInt(c.url.searchParams.get("offset"), 0, 0, 1_000_000);
+      const origin = normalizeProjectOriginFilter(c.url.searchParams.get("origin"));
+      if (!origin) return sendJson(c.res, 400, { error: "origin must be project, evaluation, or all" });
       const options: ProjectListOptions = {
         archived: truthyParam(c.url.searchParams.get("archived")),
+        origin,
         limit,
         offset,
         search: c.url.searchParams.get("q") ?? undefined,
@@ -274,7 +281,7 @@ const ROUTES: Route[] = [
       continueCoverage: "boolean? — explicit opt-in to open the next mapped scope batch after the current pipeline round is fully settled",
       scopeCoverageMode: "focused|standard|half|full|custom? — one-off coverage mode for this run; standard means audit until the project has 30 audited scopes; pass continueCoverage:true to explicitly start another scope batch after verify/confirm/report are settled. Bug-bounty contest projects default to short custom batches unless overridden.",
       maxScopes: "number? — one-off scope cap for this run, or the custom target when scopeCoverageMode=custom", mapSteps: "number? — one-off map turn cap", digSteps: "number? — one-off per-scope dig turn cap",
-      maxSteps: "number? — one-off global turn cap", digSamples: "number? — one-off samples per scope", digConcurrency: "number? — one-off parallel scopes",
+      maxSteps: "number? — one-off global turn cap", digSamples: "number? — one-off samples per scope", digConcurrency: "number? — one-off parallel scopes", verifyConcurrency: "number? — one-off parallel Verify findings (isolated workspaces)",
       findingId: "number? — confirm/report: reproduce or report one selected finding",
       findingIds: "number[]? — confirm/report: reproduce selected pending audit-confirmed findings, or generate/regenerate formal reports for selected reproduced findings. Report without selection only generates missing reports.",
       inputRunDir: "string? — confirm: the finished run dir to reproduce",
@@ -326,6 +333,19 @@ const ROUTES: Route[] = [
     handler: findingReport,
   }),
   route({
+    method: "GET", path: "/api/findings/:id/lifecycle",
+    summary: "Read one canonical finding's occurrences, status timeline, and per-phase Verify/Confirm/Report attempts.",
+    params: { id: "finding id" },
+    handler: findingLifecycle,
+  }),
+  route({
+    method: "POST", path: "/api/findings/:id/retry",
+    summary: "Explicitly reopen one blocked finding lifecycle phase. The next Continue retries only that phase against the same inputs; changed inputs are eligible automatically.",
+    params: { id: "finding id" },
+    body: { phase: "verify|confirm|report" },
+    handler: findingPhaseRetry,
+  }),
+  route({
     method: "GET", path: "/api/confirm-decisions/:id/report",
     summary: "Read one decision's final submission report markdown. This is the real-target bug-level report; linked finding reports remain evidence summaries.",
     params: { id: "confirm decision id" },
@@ -337,6 +357,76 @@ const ROUTES: Route[] = [
     params: { uuid: "project UUID" },
     query: { reproduced: "string? — e.g. 'yes' for confirmed bugs", includeStale: "boolean? — include decisions from older prepared material snapshots" },
     handler: confirmDecisionsList,
+  }),
+
+  route({
+    method: "GET", path: "/api/run-groups",
+    summary: "List durable run groups for benchmark evaluation, repeated samples, regression replay, and multi-target campaigns. Lifecycle state is separate from each item's security/scoring outcome.",
+    query: { limit: "number? (default 100)", offset: "number? (default 0)" },
+    handler: runGroupList,
+  }),
+  route({
+    method: "POST", path: "/api/run-groups",
+    summary: "Create a durable run group, optionally with its initial work items. Target bundles and evidence contracts are schema-validated; manifest commands are metadata only and never bypass Flounder's sandbox or confirmation policy.",
+    body: {
+      name: "string (required, unique)",
+      kind: "string? — evaluation|campaign|batch|custom display category",
+      parallelism: "positive integer? (default 1)",
+      config: "object? — shared provider/model/thinking defaults",
+      budget: "object? — persisted accounting limits/notes; never a security outcome",
+      items: "work-item[]? — audit-target, verify-claim, benchmark-case, or regression-replay items",
+    },
+    handler: runGroupCreate,
+  }),
+  route({
+    method: "GET", path: "/api/run-groups/:uuid",
+    summary: "Read one run group with every independently resumable work item, attempts, linked job/run, outcome, and stored evidence result.",
+    params: { uuid: "run-group UUID" },
+    handler: runGroupGet,
+  }),
+  route({
+    method: "POST", path: "/api/run-groups/:uuid/items",
+    summary: "Append validated work items to a draft or paused run group without replacing prior attempts or evidence.",
+    params: { uuid: "run-group UUID" },
+    body: { items: "work-item[] (required) — each has itemKey, kind, targetBundle, materialPolicy, and evidenceContract" },
+    handler: runGroupItemsAdd,
+  }),
+  route({
+    method: "POST", path: "/api/run-groups/:uuid/start",
+    summary: "Start or resume a run group and queue only enough existing Flounder jobs to satisfy its parallelism. The scheduler survives server restarts because group/item/job state is stored in SQLite.",
+    params: { uuid: "run-group UUID" },
+    body: { parallelism: "positive integer? — override the group's durable concurrency" },
+    handler: runGroupStart,
+  }),
+  route({
+    method: "POST", path: "/api/run-groups/:uuid/pause",
+    summary: "Pause future work-item dispatch. Already queued/claimed/running jobs finish and keep their evidence; start resumes remaining items.",
+    params: { uuid: "run-group UUID" },
+    handler: runGroupPause,
+  }),
+  route({
+    method: "POST", path: "/api/run-groups/:uuid/cancel",
+    summary: "Cancel a run group and all queued/claimed/running work-item jobs while preserving completed evidence and attempt history.",
+    params: { uuid: "run-group UUID" },
+    handler: runGroupCancel,
+  }),
+  route({
+    method: "GET", path: "/api/run-groups/:uuid/report",
+    summary: "Regenerate a run-group score/outcome report entirely from persisted work-item results without rerunning model work.",
+    params: { uuid: "run-group UUID" },
+    handler: runGroupReport,
+  }),
+  route({
+    method: "GET", path: "/api/work-items/:id",
+    summary: "Read one durable work item, including lifecycle state, security/scoring outcome, immutable attempt history, linked job/run, and evidence result.",
+    params: { id: "work-item id" },
+    handler: workItemGet,
+  }),
+  route({
+    method: "POST", path: "/api/work-items/:id/retry",
+    summary: "Retry only a blocked/failed work item while preserving its prior attempt evidence. Benchmark misses are independent results and cannot be rewritten as retries.",
+    params: { id: "work-item id" },
+    handler: workItemRetry,
   }),
 
   route({
@@ -409,21 +499,22 @@ const ROUTES: Route[] = [
 
   route({
     method: "GET", path: "/api/bugs",
-    summary: "Every finding across ALL projects (joined with project name) plus aggregate stats — the cross-project Bugs dashboard. Optional ?project=uuid, ?status= (exact or execution-confirmed), and ?tracking= filters; ?tracking=active hides ignored findings; ?limit/&offset paginate.",
-    query: { project: "string? — project uuid to scope findings and stats", status: "string? — exact status or execution-confirmed alias", tracking: "string? — tracking state, or active to hide ignored findings", limit: "number? (default 200)", offset: "number? (default 0)" },
+    summary: "Findings across operator projects plus aggregate stats, including execution-confirmed evidence. Evaluation findings are excluded by default; pass ?source=evaluation|all to inspect benchmark evidence with explicit provenance.",
+    query: { project: "string? — project uuid to scope findings and stats", source: "project|evaluation|all? — default project", status: "string? — exact status or execution-confirmed alias", tracking: "string? — tracking state, or active to hide ignored findings", limit: "number? (default 200)", offset: "number? (default 0)" },
     handler: (c) => {
       const projectUuid = c.url.searchParams.get("project") || c.url.searchParams.get("projectUuid") || undefined;
       const status = c.url.searchParams.get("status") || undefined;
-      const exactStatus = status === "execution-confirmed" ? undefined : status;
       const tracking = c.url.searchParams.get("tracking") || undefined;
-      const exactTracking = tracking === "active" ? undefined : tracking;
+      const source = normalizeFindingSourceFilter(c.url.searchParams.get("source"));
+      if (!source) return sendJson(c.res, 400, { error: "source must be project, evaluation, or all" });
       const limit = clampInt(c.url.searchParams.get("limit"), 200, 1, 500);
       const offset = clampInt(c.url.searchParams.get("offset"), 0, 0, 1_000_000);
-      const statsRows = reportableFindings(c.store.listGlobalFindings({ projectUuid, limit: 10_000, offset: 0 }));
-      const all = reportableFindings(c.store.listGlobalFindings({ projectUuid, status: exactStatus, tracking: exactTracking, limit: 10_000, offset: 0 }))
-        .filter((finding) => findingStatusMatches(finding, status))
-        .filter((finding) => findingTrackingMatches(finding, tracking));
-      sendJson(c.res, 200, { findings: all.slice(offset, offset + limit).map(findingSummaryRow), total: all.length, limit, offset, stats: globalFindingStats(statsRows) });
+      const filter = { projectUuid, source, status, tracking };
+      const findings = c.store.listGlobalFindings({ ...filter, limit, offset });
+      const total = c.store.countGlobalFindings(filter);
+      const rawStats = c.store.globalFindingStats({ projectUuid, source });
+      const stats = { ...rawStats, active: rawStats.total - (rawStats.byTracking.ignored ?? 0) };
+      sendJson(c.res, 200, { findings: withLatestFindingAttempts(c.store, findings).map(findingSummaryRow), total, limit, offset, stats });
     },
   }),
   route({
@@ -541,8 +632,8 @@ export function apiCatalog(): {
 } {
   return {
     name: "flounder",
-    description: "REST API for tracking and driving white-hat audits. Resources: project (CRUD), run (launch/stop/read), scope, discovery-backlog, finding, confirm-decision. Runs execute on connected daemons; every UI operation is one of these calls.",
-    resources: ["project", "provider", "daemon", "run", "scope", "discovery-backlog", "finding", "confirm-decision"],
+    description: "REST API for tracking and driving white-hat audits and durable evaluation groups. Runs execute on connected daemons; every UI operation is one of these calls.",
+    resources: ["project", "provider", "daemon", "run", "run-group", "work-item", "scope", "discovery-backlog", "finding", "confirm-decision"],
     endpoints: ROUTES.filter((r) => !r.hidden).map((r) => ({
       method: r.method,
       path: r.path,
@@ -572,6 +663,10 @@ export function startUiServer(options: UiServerOptions = {}): ReturnType<typeof 
   const artifactReconciled = reconcileSuccessfulArtifactRuns(store);
   if (artifactReconciled > 0) console.log(`[flounder ui] reconciled ${artifactReconciled} completed run artifact${artifactReconciled === 1 ? "" : "s"}`);
   const plane = new ControlPlane();
+  reconcileTerminalRunGroupItems(store, plane);
+  for (const group of store.listRunGroups(10_000, 0)) {
+    if (group.state === "running") scheduleRunGroupWith(store, plane, Number(group.id));
+  }
   // NOTE: we do NOT reconcile `running` rows on startup — runs execute on daemons, which
   // survive a server restart. Blind-killing them here would be wrong. (A future daemon
   // heartbeat can reconcile rows whose daemon has gone stale.)
@@ -884,7 +979,8 @@ async function projectGet(c: Ctx): Promise<void> {
       ? []
       : reportableFindings(c.store.listFindings(id).filter((row) => rowBelongsToCurrentMaterial(row, currentRunIds, materialBoundary)));
     const activeFindings = allFindings.filter((finding) => !isIgnoredFinding(finding));
-    const findingSummaries = allFindings.map((finding) => findingSummaryRow({ ...finding, timeline: c.store.findingTimeline(Number(finding.id)) }));
+    const findingSummaries = withLatestFindingAttempts(c.store, allFindings)
+      .map((finding) => findingSummaryRow({ ...finding, timeline: c.store.findingTimeline(Number(finding.id)) }));
     const auditConfirmedFindings = countAuditConfirmedFindings(activeFindings);
     const confirmDecisions = activePrepareRefresh
       ? []
@@ -973,6 +1069,9 @@ function latestScopeInventoryBoundaryRun(runs: Array<Record<string, unknown>>): 
 
 function isCurrentMaterialRun(run: Record<string, unknown>, boundary?: Record<string, unknown>): boolean {
   if (!boundary) return true;
+  const boundaryFingerprint = stringValue(boundary.material_fingerprint);
+  const runFingerprint = stringValue(run.material_fingerprint);
+  if (boundaryFingerprint && runFingerprint) return boundaryFingerprint === runFingerprint || Number(run.id) === Number(boundary.id);
   const runStarted = stringValue(run.started_at);
   const boundaryStarted = stringValue(boundary.started_at);
   if (!runStarted || !boundaryStarted) return true;
@@ -2209,6 +2308,9 @@ async function runLaunch(c: Ctx): Promise<void> {
   const scopeView = currentScopeView(c.store, projectId, currentRuns, undefined, scopeBoundary, !materialBoundary);
   const progress = scopeView.hasInventory ? scopeView.progress : emptyProgress();
   const spec = launchSpec(c.store, project, body, c.out, profile, progress, phaseProfiles);
+  const currentMaterialFingerprint = currentResultRuns(currentRuns, scopeBoundary).map((run) => stringValue(run.material_fingerprint)).find(Boolean)
+    || stringValue(materialBoundary?.material_fingerprint);
+  if (currentMaterialFingerprint) spec.materialFingerprint = currentMaterialFingerprint;
   if (spec.verb === "run") {
     if (spec.sourcePaths.length > 0) {
       applyProjectSourceDefaults(spec, project);
@@ -2240,6 +2342,31 @@ async function runLaunch(c: Ctx): Promise<void> {
   if (nextActions.length > 0) {
     spec.nextActions = nextActions;
     applyNextActionRunDefaults(spec, nextActions, progress);
+  }
+  if ((spec.verb === "run" || spec.verb === "audit") && currentResultRunIds.size > 0) {
+    spec.synthesisContext = reportableFindings(c.store.listFindings(projectId)
+      .filter((finding) => rowBelongsToCurrentMaterial(finding, currentResultRunIds, materialBoundary)))
+      .map((finding) => ({
+        id: finding.id,
+        canonical_key: finding.canonical_key,
+        finding_key: finding.finding_key,
+        title: finding.title,
+        location: finding.location,
+        status: finding.status,
+        description: finding.description,
+        exploit_sketch: finding.exploit_sketch,
+      }));
+  }
+  if (
+    spec.verb === "run"
+    && spec.pipeline
+    && spec.maxScopes === 0
+    && pipelinePostAuditWorkPending(c.store, projectId, currentResultRunIds, materialBoundary, requiresRealTargetConfirmation)
+  ) {
+    // Continue the evidence tail directly. Starting runAudit with maxScopes=0 still copies and
+    // initializes the target and records a misleading empty Dig run before Verify/Confirm/Report.
+    spec.pipelineStart = "settle";
+    spec.maxScopes = 0;
   }
   const materialDrift = verifyMaterialDrift(c.store, projectId, spec.verifyFindings, body.allowMaterialDrift === true);
   if (materialDrift) return sendJson(c.res, 409, materialDrift);
@@ -2554,7 +2681,10 @@ function confirmWorkRows(
       const key = stringValue((row as Record<string, unknown>).finding_key).toLowerCase();
       return Boolean(key && readinessKeys.has(key));
     });
-  return uniqueRowsByFindingKey([...pending, ...readiness]);
+  return uniqueRowsByFindingKey([...pending, ...readiness]).filter((row) => {
+    const inputFingerprint = findingPhaseFingerprint(store, row, "confirm", materialBoundary);
+    return store.phaseEligible(projectId, "finding", Number(row.id), "confirm", inputFingerprint);
+  });
 }
 
 function uniqueRowsByFindingKey(rows: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
@@ -2607,6 +2737,10 @@ function verifyMaterialDrift(store: MetadataStore, projectId: number, verifyFind
     if (!Number.isFinite(runId)) continue;
     const newerPrepare = store.latestPrepareAfterRun(projectId, runId);
     if (!newerPrepare || !isSuccessfulPrepareRun(newerPrepare)) continue;
+    const findingRun = store.getRun(runId);
+    const findingFingerprint = stringValue(findingRun?.material_fingerprint);
+    const prepareFingerprint = stringValue(newerPrepare.material_fingerprint);
+    if (findingFingerprint && prepareFingerprint && findingFingerprint === prepareFingerprint) continue;
     drifted.push({
       findingId: id,
       title: stringValue(finding.title),
@@ -2666,7 +2800,8 @@ function reportWorklist(
     if (isIgnoredFinding(row)) return false;
     if (!selected && !includeExistingReports && rowHasFormalReport(row)) return false;
     if (!rowBelongsToCurrentMaterial(row, currentRunIds ?? new Set(), materialBoundary)) return false;
-    return isExecutionConfirmedFindingStatus(String(row.status ?? "").toLowerCase());
+    if (!isExecutionConfirmedFindingStatus(String(row.status ?? "").toLowerCase())) return false;
+    return Boolean(selected) || store.phaseEligible(projectId, "finding", Number(row.id), "report", findingPhaseFingerprint(store, row, "report", materialBoundary));
   });
   if (selected && rows.length !== selected.size) {
     const found = new Set(rows.map((row) => Number(row.id)));
@@ -2694,6 +2829,7 @@ function reportWorklist(
       fix: stringValue(row.fix) || undefined,
       confidence: Number.isFinite(Number(row.confidence)) ? Number(row.confidence) : undefined,
       decisions: [],
+      phaseInputFingerprint: findingPhaseFingerprint(store, row, "report", materialBoundary),
     })),
   };
 }
@@ -2720,6 +2856,7 @@ function decisionReportWorklist(
     .filter((decision) => isSubmissionReadyDecision(decision, { requireImpactInventory: false }))
     .filter((decision) => isRealTargetDecisionEvidence(stringValue(decision.evidence_level)))
     .filter((decision) => selected || includeExistingReports || !decisionHasFormalReport(decision))
+    .filter((decision) => Boolean(selected) || store.phaseEligible(projectId, "decision", Number(decision.id), "report", decisionReportFingerprint(store, decision, materialBoundary)))
     .filter((decision) => {
       if (!selected) return true;
       const linked = decisionLinkedFindingRows(decision, findingsByKey).filter((finding) => !isIgnoredFinding(finding));
@@ -2765,9 +2902,25 @@ function decisionReportWorklist(
         confidence: maxConfidenceFromRows(linkedFindings),
         decisions: [confirmDecisionDisplayRow(decision)],
         linkedFindings: linkedFindings.map(reportLinkedFindingRow),
+        phaseInputFingerprint: decisionReportFingerprint(store, decision, materialBoundary),
       };
     }),
   };
+}
+
+function decisionReportFingerprint(store: MetadataStore, decision: Record<string, unknown>, boundary?: Record<string, unknown>): string {
+  const runId = Number(decision.run_id);
+  const run = Number.isFinite(runId) ? store.getRun(runId) : undefined;
+  return phaseInputFingerprint({
+    phase: "report",
+    material: run?.material_fingerprint ?? boundary?.material_fingerprint ?? null,
+    decisionId: Number(decision.id),
+    reproduced: decision.reproduced,
+    recommendation: decision.recommendation,
+    evidenceLevel: decision.evidence_level,
+    submissionConfidence: decision.submission_confidence,
+    members: decision.members_json,
+  });
 }
 
 function decisionLinkedFindingRows(decision: Record<string, unknown>, findingsByKey: Map<string, Record<string, unknown>>): Array<Record<string, unknown>> {
@@ -3023,7 +3176,7 @@ function normalizeLaunchSpec(body: Record<string, unknown>, target: string, verb
 // The project-row config_json for a launched ad-hoc run (display only; the daemon runs the spec).
 function launchDisplayConfig(spec: LaunchSpec): Record<string, unknown> {
   const cfg: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries({ provider: spec.provider, model: spec.model, thinking: spec.thinking, maxScopes: spec.maxScopes, mapSteps: spec.mapSteps, digSteps: spec.digSteps, digSamples: spec.digSamples, digConcurrency: spec.digConcurrency, sandboxBackend: spec.sandboxBackend, sandboxImage: spec.sandboxImage, sandboxAllowHostFallback: spec.sandboxAllowHostFallback, sandboxPrepareNetwork: spec.sandboxPrepareNetwork, sandboxConfirmNetwork: spec.sandboxConfirmNetwork, sandboxMemoryMb: spec.sandboxMemoryMb, sandboxCpus: spec.sandboxCpus })) {
+  for (const [k, v] of Object.entries({ provider: spec.provider, model: spec.model, thinking: spec.thinking, maxScopes: spec.maxScopes, mapSteps: spec.mapSteps, digSteps: spec.digSteps, digSamples: spec.digSamples, digConcurrency: spec.digConcurrency, verifyConcurrency: spec.verifyConcurrency, sandboxBackend: spec.sandboxBackend, sandboxImage: spec.sandboxImage, sandboxAllowHostFallback: spec.sandboxAllowHostFallback, sandboxPrepareNetwork: spec.sandboxPrepareNetwork, sandboxConfirmNetwork: spec.sandboxConfirmNetwork, sandboxMemoryMb: spec.sandboxMemoryMb, sandboxCpus: spec.sandboxCpus })) {
     if (v !== undefined) cfg[k] = v;
   }
   return cfg;
@@ -3043,24 +3196,32 @@ function findingsList(c: Ctx): void {
     const currentRuns = currentVisibleRuns(allRuns, materialBoundary, activePrepareRefresh);
     const scopeBoundary = latestScopeInventoryBoundaryRun(currentRuns);
     const currentResultRunIds = runIdSet(currentResultRuns(currentRuns, scopeBoundary));
-    const rows = reportableFindings(c.store.listFindings(id)
-      .filter((finding) => includeStale || (!activePrepareRefresh && rowBelongsToCurrentMaterial(finding, currentResultRunIds, materialBoundary))))
-      .map((finding) => annotateFindingMaterialStaleness(finding, currentResultRunIds, materialBoundary, activePrepareRefresh))
-      .filter((finding) => findingStatusMatches(finding, status))
-      .filter((finding) => findingTrackingMatches(finding, tracking))
-      .filter((finding) => findingSearchMatches(finding, search))
-      .sort((a, b) => findingSeverityScore(b) - findingSeverityScore(a) || String(b.updated_at ?? "").localeCompare(String(a.updated_at ?? "")));
-    const findings = rows.slice(offset, offset + limit).map((finding) => findingDetailRow({ ...finding, timeline: c.store.findingTimeline(Number(finding.id)) }));
-    sendJson(c.res, 200, { findings, total: rows.length, limit, offset });
+    const filter = {
+      status,
+      tracking,
+      search,
+      reportable: true,
+      ...(!includeStale && (activePrepareRefresh || materialBoundary) ? { runIds: activePrepareRefresh ? [] : [...currentResultRunIds] } : {}),
+    };
+    const total = c.store.countFindings(id, filter);
+    const rows = c.store.queryFindings(id, { ...filter, limit, offset })
+      .map((finding) => annotateFindingMaterialStaleness(finding, currentResultRunIds, materialBoundary, activePrepareRefresh));
+    const findings = withLatestFindingAttempts(c.store, rows)
+      .map((finding) => findingDetailRow({ ...finding, timeline: c.store.findingTimeline(Number(finding.id)) }));
+    sendJson(c.res, 200, { findings, total, limit, offset });
   });
 }
 
-function findingSearchMatches(row: Record<string, unknown>, search?: string): boolean {
-  const query = search?.trim().toLowerCase();
-  if (!query) return true;
-  const idMatch = query.match(/^#?(\d+)$/);
-  if (idMatch && String(row.id ?? "") === idMatch[1]) return true;
-  return `${row.title ?? ""} ${row.location ?? ""}`.toLowerCase().includes(query);
+function withLatestFindingAttempts(store: MetadataStore, rows: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  const attempts = store.latestFindingPhaseAttempts("finding", rows.map((row) => Number(row.id)));
+  const byFinding = new Map<number, Array<Record<string, unknown>>>();
+  for (const attempt of attempts) {
+    const id = Number(attempt.subject_id);
+    const current = byFinding.get(id) ?? [];
+    current.push(attempt);
+    byFinding.set(id, current);
+  }
+  return rows.map((row) => ({ ...row, phase_attempts: byFinding.get(Number(row.id)) ?? [] }));
 }
 
 function annotateFindingMaterialStaleness(row: Record<string, unknown>, currentRunIds: Set<number>, boundary?: Record<string, unknown>, activePrepareRefreshStartedAt?: string): Record<string, unknown> {
@@ -3073,29 +3234,27 @@ function annotateFindingMaterialStaleness(row: Record<string, unknown>, currentR
   };
 }
 
-function findingSeverityScore(finding: Record<string, unknown>): number {
-  const severity = String(finding.severity ?? "").toLowerCase();
-  if (severity === "critical") return 5;
-  if (severity === "high") return 4;
-  if (severity === "medium") return 3;
-  if (severity === "low") return 2;
-  if (severity === "info") return 1;
-  return 0;
-}
-
 function reportableFindings(rows: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
-  return dedupeFindingRows(rows.filter(isReportableFinding));
+  // Canonical identity and occurrence provenance are enforced when findings are
+  // ingested. Read paths must not hide distinct claims with title-similarity guesses.
+  return rows.filter(isReportableFinding);
 }
 
 function findingSummaryRow(row: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const key of [
     "id",
+    "uuid",
     "project_id",
     "project_name",
     "project_uuid",
+    "source",
+    "evaluation_name",
+    "evaluation_uuid",
     "run_id",
     "finding_key",
+    "canonical_key",
+    "occurrence_count",
     "title",
     "location",
     "severity",
@@ -3104,6 +3263,9 @@ function findingSummaryRow(row: Record<string, unknown>): Record<string, unknown
     "duplicate_of_finding_id",
     "scope_id",
     "confidence",
+    "refutation_status",
+    "refutation_reason",
+    "phase_attempts",
     "tracking_status",
     "created_at",
     "updated_at",
@@ -3183,6 +3345,45 @@ function findingReport(c: Ctx): void {
     markdown: stored || renderFindingReportMarkdown(display, decisions),
     source: stored ? "db" : "generated",
   });
+}
+
+function findingLifecycle(c: Ctx): void {
+  const id = Number(c.params.id);
+  const finding = c.store.getFinding(id);
+  if (!finding) return sendJson(c.res, 404, { error: "no such finding" });
+  const decisions = c.store.listConfirmDecisionsForFinding(Number(finding.project_id), String(finding.finding_key ?? ""));
+  sendJson(c.res, 200, {
+    finding: findingSummaryRow(finding),
+    timeline: c.store.findingTimeline(id),
+    occurrences: c.store.findingOccurrences(id),
+    attempts: c.store.listFindingPhaseAttempts("finding", id),
+    decisions: decisions.map((decision) => ({
+      ...confirmDecisionDisplayRow(decision),
+      attempts: c.store.listFindingPhaseAttempts("decision", Number(decision.id)),
+    })),
+  });
+}
+
+async function findingPhaseRetry(c: Ctx): Promise<void> {
+  const id = Number(c.params.id);
+  const finding = c.store.getFinding(id);
+  if (!finding) return sendJson(c.res, 404, { error: "no such finding" });
+  const body = (await readBody(c.req)) as { phase?: string };
+  if (body.phase !== "verify" && body.phase !== "confirm" && body.phase !== "report") {
+    return sendJson(c.res, 400, { error: "phase must be verify, confirm, or report" });
+  }
+  let subjectType: "finding" | "decision" = "finding";
+  let subjectId = id;
+  if (body.phase === "report") {
+    const decisions = c.store.listConfirmDecisionsForFinding(Number(finding.project_id), String(finding.finding_key ?? ""));
+    const decision = decisions.find((row) => c.store.latestFindingPhaseAttempt("decision", Number(row.id), "report")?.state === "blocked") ?? decisions[0];
+    if (decision) {
+      subjectType = "decision";
+      subjectId = Number(decision.id);
+    }
+  }
+  const ok = c.store.requestFindingPhaseRetry(Number(finding.project_id), subjectType, subjectId, body.phase);
+  sendJson(c.res, ok ? 200 : 409, ok ? { ok: true, phase: body.phase, subjectType, subjectId } : { error: "phase retry could not be queued" });
 }
 
 function confirmDecisionReport(c: Ctx): void {
@@ -3397,15 +3598,6 @@ function isIgnoredFinding(row: Record<string, unknown>): boolean {
   return String(row.tracking_status ?? "open") === "ignored";
 }
 
-const FINDING_STATUS_RANK: Record<string, number> = {
-  discharged: 0,
-  refuted: 1,
-  suspected: 2,
-  "confirmed-source": 3,
-  "confirmed-executable": 4,
-  "confirmed-differential": 5,
-};
-
 const FINDING_SEVERITY_RANK: Record<string, number> = {
   info: 0,
   low: 1,
@@ -3414,102 +3606,8 @@ const FINDING_SEVERITY_RANK: Record<string, number> = {
   critical: 4,
 };
 
-function dedupeFindingRows(rows: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
-  const best = new Map<string, Record<string, unknown>>();
-  for (const row of rows) {
-    const key = findingDisplayDedupeKey(row);
-    const current = best.get(key);
-    if (!current || compareFindingRows(row, current) > 0) best.set(key, row);
-  }
-  const exactDeduped = rows.filter((row) => best.get(findingDisplayDedupeKey(row)) === row);
-  const confirmed = exactDeduped.filter((row) => isConfirmedFindingStatus(String(row.status ?? "").toLowerCase()));
-  return exactDeduped.filter((row) => {
-    if (isConfirmedFindingStatus(String(row.status ?? "").toLowerCase())) return true;
-    return !confirmed.some((candidate) => likelyVerifiedDuplicate(row, candidate));
-  });
-}
-
-function findingDisplayDedupeKey(row: Record<string, unknown>): string {
-  const project = normalizeDedupePart(row.project_id ?? row.project_uuid ?? "");
-  const title = normalizeDedupePart(cleanFindingTitle(row.title));
-  const location = normalizeDedupePart(row.location);
-  if (title || location) return `${project}|${location}|${title}`;
-  return `${project}|${normalizeDedupePart(row.finding_key ?? row.id ?? "")}`;
-}
-
-function normalizeDedupePart(value: unknown): string {
-  return String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
-}
-
-function likelyVerifiedDuplicate(row: Record<string, unknown>, confirmed: Record<string, unknown>): boolean {
-  if (rank(FINDING_STATUS_RANK, confirmed.status) <= rank(FINDING_STATUS_RANK, row.status)) return false;
-  if (normalizeDedupePart(row.project_id ?? row.project_uuid ?? "") !== normalizeDedupePart(confirmed.project_id ?? confirmed.project_uuid ?? "")) return false;
-  const scope = normalizeDedupePart(row.scope_id ?? "");
-  const location = normalizeDedupePart(row.location ?? "");
-  if (scope && scope === normalizeDedupePart(confirmed.scope_id ?? "") && location && location === normalizeDedupePart(confirmed.location ?? "")) {
-    return relatedFindingTitles(row.title, confirmed.title);
-  }
-  return stronglyRelatedFindingTitles(row.title, confirmed.title);
-}
-
-function relatedFindingTitles(a: unknown, b: unknown): boolean {
-  const aTokens = findingTitleTokens(a);
-  const bTokens = findingTitleTokens(b);
-  if (aTokens.size === 0 || bTokens.size === 0) return false;
-  let overlap = 0;
-  for (const token of aTokens) if (bTokens.has(token)) overlap += 1;
-  return overlap >= Math.min(3, Math.min(aTokens.size, bTokens.size));
-}
-
-function stronglyRelatedFindingTitles(a: unknown, b: unknown): boolean {
-  const aTokens = findingTitleTokens(a);
-  const bTokens = findingTitleTokens(b);
-  if (aTokens.size < 5 || bTokens.size < 5) return false;
-  let overlap = 0;
-  for (const token of aTokens) if (bTokens.has(token)) overlap += 1;
-  const smaller = Math.min(aTokens.size, bTokens.size);
-  const larger = Math.max(aTokens.size, bTokens.size);
-  return overlap >= 5 && overlap / smaller >= 0.7 && overlap / larger >= 0.5;
-}
-
-const FINDING_TITLE_STOPWORDS = new Set(["a", "an", "and", "are", "at", "be", "by", "can", "for", "from", "in", "is", "it", "of", "on", "or", "the", "to", "with"]);
-
-function findingTitleTokens(value: unknown): Set<string> {
-  return new Set(
-    normalizeDedupePart(cleanFindingTitle(value))
-      .split(/[^a-z0-9]+/i)
-      .filter((token) => token.length >= 3 && !FINDING_TITLE_STOPWORDS.has(token)),
-  );
-}
-
-function compareFindingRows(a: Record<string, unknown>, b: Record<string, unknown>): number {
-  for (const delta of [
-    rank(FINDING_STATUS_RANK, a.status) - rank(FINDING_STATUS_RANK, b.status),
-    rank(FINDING_SEVERITY_RANK, a.severity) - rank(FINDING_SEVERITY_RANK, b.severity),
-    numberish(a.confidence) - numberish(b.confidence),
-    findingRichness(a) - findingRichness(b),
-    timestampMs(a.updated_at) - timestampMs(b.updated_at),
-  ]) {
-    if (delta !== 0) return delta;
-  }
-  return numberish(a.id) - numberish(b.id);
-}
-
 function rank(table: Record<string, number>, value: unknown): number {
   return table[String(value ?? "").toLowerCase()] ?? -1;
-}
-
-function numberish(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : Number(value) || 0;
-}
-
-function timestampMs(value: unknown): number {
-  const n = Date.parse(String(value ?? ""));
-  return Number.isFinite(n) ? n : 0;
-}
-
-function findingRichness(row: Record<string, unknown>): number {
-  return ["description", "evidence", "exploit_sketch", "fix"].reduce((sum, key) => sum + String(row[key] ?? "").trim().length, 0);
 }
 
 function findingCounts(rows: Array<Record<string, unknown>>): Record<string, number> {
@@ -3520,16 +3618,6 @@ function findingCounts(rows: Array<Record<string, unknown>>): Record<string, num
     counts[status] = (counts[status] ?? 0) + 1;
   }
   return counts;
-}
-
-function globalFindingStats(rows: Array<Record<string, unknown>>): { total: number; active: number; byStatus: Record<string, number>; byTracking: Record<string, number> } {
-  const byStatus = findingCounts(rows);
-  const byTracking: Record<string, number> = {};
-  for (const row of rows) {
-    const tracking = String(row.tracking_status ?? "open") || "open";
-    byTracking[tracking] = (byTracking[tracking] ?? 0) + 1;
-  }
-  return { total: rows.length, active: rows.filter((row) => !isIgnoredFinding(row)).length, byStatus, byTracking };
 }
 
 function confirmDecisionsList(c: Ctx): void {
@@ -3565,6 +3653,233 @@ function annotateConfirmDecisionMaterialStaleness(
     stale_since_prepare_run_id: materialBoundary?.id,
     stale_since_prepare_started_at: activePrepareRefreshStartedAt ?? materialBoundary?.started_at,
   };
+}
+
+// ---- durable run groups + work items --------------------------------------
+
+function runGroupList(c: Ctx): void {
+  const limit = clampInt(c.url.searchParams.get("limit"), 100, 1, 500);
+  const offset = clampInt(c.url.searchParams.get("offset"), 0, 0, 1_000_000);
+  const groups = c.store.listRunGroups(limit, offset).map((group) => runGroupApiRow(c.store, group));
+  sendJson(c.res, 200, { runGroups: groups, total: c.store.countRunGroups(), limit, offset });
+}
+
+async function runGroupCreate(c: Ctx): Promise<void> {
+  const body = objectValue(await readBody(c.req));
+  if (!body) return sendJson(c.res, 400, { error: "request body must be an object" });
+  try {
+    const rawItems = Array.isArray(body.items) ? body.items : [];
+    if (rawItems.length > 0) {
+      const manifest = normalizeRunGroupManifest({ version: body.version ?? 1, ...body, items: rawItems });
+      const group = c.store.createRunGroup({ name: manifest.name, kind: manifest.kind, parallelism: manifest.parallelism, config: manifest.config, budget: manifest.budget });
+      c.store.addWorkItems(Number(group.id), manifest.items);
+      return sendJson(c.res, 201, runGroupApiRow(c.store, c.store.getRunGroupById(Number(group.id))!));
+    }
+    const name = stringValue(body.name).trim();
+    if (!name) return sendJson(c.res, 400, { error: "name is required" });
+    const parallelism = optionalPositiveInt(body.parallelism, 1);
+    if (parallelism === undefined) return sendJson(c.res, 400, { error: "parallelism must be a positive integer" });
+    const group = c.store.createRunGroup({
+      name,
+      kind: stringValue(body.kind).trim() || "evaluation",
+      parallelism,
+      ...(objectValue(body.config) ? { config: body.config } : {}),
+      ...(objectValue(body.budget ?? body.budgets) ? { budget: body.budget ?? body.budgets } : {}),
+    });
+    sendJson(c.res, 201, runGroupApiRow(c.store, group));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    sendJson(c.res, /UNIQUE constraint failed/.test(message) ? 409 : 400, { error: message });
+  }
+}
+
+function runGroupGet(c: Ctx): void {
+  const group = c.store.getRunGroupByUuid(c.params.uuid ?? "");
+  group ? sendJson(c.res, 200, runGroupApiRow(c.store, group)) : sendJson(c.res, 404, { error: "no such run group" });
+}
+
+async function runGroupItemsAdd(c: Ctx): Promise<void> {
+  const group = c.store.getRunGroupByUuid(c.params.uuid ?? "");
+  if (!group) return sendJson(c.res, 404, { error: "no such run group" });
+  if (group.state !== "draft" && group.state !== "paused") return sendJson(c.res, 409, { error: "work items may only be appended while a group is draft or paused" });
+  const body = objectValue(await readBody(c.req));
+  const rawItems = body && Array.isArray(body.items) ? body.items : [];
+  if (rawItems.length === 0) return sendJson(c.res, 400, { error: "items must be a non-empty array" });
+  try {
+    c.store.addWorkItems(Number(group.id), rawItems.map((item, index) => normalizeWorkItemInput(item, index)));
+    sendJson(c.res, 200, runGroupApiRow(c.store, c.store.getRunGroupById(Number(group.id))!));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    sendJson(c.res, /UNIQUE constraint failed/.test(message) ? 409 : 400, { error: message });
+  }
+}
+
+async function runGroupStart(c: Ctx): Promise<void> {
+  const group = c.store.getRunGroupByUuid(c.params.uuid ?? "");
+  if (!group) return sendJson(c.res, 404, { error: "no such run group" });
+  if (c.store.listWorkItems(Number(group.id)).length === 0) return sendJson(c.res, 409, { error: "run group has no work items" });
+  const body = objectValue(await readBody(c.req)) ?? {};
+  const parallelism = body.parallelism === undefined ? undefined : optionalPositiveInt(body.parallelism, undefined);
+  if (body.parallelism !== undefined && parallelism === undefined) return sendJson(c.res, 400, { error: "parallelism must be a positive integer" });
+  if (!c.store.startRunGroup(String(group.uuid), parallelism)) return sendJson(c.res, 409, { error: `run group cannot start from state ${String(group.state)}` });
+  const scheduled = scheduleRunGroup(c, Number(group.id));
+  sendJson(c.res, 200, { ...runGroupApiRow(c.store, c.store.getRunGroupById(Number(group.id))!), scheduled });
+}
+
+function runGroupPause(c: Ctx): void {
+  const group = c.store.getRunGroupByUuid(c.params.uuid ?? "");
+  if (!group) return sendJson(c.res, 404, { error: "no such run group" });
+  if (group.state !== "running") return sendJson(c.res, 409, { error: "only a running group can be paused" });
+  c.store.setRunGroupState(String(group.uuid), "paused");
+  sendJson(c.res, 200, runGroupApiRow(c.store, c.store.getRunGroupById(Number(group.id))!));
+}
+
+function runGroupCancel(c: Ctx): void {
+  const group = c.store.getRunGroupByUuid(c.params.uuid ?? "");
+  if (!group) return sendJson(c.res, 404, { error: "no such run group" });
+  if (group.state === "finished" || group.state === "failed" || group.state === "cancelled") {
+    return sendJson(c.res, 409, { error: `run group cannot be cancelled from state ${String(group.state)}` });
+  }
+  const jobs = c.store.cancelRunGroupItems(Number(group.id));
+  for (const jobId of jobs) {
+    c.store.cancelJob(jobId, "run group cancelled by operator");
+    c.plane.cancel(jobId);
+  }
+  c.store.setRunGroupState(String(group.uuid), "cancelled");
+  sendJson(c.res, 200, { ...runGroupApiRow(c.store, c.store.getRunGroupById(Number(group.id))!), canceledJobs: jobs });
+}
+
+function runGroupReport(c: Ctx): void {
+  const group = c.store.getRunGroupByUuid(c.params.uuid ?? "");
+  if (!group) return sendJson(c.res, 404, { error: "no such run group" });
+  c.store.refreshRunGroupCompletion(Number(group.id));
+  const current = c.store.getRunGroupById(Number(group.id))!;
+  sendJson(c.res, 200, { group: current, ...renderRunGroupReport(current, c.store.listWorkItems(Number(group.id))) });
+}
+
+function workItemGet(c: Ctx): void {
+  const item = c.store.getWorkItem(Number(c.params.id));
+  item ? sendJson(c.res, 200, { workItem: workItemApiRow(c.store, item) }) : sendJson(c.res, 404, { error: "no such work item" });
+}
+
+function workItemRetry(c: Ctx): void {
+  const item = c.store.getWorkItem(Number(c.params.id));
+  if (!item) return sendJson(c.res, 404, { error: "no such work item" });
+  if (!c.store.retryBlockedWorkItem(Number(item.id))) {
+    return sendJson(c.res, 409, { error: "only blocked failed/cancelled work items in a non-cancelled group can be retried" });
+  }
+  const group = c.store.getRunGroupById(Number(item.run_group_id))!;
+  const scheduled = group.state === "running" ? scheduleRunGroup(c, Number(group.id)) : 0;
+  sendJson(c.res, 200, { ...runGroupApiRow(c.store, c.store.getRunGroupById(Number(group.id))!), scheduled });
+}
+
+function runGroupApiRow(store: MetadataStore, group: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...group,
+    config: parseStoredJson(group.config_json),
+    budget: parseStoredJson(group.budget_json),
+    summary: parseStoredJson(group.summary_json),
+    items: store.listWorkItems(Number(group.id)).map((item) => workItemApiRow(store, item)),
+  };
+}
+
+function workItemApiRow(store: MetadataStore, item: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...item,
+    targetBundle: parseStoredJson(item.target_bundle_json),
+    materialPolicy: parseStoredJson(item.material_policy_json),
+    evidenceContract: parseStoredJson(item.evidence_contract_json),
+    result: parseStoredJson(item.result_json),
+    attemptHistory: store.listWorkItemAttempts(Number(item.id)).map((attempt) => ({
+      ...attempt,
+      result: parseStoredJson(attempt.result_json),
+    })),
+  };
+}
+
+function scheduleRunGroup(c: Ctx, runGroupId: number): number {
+  return scheduleRunGroupWith(c.store, c.plane, runGroupId);
+}
+
+function scheduleRunGroupWith(store: MetadataStore, plane: ControlPlane, runGroupId: number): number {
+  const group = store.getRunGroupById(runGroupId);
+  if (!group || group.state !== "running") return 0;
+  let scheduled = 0;
+  while (true) {
+    const pending = store.pendingRunGroupDispatch(runGroupId, Number(group.parallelism) || 1);
+    if (pending.length === 0) break;
+    let progressed = false;
+    for (const item of pending) {
+      try {
+        const spec = buildWorkItemLaunchSpec(item, group);
+        const bundle = parseStoredJson(item.target_bundle_json);
+        const daemonId = typeof bundle?.daemonId === "number" ? bundle.daemonId : undefined;
+        const jobId = store.enqueueJob(evaluationTrackingProjectName(item), spec, daemonId);
+        if (!store.attachWorkItemJob(Number(item.id), jobId)) {
+          store.cancelJob(jobId, "work item was concurrently scheduled");
+          continue;
+        }
+        scheduled += 1;
+        progressed = true;
+      } catch (error) {
+        progressed = store.failUnscheduledWorkItem(Number(item.id), "invalid", error instanceof Error ? error.message : String(error)) || progressed;
+      }
+    }
+    if (!progressed) break;
+  }
+  store.refreshRunGroupCompletion(runGroupId);
+  if (scheduled > 0) plane.nudge();
+  return scheduled;
+}
+
+function settleRunGroupWorkItem(c: Ctx, jobId: number, status: "done" | "error" | "canceled", error?: string): void {
+  settleRunGroupWorkItemWith(c.store, c.plane, jobId, status, error);
+}
+
+function settleRunGroupWorkItemWith(store: MetadataStore, plane: ControlPlane, jobId: number, status: "done" | "error" | "canceled", error?: string): void {
+  const item = store.getWorkItemByJob(jobId);
+  if (!item) return;
+  const group = store.getRunGroupById(Number(item.run_group_id));
+  if (!group) return;
+  const job = store.getJob(jobId);
+  const runId = job && typeof job.run_id === "number" ? job.run_id : undefined;
+  const run = runId !== undefined ? store.getRun(runId) : undefined;
+  const projectId = run && typeof run.project_id === "number" ? run.project_id : typeof item.project_id === "number" ? item.project_id : undefined;
+  const findings = projectId === undefined ? [] : store.listFindings(projectId).filter((finding) => runId === undefined || finding.run_id === runId);
+  const settlement = settleWorkItem({ item, jobStatus: status, ...(error ? { jobError: error } : {}), ...(run ? { run } : {}), findings });
+  store.settleWorkItemByJob(jobId, settlement.state, settlement.outcome, settlement.result, settlement.error);
+  store.refreshRunGroupCompletion(Number(group.id));
+  if (store.getRunGroupById(Number(group.id))?.state === "running") scheduleRunGroupWith(store, plane, Number(group.id));
+}
+
+function reconcileTerminalRunGroupItems(store: MetadataStore, plane: ControlPlane): void {
+  for (const group of store.listRunGroups(10_000, 0)) {
+    if (group.state !== "running" && group.state !== "paused") continue;
+    for (const item of store.listWorkItems(Number(group.id))) {
+      if (typeof item.job_id !== "number" || (item.state !== "queued" && item.state !== "claimed" && item.state !== "running")) continue;
+      const job = store.getJob(item.job_id);
+      const status = job?.status;
+      if (status === "done" || status === "error" || status === "canceled") {
+        settleRunGroupWorkItemWith(store, plane, item.job_id, status, typeof job?.error === "string" ? job.error : undefined);
+      }
+    }
+  }
+}
+
+function parseStoredJson(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+function optionalPositiveInt(value: unknown, fallback: number | undefined): number | undefined {
+  if (value === undefined || value === null) return fallback;
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
 // ---- providers (model-strategy profiles) ----------------------------------
@@ -4096,8 +4411,19 @@ async function daemonRunStart(c: Ctx): Promise<void> {
   if ((!additional && job.status !== "dispatched") || (additional && job.status !== "running")) {
     return sendJson(c.res, 409, { error: additional ? "pipeline phase can only be appended to a running job" : "job must be claimed before starting a run" });
   }
-  const existing = c.store.getProject(name);
-  const projectId = existing ? Number(existing.id) : c.store.upsertProject({ name, config: body.budgets });
+  const workItem = c.store.getWorkItemByJob(body.jobId);
+  // Evaluation jobs may carry an older target-shaped queue name from a pre-isolation DB.
+  // The durable work-item identity is authoritative, so both old queued jobs and new ones
+  // land in a hidden evaluation project instead of reusing a same-named operator project.
+  const trackingName = workItem ? evaluationTrackingProjectName(workItem) : name;
+  const existing = c.store.getProject(trackingName);
+  const expectedOrigin = workItem ? "evaluation" : "project";
+  if (existing && existing.origin !== expectedOrigin) {
+    return sendJson(c.res, 409, { error: `${expectedOrigin} tracking identity collides with an existing ${String(existing.origin)} project` });
+  }
+  const projectId = existing
+    ? Number(existing.id)
+    : c.store.upsertProject({ name: trackingName, origin: expectedOrigin, config: body.budgets });
   const runId = c.store.startRun({
     projectId,
     kind: body.kind ?? "run",
@@ -4128,6 +4454,8 @@ async function daemonRunUpdate(c: Ctx): Promise<void> {
     confirmDecisions?: Parameters<MetadataStore["upsertConfirmDecisions"]>[2];
     decisionPath?: string;
     runScopes?: { done: number; target: number };
+    materialFingerprint?: string;
+    phaseAttempt?: Parameters<MetadataStore["recordFindingPhaseAttempt"]>[2];
     stage?: { name: string; info: Record<string, unknown> };
     health?: Parameters<MetadataStore["recordRunHealth"]>[1];
     backlog?: Parameters<MetadataStore["replaceDiscoveryBacklog"]>[2];
@@ -4139,6 +4467,8 @@ async function daemonRunUpdate(c: Ctx): Promise<void> {
     c.store.updateRunCoverage(runId, c.store.scopeProgress(projectId));
   }
   if (body.runScopes) c.store.updateRunScopes(runId, body.runScopes.done, body.runScopes.target);
+  if (typeof body.materialFingerprint === "string" && body.materialFingerprint.trim()) c.store.updateRunMaterialFingerprint(runId, body.materialFingerprint.trim());
+  if (body.phaseAttempt) c.store.recordFindingPhaseAttempt(projectId, runId, body.phaseAttempt);
   if (body.stage) c.store.recordStage(runId, body.stage.name, body.stage.info);
   if (body.health) c.store.recordRunHealth(runId, body.health);
   if (body.backlog) c.store.replaceDiscoveryBacklog(projectId, runId, body.backlog);
@@ -4254,7 +4584,30 @@ function verifyWorklist(store: MetadataStore, projectId: number, currentResultRu
       if (!fromStart || row.confirm_status != null) return false;
       return status === "confirmed-executable" || status === "confirmed-differential";
     })
-    .map((row) => normalizeProjectVerifyFindings(store, projectId, findingDetailRow(row)));
+    .map((row) => {
+      const inputFingerprint = findingPhaseFingerprint(store, row, "verify", materialBoundary);
+      return { row, inputFingerprint };
+    })
+    .filter(({ row, inputFingerprint }) => store.phaseEligible(projectId, "finding", Number(row.id), "verify", inputFingerprint))
+    .map(({ row, inputFingerprint }) => ({
+      ...(normalizeProjectVerifyFindings(store, projectId, findingDetailRow(row)) as Record<string, unknown>),
+      _phaseAttempt: { subjectType: "finding", subjectId: Number(row.id), inputFingerprint },
+    }));
+}
+
+function findingPhaseFingerprint(store: MetadataStore, row: Record<string, unknown>, phase: "verify" | "confirm" | "report", boundary?: Record<string, unknown>): string {
+  const full = Number.isFinite(Number(row.id)) ? store.getFinding(Number(row.id)) ?? row : row;
+  const runId = Number(full.run_id);
+  const run = Number.isFinite(runId) ? store.getRun(runId) : undefined;
+  return phaseInputFingerprint({
+    phase,
+    material: run?.material_fingerprint ?? boundary?.material_fingerprint ?? null,
+    findingId: Number(full.id),
+    canonicalKey: full.canonical_key ?? full.finding_key,
+    status: full.status,
+    ...(phase === "verify" ? { confirmStatus: full.confirm_status ?? null } : {}),
+    updatedAt: full.updated_at,
+  });
 }
 
 async function daemonJobStatus(c: Ctx): Promise<void> {
@@ -4282,6 +4635,7 @@ async function daemonJobStatus(c: Ctx): Promise<void> {
       if (run && run.status === "running") c.store.finishRun(runId, status === "canceled" ? "killed" : "error");
     }
   }
+  settleRunGroupWorkItem(c, jobId, status, body.error);
   sendJson(c.res, 200, { ok: true });
 }
 
@@ -4322,11 +4676,13 @@ function reconcileLostExecutorJobs(store: MetadataStore, plane: ControlPlane): n
     const freshDaemonLostJob = daemonHasFreshHeartbeat && timestampOlderThan(jobTouchedAt, DAEMON_LOST_JOB_GRACE_MS);
     if (!freshDaemonLostJob && !activity?.staleActivity) continue;
 
-    store.setJobStatus(jobId, "canceled", daemonOnline ? "executor no longer holds this job" : "executor offline before completion");
+    const error = daemonOnline ? "executor no longer holds this job" : "executor offline before completion";
+    store.setJobStatus(jobId, "canceled", error);
     if (runId !== undefined) {
       const run = store.getRun(runId);
       if (run && run.status === "running") store.finishRun(runId, "killed");
     }
+    settleRunGroupWorkItemWith(store, plane, jobId, "canceled", error);
     changed += 1;
   }
   return changed;
@@ -4468,6 +4824,16 @@ function normalizeProjectStatusFilter(value: string | null | undefined): Project
   return PROJECT_STATUS_FILTERS.includes(value as ProjectStatusFilter) ? value as ProjectStatusFilter : undefined;
 }
 
+function normalizeProjectOriginFilter(value: string | null | undefined): NonNullable<ProjectListOptions["origin"]> | undefined {
+  if (!value) return "project";
+  return value === "project" || value === "evaluation" || value === "all" ? value : undefined;
+}
+
+function normalizeFindingSourceFilter(value: string | null | undefined): "project" | "evaluation" | "all" | undefined {
+  if (!value) return "project";
+  return value === "project" || value === "evaluation" || value === "all" ? value : undefined;
+}
+
 function emptyProjectStatusCounts(total = 0): ProjectStatusCounts {
   return { all: total, running: 0, "needs-work": 0, done: 0, failed: 0, "not-started": 0 };
 }
@@ -4511,7 +4877,7 @@ function projectListResponse(
 ): { projects: Array<Record<string, unknown>>; total: number; limit: number; offset: number; statusCounts: ProjectStatusCounts } {
   const limit = typeof options.limit === "number" && Number.isFinite(options.limit) ? Math.max(1, Math.floor(options.limit)) : 100;
   const offset = typeof options.offset === "number" && Number.isFinite(options.offset) ? Math.max(0, Math.floor(options.offset)) : 0;
-  const allRows = projectSnapshots(store, { archived: options.archived, search: options.search });
+  const allRows = projectSnapshots(store, { archived: options.archived, origin: options.origin, search: options.search });
   const statusCounts = countProjectStatuses(allRows);
   const filteredRows = status ? allRows.filter((row) => projectSnapshotStatus(row) === status) : allRows;
   return { projects: filteredRows.slice(offset, offset + limit), total: filteredRows.length, limit, offset, statusCounts };
@@ -4520,7 +4886,10 @@ function projectListResponse(
 function projectSnapshots(store: MetadataStore, options: ProjectListOptions = {}): Array<Record<string, unknown>> {
   const runningJobs = store.runningJobs();
   const activeByTarget = new Map<string, number>();
-  for (const job of runningJobs) activeByTarget.set(String(job.project), (activeByTarget.get(String(job.project)) ?? 0) + 1);
+  for (const job of runningJobs) {
+    if (store.getWorkItemByJob(Number(job.id))) continue;
+    activeByTarget.set(String(job.project), (activeByTarget.get(String(job.project)) ?? 0) + 1);
+  }
   return store.listProjects(options).map((project) => {
     const id = Number(project.id);
     const allRuns = store.listRuns(id);
@@ -4556,6 +4925,7 @@ function projectSnapshots(store: MetadataStore, options: ProjectListOptions = {}
       id,
       uuid: project.uuid,
       name: project.name,
+      origin: project.origin ?? "project",
       provider_id: project.provider_id ?? null,
       daemon_id: project.daemon_id ?? null,
       dir: project.dir ?? null,
@@ -4709,6 +5079,7 @@ function launchSpec(store: MetadataStore, project: Record<string, unknown>, body
     maxSteps: num(merged.maxSteps),
     digSamples: num(merged.digSamples),
     digConcurrency: num(merged.digConcurrency),
+    verifyConcurrency: num(merged.verifyConcurrency),
     sandboxBackend: backend(merged.sandboxBackend),
     sandboxImage: str(merged.sandboxImage),
     sandboxAllowHostFallback: typeof merged.sandboxAllowHostFallback === "boolean" ? merged.sandboxAllowHostFallback : undefined,
@@ -4760,6 +5131,7 @@ function runBodyConfigOverrides(body: Record<string, unknown>): Record<string, u
     "maxSteps",
     "digSamples",
     "digConcurrency",
+    "verifyConcurrency",
     "sandboxBackend",
     "sandboxImage",
     "sandboxAllowHostFallback",

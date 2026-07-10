@@ -1,12 +1,49 @@
 # Product Capability Expansion Plan
 
-This document is a product and engineering plan, not an implementation change.
-It should be reviewed and accepted before development starts.
+This document is the product and engineering plan for the capability-expansion
+layer. The durable evaluation foundation described below is now implemented;
+later concrete features remain explicitly tracked here rather than being
+silently presented as shipped.
 
 The design goal is balanced abstraction. Flounder should abstract repeated
 shapes such as batch work, benchmark cases, evidence gates, and replayable
 outputs. It should not wrap every concrete capability in a generic adapter just
 because it might vary someday.
+
+## Implementation Status
+
+Implemented foundation:
+
+- SQLite-backed run groups and independently resumable work items;
+- bounded scheduling through the existing daemon job queue, including
+  pause/resume/cancel, attempt history, terminal reconciliation, and restart
+  recovery;
+- schema-validated target bundles, blind/informed material policy, evidence
+  contracts, and capability-surface context;
+- `audit-target`, `verify-claim`, `benchmark-case`, and `regression-replay`
+  work items mapped onto the existing sealed `run` / `audit --verify` kernel;
+- CLI and self-describing API control plus reports regenerated from persisted
+  results without rerunning model work;
+- an Evaluations dashboard with run-group search and filtering, group creation,
+  validated work-item entry, start/pause/cancel/retry controls, evidence-aware
+  scoring, attempt history, and persisted Markdown reports;
+- strict separation of lifecycle, security outcome, and benchmark acceptance;
+  infrastructure failure is `blocked`, never a negative security result;
+- immutable per-dispatch attempt evidence plus blocked-only retry, healthy-run
+  scoring, required-refutation completeness checks, and fail-closed corpus
+  decisions.
+
+Still planned:
+
+- model-generated capability-surface preparation (the current foundation
+  accepts an explicit validated surface in a target bundle);
+- source-control history context and evidence-package export;
+- suite-specific benchmark translators where the generic manifest is
+  insufficient;
+- verifier-grounded failure mining and bounded harness-candidate proposal.
+
+The evaluator, material policy, sandbox, command safety, confirmation gate, and
+promotion decision remain outside any future harness self-improvement loop.
 
 ## Principles
 
@@ -214,6 +251,8 @@ POST /api/run-groups/:uuid/start
 POST /api/run-groups/:uuid/pause
 POST /api/run-groups/:uuid/cancel
 GET  /api/run-groups/:uuid/report
+GET  /api/work-items/:id
+POST /api/work-items/:id/retry
 ```
 
 ### CLI
@@ -222,6 +261,8 @@ GET  /api/run-groups/:uuid/report
 flounder group create --name <name> --manifest <file>
 flounder group start <uuid-or-name> [--parallel <n>]
 flounder group status <uuid-or-name>
+flounder group pause|cancel <uuid-or-name>
+flounder group retry <work-item-id>
 flounder group report <uuid-or-name>
 ```
 
@@ -250,7 +291,7 @@ evidence accounting, even though their inputs differ.
 - `uuid`
 - `run_group_id`
 - `item_key`: stable producer-provided id
-- `kind`: `audit-target | verify-claim | benchmark-case | replay-evidence |
+- `kind`: `audit-target | verify-claim | benchmark-case | regression-replay |
   custom`
 - `state`: `queued | claimed | running | finished | failed | cancelled`
 - `outcome`: `null | reproduced | confirmed | not_reproduced | refuted |
@@ -259,7 +300,7 @@ evidence accounting, even though their inputs differ.
 - `material_policy_json`
 - `evidence_contract_json`
 - `result_json`
-- `project_id`, `run_id`, `finding_id` when linked to existing records
+- `project_id`, `run_id`, and `job_id` when linked to existing records
 - `attempts`
 - `last_error`
 
@@ -280,6 +321,7 @@ The first implementation should support only the smallest complete set:
 
 - verify-like reproduction items
 - audit-target items
+- benchmark-case items
 - regression-replay items
 
 ### Acceptance Criteria
@@ -356,9 +398,10 @@ Write `material_manifest.json`:
 
 - The operator or manifest producer provides labels and provenance.
 - Automatic classification may warn, but it must not be the sole authority.
-- Blind mode excludes material labeled as disclosure, incident detail, exploit
-  recipe, benchmark answer, issue discussion, or unknown high-risk material
-  unless the operator explicitly overrides it.
+- Blind mode rejects inclusion of material labeled as disclosure, incident
+  detail, exploit recipe, benchmark answer, issue discussion, or unknown
+  high-risk material. Use an explicitly recorded informed posture instead of
+  silently overriding blind mode.
 - Informed mode may include richer material, but the run metadata must say so.
 
 ### Acceptance Criteria
@@ -618,7 +661,7 @@ because the export profiles are product policy, not extension points.
 9. Add private evidence replay and public export checks.
 10. Add capability surface preparation.
 11. Add source-control history context.
-12. Add UI views after the API and store model are stable.
+12. Add UI views after the API and store model are stable. (Implemented.)
 
 This order builds only the generic substrate needed by multiple immediate
 features, then adds concrete features one at a time.
@@ -659,12 +702,11 @@ features, then adds concrete features one at a time.
 
 ### UI Tests
 
-Only after UI implementation:
-
 - run-group list and detail views
-- item status filters
-- blocker grouping
-- report links
+- item and group lifecycle controls
+- blocker visibility and blocked-only retry
+- persisted report access
+- scoring math for positive, control, blocked, and invalid cases
 - no conflation of lifecycle state and security outcome
 
 ## Failure Modes To Cover
