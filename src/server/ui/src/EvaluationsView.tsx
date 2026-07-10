@@ -42,11 +42,12 @@ interface EvaluationsWorkspaceProps {
   selectedUuid?: string;
   providers: ProviderProfile[];
   daemons: DaemonRow[];
+  maintainerMode: boolean;
   onSelect: (uuid?: string) => void;
   onToast: (tone: ToastTone, message: string) => void;
 }
 
-export function EvaluationsWorkspace({ selectedUuid, providers, daemons, onSelect, onToast }: EvaluationsWorkspaceProps) {
+export function EvaluationsWorkspace({ selectedUuid, providers, daemons, maintainerMode, onSelect, onToast }: EvaluationsWorkspaceProps) {
   const [groups, setGroups] = useState<RunGroupRow[]>([]);
   const [experiments, setExperiments] = useState<HarnessExperimentRow[]>([]);
   const [railMode, setRailMode] = useState<"runs" | "evolution">("runs");
@@ -88,7 +89,10 @@ export function EvaluationsWorkspace({ selectedUuid, providers, daemons, onSelec
   const refresh = useCallback(async (quiet = false) => {
     if (!quiet) setLoading(true);
     try {
-      const [groupResponse, experimentResponse] = await Promise.all([api.runGroups(), api.harnessExperiments()]);
+      const [groupResponse, experimentResponse] = await Promise.all([
+        api.runGroups(),
+        maintainerMode ? api.harnessExperiments() : Promise.resolve({ experiments: [], total: 0, limit: 0, offset: 0 }),
+      ]);
       let next = groupResponse.runGroups.sort(sortGroups);
       let nextExperiments = experimentResponse.experiments.sort(sortExperiments);
       if (selectedUuid) {
@@ -107,10 +111,12 @@ export function EvaluationsWorkspace({ selectedUuid, providers, daemons, onSelec
           try {
             next = [await api.runGroup(selectedUuid), ...next].sort(sortGroups);
           } catch {
-            try {
-              nextExperiments = [await api.harnessExperiment(selectedUuid), ...nextExperiments].sort(sortExperiments);
-            } catch {
-              // The lists still provide a useful workspace if a copied URL is stale.
+            if (maintainerMode) {
+              try {
+                nextExperiments = [await api.harnessExperiment(selectedUuid), ...nextExperiments].sort(sortExperiments);
+              } catch {
+                // The lists still provide a useful workspace if a copied URL is stale.
+              }
             }
           }
         }
@@ -123,7 +129,16 @@ export function EvaluationsWorkspace({ selectedUuid, providers, daemons, onSelec
     } finally {
       if (!quiet) setLoading(false);
     }
-  }, [selectedUuid]);
+  }, [maintainerMode, selectedUuid]);
+
+  useEffect(() => {
+    if (maintainerMode) return;
+    setRailMode("runs");
+    setExperiments([]);
+    setNewExperimentOpen(false);
+    setAttachCandidateOpen(false);
+    setRefineProposalOpen(false);
+  }, [maintainerMode]);
 
   useEffect(() => {
     void refresh();
@@ -224,10 +239,10 @@ export function EvaluationsWorkspace({ selectedUuid, providers, daemons, onSelec
           <div><h2>Evaluations</h2><Counter>{railMode === "runs" ? groups.length : experiments.length}</Counter></div>
           <Button size="sm" icon="package" onClick={() => railMode === "runs" ? setNewOpen(true) : setNewExperimentOpen(true)}>New</Button>
         </div>
-        <div className="evaluation-mode-switch" role="tablist" aria-label="Evaluation workspace mode">
+        {maintainerMode ? <div className="evaluation-mode-switch" role="tablist" aria-label="Evaluation workspace mode">
           <button role="tab" aria-selected={railMode === "runs"} className={railMode === "runs" ? "sel" : ""} onClick={() => { setRailMode("runs"); onSelect(); }}>Runs</button>
-          <button role="tab" aria-selected={railMode === "evolution"} className={railMode === "evolution" ? "sel" : ""} onClick={() => { setRailMode("evolution"); onSelect(); }}>Harness</button>
-        </div>
+          <button role="tab" aria-selected={railMode === "evolution"} className={railMode === "evolution" ? "sel" : ""} onClick={() => { setRailMode("evolution"); onSelect(); }}>Harness · Maintainer</button>
+        </div> : null}
         <div className="evaluation-filters">
           <div className="project-search-row evaluation-search-row">
             <Icon name="search" size={14} />
@@ -528,6 +543,10 @@ function WorkItemEntry({ group, item, open, retrying, onExpand, onRetry }: { gro
               <DetailLine label="Network" value={item.evidenceContract.networkPolicy} />
               <DetailLine label="Differential" value={item.evidenceContract.requiresDifferential ? "Required" : "Not required"} />
               <DetailLine label="Refutation" value={item.evidenceContract.requiresRefutation ? "Required" : "Not required"} />
+              {item.evidenceContract.expectedOutcome ? <DetailLine label="Case" value={item.evidenceContract.caseId ?? item.item_key} code /> : null}
+              {item.evidenceContract.caseFamily ? <DetailLine label="Family" value={item.evidenceContract.caseFamily} /> : null}
+              {item.evidenceContract.targetStack ? <DetailLine label="Stack" value={item.evidenceContract.targetStack} /> : null}
+              {item.evidenceContract.expectedOutcome ? <DetailLine label="Holdout" value={item.evidenceContract.holdout ? "Hidden from failure mining" : "Training-visible"} /> : null}
             </EvidenceBlock>
             <EvidenceBlock title="Recorded result">
               <DetailLine label="Score" value={typeof result.accepted === "boolean" ? result.accepted ? "Accepted" : "Failed" : "Not eligible"} />
@@ -619,6 +638,12 @@ function AddWorkItemModal({ group, daemons, onClose, onCreated }: { group: RunGr
   const [corpusPaths, setCorpusPaths] = useState("");
   const [daemonId, setDaemonId] = useState("");
   const [expectedOutcome, setExpectedOutcome] = useState<ExpectedOutcome>("detect-positive");
+  const [caseId, setCaseId] = useState("");
+  const [caseFamily, setCaseFamily] = useState("");
+  const [targetStack, setTargetStack] = useState("");
+  const [holdout, setHoldout] = useState(false);
+  const [mapSamples, setMapSamples] = useState("2");
+  const [digMaxSamples, setDigMaxSamples] = useState("3");
   const [posture, setPosture] = useState<WorkItemPayload["materialPolicy"]["posture"]>("blind");
   const [materialLabel, setMaterialLabel] = useState("specification");
   const [materialReason, setMaterialReason] = useState("Operator-authorized target documentation used as design intent.");
@@ -651,6 +676,7 @@ function AddWorkItemModal({ group, daemons, onClose, onCreated }: { group: RunGr
     const sources = splitLines(sourcePaths);
     const corpus = splitLines(corpusPaths);
     if (!itemKey.trim() || !target.trim() || sources.length === 0) return setError("Item key, target, and at least one source path are required.");
+    if (scoredKind && (!caseFamily.trim() || !targetStack.trim())) return setError("Scored evaluation items require a bug family and target stack for generalization scoring.");
     if (corpus.length && !materialAuthorized) return setError("Confirm that every corpus path and its label are operator-authorized.");
     if (posture === "blind" && /incident|post.?mortem|prior-audit|disclosure|exploit|issue/i.test(materialLabel)) return setError("Blind evaluations cannot include answer-bearing or disclosure material. Choose an informed posture or remove it.");
     let parsedClaim: unknown;
@@ -669,6 +695,7 @@ function AddWorkItemModal({ group, daemons, onClose, onCreated }: { group: RunGr
         corpusPaths: corpus,
         ...(buildRoot.trim() ? { buildRoot: buildRoot.trim() } : {}),
         ...(daemonId ? { daemonId: Number(daemonId) } : {}),
+        ...(scoredKind ? { mapSamples: Math.max(1, Number(mapSamples) || 1), digMaxSamples: Math.max(1, Number(digMaxSamples) || 1), adaptiveDig: true, eagerPrepare: true } : {}),
         ...(kind === "verify-claim" ? { claim: parsedClaim } : {}),
         ...(targetClass === "capability-surface" ? { capabilitySurface: { entrypoints: surfaceFields[0]!, inputs: surfaceFields[1]!, effects: surfaceFields[2]!, authorities: surfaceFields[3]!, boundaries: surfaceFields[4]!, localFixtures: surfaceFields[5]! } } : {}),
       },
@@ -683,7 +710,13 @@ function AddWorkItemModal({ group, daemons, onClose, onCreated }: { group: RunGr
         requiresDifferential,
         requiresRefutation,
         networkPolicy: "sealed",
-        ...(scoredKind ? { expectedOutcome } : {}),
+        ...(scoredKind ? {
+          expectedOutcome,
+          caseId: caseId.trim() || itemKey.trim(),
+          caseFamily: caseFamily.trim(),
+          targetStack: targetStack.trim(),
+          holdout,
+        } : {}),
       },
     };
     setSubmitting(true);
@@ -738,6 +771,14 @@ function AddWorkItemModal({ group, daemons, onClose, onCreated }: { group: RunGr
             <div className="field"><span>Network policy</span><div className="readonly-field">Sealed · local execution only</div></div>
             <label className="check-row"><input type="checkbox" checked={requiresDifferential} onChange={(event) => setRequiresDifferential(event.target.checked)} />Require differential confirmation</label>
             <label className="check-row"><input type="checkbox" checked={requiresRefutation} onChange={(event) => setRequiresRefutation(event.target.checked)} />Require independent refutation</label>
+            {scoredKind ? <>
+              <label className="field">Case ID<input value={caseId} onChange={(event) => setCaseId(event.target.value)} placeholder={itemKey || "stable-case-id"} /><small>Stable identity for paired baseline/candidate scoring.</small></label>
+              <label className="field">Bug family<input value={caseFamily} onChange={(event) => setCaseFamily(event.target.value)} placeholder="authorization-binding" /><small>Promotion needs distinct families, not repeated variants of one bug.</small></label>
+              <label className="field">Target stack<input value={targetStack} onChange={(event) => setTargetStack(event.target.value)} placeholder="solidity-foundry" /></label>
+              <label className="check-row"><input type="checkbox" checked={holdout} onChange={(event) => setHoldout(event.target.checked)} />Hidden holdout; exclude from candidate failure mining</label>
+              <label className="field">Map samples<input type="number" min="1" value={mapSamples} onChange={(event) => setMapSamples(event.target.value)} /><small>Independent scope inventories are unioned.</small></label>
+              <label className="field">Adaptive dig ceiling<input type="number" min="1" value={digMaxSamples} onChange={(event) => setDigMaxSamples(event.target.value)} /><small>Extra passes run only on incomplete or uncertain scope outcomes.</small></label>
+            </> : null}
           </div>
         </FormSection>
         {error ? <div className="evaluation-form-error">{error}</div> : null}

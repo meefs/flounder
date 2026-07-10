@@ -17,6 +17,9 @@ export type HarnessFailureKind = (typeof HARNESS_FAILURE_KINDS)[number];
 
 export interface HarnessPromotionPolicy {
   minimumSamplesPerClass: number;
+  minimumDistinctCases: number;
+  minimumDistinctFamilies: number;
+  minimumHoldoutCases: number;
   minimumImprovedCases: number;
   requireAllControlsPass: boolean;
   maxBlockedRate: number;
@@ -73,6 +76,12 @@ export interface HarnessEvidenceItem {
   reason: string | null;
   attempts: number;
   durationSeconds: number | null;
+  caseId: string | null;
+  caseFamily: string | null;
+  targetStack: string | null;
+  holdout: boolean;
+  failurePhase: string | null;
+  phaseFunnel: Record<string, unknown> | null;
 }
 
 export interface HarnessGroupSnapshot {
@@ -98,6 +107,12 @@ export interface HarnessScoreMetrics {
   positiveRecall: number | null;
   controlPassRate: number | null;
   blockedRate: number;
+  distinctPositiveCases: number;
+  distinctControlCases: number;
+  distinctFamilies: number;
+  distinctStacks: number;
+  holdouts: number;
+  holdoutsPassed: number;
 }
 
 export interface HarnessExperimentScorecard {
@@ -114,6 +129,9 @@ export interface HarnessExperimentScorecard {
 
 const DEFAULT_PROMOTION_POLICY: HarnessPromotionPolicy = {
   minimumSamplesPerClass: 2,
+  minimumDistinctCases: 2,
+  minimumDistinctFamilies: 2,
+  minimumHoldoutCases: 1,
   minimumImprovedCases: 1,
   requireAllControlsPass: true,
   maxBlockedRate: 0,
@@ -122,11 +140,8 @@ const DEFAULT_PROMOTION_POLICY: HarnessPromotionPolicy = {
 };
 
 const EDITABLE_HARNESS_FILES = new Set([
-  "src/agent/audit.ts",
-  "src/agent/discovery-artifacts.ts",
   "src/agent/loop.ts",
   "src/agent/memory.ts",
-  "src/agent/prepare.ts",
   "src/agent/prompts.ts",
 ]);
 
@@ -145,6 +160,9 @@ export function normalizeHarnessExperimentInput(input: unknown): HarnessExperime
     editableFiles: [...new Set(editableFiles)],
     promotionPolicy: {
       minimumSamplesPerClass: boundedInteger(policyRecord.minimumSamplesPerClass ?? policyRecord.minimum_samples_per_class, DEFAULT_PROMOTION_POLICY.minimumSamplesPerClass, 1, 100),
+      minimumDistinctCases: boundedInteger(policyRecord.minimumDistinctCases ?? policyRecord.minimum_distinct_cases, DEFAULT_PROMOTION_POLICY.minimumDistinctCases, 1, 100),
+      minimumDistinctFamilies: boundedInteger(policyRecord.minimumDistinctFamilies ?? policyRecord.minimum_distinct_families, DEFAULT_PROMOTION_POLICY.minimumDistinctFamilies, 1, 100),
+      minimumHoldoutCases: boundedInteger(policyRecord.minimumHoldoutCases ?? policyRecord.minimum_holdout_cases, DEFAULT_PROMOTION_POLICY.minimumHoldoutCases, 0, 100),
       minimumImprovedCases: boundedInteger(policyRecord.minimumImprovedCases ?? policyRecord.minimum_improved_cases, DEFAULT_PROMOTION_POLICY.minimumImprovedCases, 1, 100),
       requireAllControlsPass: booleanValue(policyRecord.requireAllControlsPass ?? policyRecord.require_all_controls_pass, DEFAULT_PROMOTION_POLICY.requireAllControlsPass),
       maxBlockedRate: boundedRatio(policyRecord.maxBlockedRate ?? policyRecord.max_blocked_rate, DEFAULT_PROMOTION_POLICY.maxBlockedRate, 0, 1),
@@ -190,9 +208,10 @@ export function normalizeHarnessProposal(input: unknown, editableFiles: string[]
 export function mineHarnessWeaknesses(items: HarnessEvidenceItem[]): HarnessFailurePattern[] {
   const grouped = new Map<string, HarnessFailurePattern>();
   for (const item of items) {
+    if (item.holdout) continue; // a hidden generalization case cannot teach the candidate
     const kind = failureKind(item);
     if (!kind) continue;
-    const mechanism = failureMechanism(kind, item.reason);
+    const mechanism = failureMechanism(kind, item.reason, item.failurePhase);
     const verifierCause = normalizeFailureCause(item.reason ?? defaultFailureCause(kind));
     const causalStatus = `${item.state}/${item.outcome ?? "no-outcome"}`;
     const fingerprint = createHash("sha256").update(`${kind}\n${mechanism}\n${verifierCause}`).digest("hex").slice(0, 16);
@@ -210,7 +229,10 @@ export function mineHarnessWeaknesses(items: HarnessEvidenceItem[]): HarnessFail
 
 export function minePreservedBehaviors(items: HarnessEvidenceItem[]): PreservedBehavior[] {
   return items
-    .filter((item) => item.accepted === true && item.expectedOutcome !== null)
+    // Holdouts belong only to the external evaluator. Leaking even a passing
+    // holdout's key and expected outcome into the candidate brief turns it into
+    // training data and invalidates the generalization gate.
+    .filter((item) => !item.holdout && item.accepted === true && item.expectedOutcome !== null)
     .map((item) => ({ workItemKey: item.itemKey, expectedOutcome: item.expectedOutcome!, evidenceGate: item.evidenceGate }))
     .sort((a, b) => a.workItemKey.localeCompare(b.workItemKey));
 }
@@ -268,6 +290,7 @@ export function scoreHarnessExperiment(
 
   const durationRatio = ratio(candidateMetrics.durationSeconds, baselineMetrics.durationSeconds);
   const attemptRatio = ratio(candidateMetrics.attempts, baselineMetrics.attempts);
+  const improvedCaseIds = new Set(improvedItemKeys.map((key) => candidateByKey.get(key)?.caseId ?? key));
   let decision: HarnessDecision;
   if (!comparableKeys || reasons.some((reason) => reason.includes("not comparable"))) {
     decision = "reject";
@@ -285,6 +308,21 @@ export function scoreHarnessExperiment(
   ) {
     decision = "needs-more-samples";
     reasons.push(`Each variant needs at least ${policy.minimumSamplesPerClass} scored positive and control samples.`);
+  } else if (
+    baselineMetrics.distinctPositiveCases < policy.minimumDistinctCases
+    || candidateMetrics.distinctPositiveCases < policy.minimumDistinctCases
+  ) {
+    decision = "needs-more-samples";
+    reasons.push(`Each variant needs at least ${policy.minimumDistinctCases} distinct positive cases; repeated samples of one case do not prove generalization.`);
+  } else if (baselineMetrics.distinctFamilies < policy.minimumDistinctFamilies || candidateMetrics.distinctFamilies < policy.minimumDistinctFamilies) {
+    decision = "needs-more-samples";
+    reasons.push(`Each variant needs at least ${policy.minimumDistinctFamilies} distinct case families.`);
+  } else if (baselineMetrics.holdouts < policy.minimumHoldoutCases || candidateMetrics.holdouts < policy.minimumHoldoutCases) {
+    decision = "needs-more-samples";
+    reasons.push(`Each variant needs at least ${policy.minimumHoldoutCases} hidden holdout case${policy.minimumHoldoutCases === 1 ? "" : "s"}.`);
+  } else if (candidateMetrics.holdoutsPassed !== candidateMetrics.holdouts) {
+    decision = "reject";
+    reasons.push("Every hidden holdout case must pass; holdouts are not available to candidate failure mining.");
   } else if (regressedItemKeys.length > 0) {
     decision = "reject";
     reasons.push(`${regressedItemKeys.length} previously passing case${regressedItemKeys.length === 1 ? "" : "s"} regressed.`);
@@ -300,12 +338,12 @@ export function scoreHarnessExperiment(
   } else if (attemptRatio !== null && attemptRatio > policy.maxAttemptRatio) {
     decision = "reject";
     reasons.push(`Candidate attempt ratio ${attemptRatio.toFixed(2)} exceeds the ${policy.maxAttemptRatio.toFixed(2)} budget.`);
-  } else if (improvedItemKeys.length < policy.minimumImprovedCases) {
+  } else if (improvedCaseIds.size < policy.minimumImprovedCases) {
     decision = "reject";
-    reasons.push(`Candidate improved ${improvedItemKeys.length} cases; policy requires at least ${policy.minimumImprovedCases}.`);
+    reasons.push(`Candidate improved ${improvedCaseIds.size} distinct cases; policy requires at least ${policy.minimumImprovedCases}.`);
   } else {
     decision = "promote";
-    reasons.push(`Candidate improved ${improvedItemKeys.length} cases with no paired regressions and kept every control passing.`);
+    reasons.push(`Candidate improved ${improvedCaseIds.size} distinct cases across ${improvedItemKeys.length} paired samples with no regressions and kept every control passing.`);
   }
 
   return {
@@ -354,6 +392,8 @@ export function renderHarnessCandidateBrief(input: {
     "## Promotion gate",
     "",
     `- At least ${input.policy.minimumSamplesPerClass} positive and ${input.policy.minimumSamplesPerClass} control samples per variant.`,
+    `- At least ${input.policy.minimumDistinctCases} distinct positive cases across ${input.policy.minimumDistinctFamilies} case families.`,
+    `- At least ${input.policy.minimumHoldoutCases} hidden holdout case${input.policy.minimumHoldoutCases === 1 ? "" : "s"}; holdouts are excluded from failure mining.`,
     `- At least ${input.policy.minimumImprovedCases} improved paired case${input.policy.minimumImprovedCases === 1 ? "" : "s"}; zero paired regressions.`,
     `- Candidate blocked rate at most ${formatRate(input.policy.maxBlockedRate)}.`,
     `- Candidate duration and attempt ratios at most ${input.policy.maxDurationRatio.toFixed(2)} and ${input.policy.maxAttemptRatio.toFixed(2)}.`,
@@ -365,11 +405,15 @@ export function renderHarnessCandidateBrief(input: {
   ].join("\n");
 }
 
-export function harnessEvidenceItemFromRow(row: Record<string, unknown>): HarnessEvidenceItem {
+export function harnessEvidenceItemFromRow(row: Record<string, unknown>, groupConfig: Record<string, unknown> = {}): HarnessEvidenceItem {
   const evidence = jsonRecord(row.evidenceContract ?? row.evidence_contract_json);
   const target = jsonRecord(row.targetBundle ?? row.target_bundle_json);
   const material = jsonRecord(row.materialPolicy ?? row.material_policy_json);
   const result = jsonRecord(row.result ?? row.result_json);
+  const phaseFunnel = jsonRecord(result.phaseFunnel ?? result.phase_funnel);
+  const caseId = typeof evidence.caseId === "string" ? evidence.caseId : typeof evidence.case_id === "string" ? evidence.case_id : null;
+  const caseFamily = typeof evidence.caseFamily === "string" ? evidence.caseFamily : typeof evidence.case_family === "string" ? evidence.case_family : null;
+  const targetStack = typeof evidence.targetStack === "string" ? evidence.targetStack : typeof evidence.target_stack === "string" ? evidence.target_stack : null;
   const expected = evidence.expectedOutcome ?? evidence.expected_outcome;
   const started = dateMillis(row.started_at);
   const ended = dateMillis(row.ended_at);
@@ -379,11 +423,30 @@ export function harnessEvidenceItemFromRow(row: Record<string, unknown>): Harnes
     outcome: typeof row.outcome === "string" ? row.outcome : null,
     expectedOutcome: expected === "detect-positive" || expected === "reject-positive" ? expected : null,
     evidenceGate: typeof evidence.kind === "string" ? evidence.kind : "unknown",
-    contractFingerprint: createHash("sha256").update(stableJson({ kind: row.kind, target, material, evidence })).digest("hex"),
+    contractFingerprint: createHash("sha256").update(stableJson({
+      kind: row.kind,
+      target,
+      material,
+      evidence,
+      // Provider/model/thinking may be inherited from the run group rather than
+      // repeated in each target bundle. Bind the effective settings so a candidate
+      // cannot win by silently switching to a stronger or different executor.
+      execution: {
+        provider: firstString(target.provider, groupConfig.provider),
+        model: firstString(target.model, groupConfig.model),
+        thinking: firstString(target.thinking, groupConfig.thinking),
+      },
+    })).digest("hex"),
     accepted: typeof result.accepted === "boolean" ? result.accepted : null,
     reason: firstString(result.reason, row.last_error, row.error),
     attempts: finiteInteger(row.attempts) ?? 0,
     durationSeconds: started !== null && ended !== null && ended >= started ? Math.round((ended - started) / 1000) : null,
+    caseId,
+    caseFamily,
+    targetStack,
+    holdout: evidence.holdout === true,
+    failurePhase: typeof phaseFunnel.failurePhase === "string" ? phaseFunnel.failurePhase : null,
+    phaseFunnel: Object.keys(phaseFunnel).length > 0 ? phaseFunnel : null,
   };
 }
 
@@ -391,6 +454,12 @@ function scoreMetrics(items: HarnessEvidenceItem[]): HarnessScoreMetrics {
   const scored = items.filter((item) => item.accepted !== null);
   const positives = scored.filter((item) => item.expectedOutcome === "detect-positive");
   const controls = scored.filter((item) => item.expectedOutcome === "reject-positive");
+  const holdoutItems = scored.filter((item) => item.holdout);
+  const holdoutsByCase = new Map<string, HarnessEvidenceItem[]>();
+  for (const item of holdoutItems) {
+    const key = item.caseId ?? item.itemKey;
+    holdoutsByCase.set(key, [...(holdoutsByCase.get(key) ?? []), item]);
+  }
   const durationValues = items.map((item) => item.durationSeconds).filter((value): value is number => value !== null);
   const blocked = items.filter((item) => item.outcome === "blocked" || item.state === "failed" || item.state === "cancelled").length;
   return {
@@ -409,6 +478,12 @@ function scoreMetrics(items: HarnessEvidenceItem[]): HarnessScoreMetrics {
     positiveRecall: positives.length ? positives.filter((item) => item.accepted === true).length / positives.length : null,
     controlPassRate: controls.length ? controls.filter((item) => item.accepted === true).length / controls.length : null,
     blockedRate: items.length ? blocked / items.length : 0,
+    distinctPositiveCases: new Set(positives.map((item) => item.caseId ?? item.itemKey)).size,
+    distinctControlCases: new Set(controls.map((item) => item.caseId ?? item.itemKey)).size,
+    distinctFamilies: new Set(positives.map((item) => item.caseFamily).filter(Boolean)).size,
+    distinctStacks: new Set(scored.map((item) => item.targetStack).filter(Boolean)).size,
+    holdouts: holdoutsByCase.size,
+    holdoutsPassed: [...holdoutsByCase.values()].filter((samples) => samples.every((item) => item.accepted === true)).length,
   };
 }
 
@@ -420,8 +495,9 @@ function failureKind(item: HarnessEvidenceItem): HarnessFailureKind | null {
   return null;
 }
 
-function failureMechanism(kind: HarnessFailureKind, cause: string | null): string {
+function failureMechanism(kind: HarnessFailureKind, cause: string | null, failurePhase: string | null): string {
   const normalized = (cause ?? "").toLowerCase();
+  if (failurePhase) return `${failurePhase} phase`;
   if (normalized.includes("refutation")) return "refutation completeness";
   if (normalized.includes("health")) return "run health";
   if (normalized.includes("build") || normalized.includes("prepare") || normalized.includes("compile")) return "target preparation";
