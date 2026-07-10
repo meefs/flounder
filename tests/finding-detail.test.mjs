@@ -83,7 +83,9 @@ test("upsertFindings with originId flips the ORIGINAL finding in place — no du
   const flipped = all[0];
   assert.equal(flipped.id, orig.id, "same row id");
   assert.equal(flipped.run_id, verifyRun, "source run moves to the verify run that holds the PoC artifact");
-  assert.equal(flipped.finding_key, verifyKey, "content key follows the verified artifact");
+  assert.equal(flipped.finding_key, key, "the canonical key stays immutable across verify updates");
+  assert.equal(store.setFindingConfirmStatus(pid, verifyKey, "reproduced"), true, "the verified artifact key remains an addressable alias");
+  store.setFindingConfirmStatus(pid, verifyKey, null);
   assert.equal(flipped.status, "confirmed-differential", "status flipped by the verdict");
   assert.equal(flipped.title, "CONFIRMED: Escape hatch root not bound", "verified title is now the current finding identity");
   assert.equal(flipped.report_path, "/runs/verify/report_f1.md", "confirm can recover the verify run dir from the report path");

@@ -32,6 +32,7 @@ test("api: GET /api is a self-describing catalog of every resource + operation",
       "GET /api/projects", "PATCH /api/projects/order", "POST /api/projects", "GET /api/projects/:uuid",
       "PATCH /api/projects/:uuid", "DELETE /api/projects/:uuid",
       "POST /api/projects/:uuid/runs", "GET /api/projects/:uuid/findings",
+      "GET /api/findings/:id/lifecycle", "POST /api/findings/:id/retry",
       "GET /api/projects/:uuid/scopes", "GET /api/projects/:uuid/backlog", "GET /api/projects/:uuid/confirm-decisions",
       "PATCH /api/backlog/:id",
       "GET /api/providers", "POST /api/providers", "GET /api/providers/:id",
@@ -717,7 +718,7 @@ test("api: standard pipeline continue finishes pending verify work before openin
   });
 });
 
-test("api: standard pipeline continue keeps reproduced needs-human decisions in confirm before opening the next scope batch", async () => {
+test("api: blocked confirm decisions stay idempotent until focused retry or explicit coverage continuation", async () => {
   await withServer(async (base, out) => {
     const json = (r) => r.json();
     const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -761,14 +762,11 @@ test("api: standard pipeline continue keeps reproduced needs-human decisions in 
       store.close();
     }
 
-    const pipeline = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "run", pipeline: true }));
-    assert.equal(pipeline.queued, true);
-    const pipelineJob = (await json(await fetch(base + "/api/jobs/" + pipeline.jobId))).job;
-    const pipelineSpec = JSON.parse(pipelineJob.spec_json);
-    assert.equal(pipelineSpec.pipeline, true);
-    assert.equal(pipelineSpec.coverageMode, "standard");
-    assert.equal(pipelineSpec.coverageTarget, 30);
-    assert.equal(pipelineSpec.maxScopes, 0);
+    const response = await post(`/api/projects/${created.uuid}/runs`, { verb: "run", pipeline: true });
+    assert.equal(response.status, 409);
+    const pipeline = await json(response);
+    assert.equal(pipeline.roundComplete, true);
+    assert.equal(pipeline.continueCoverageRequired, true);
   });
 });
 
@@ -817,7 +815,7 @@ test("api: standard pipeline continue resumes an interrupted batch before pendin
   });
 });
 
-test("api: successful later coverage clears stale interrupted-batch remainder before confirm readiness", async () => {
+test("api: successful later coverage clears stale interrupted remainder without rerunning an unchanged blocked confirm", async () => {
   await withServer(async (base, out) => {
     const json = (r) => r.json();
     const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -865,13 +863,11 @@ test("api: successful later coverage clears stale interrupted-batch remainder be
       store.close();
     }
 
-    const pipeline = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "run", pipeline: true }));
-    assert.equal(pipeline.queued, true);
-    const pipelineJob = (await json(await fetch(base + "/api/jobs/" + pipeline.jobId))).job;
-    const pipelineSpec = JSON.parse(pipelineJob.spec_json);
-    assert.equal(pipelineSpec.pipeline, true);
-    assert.equal(pipelineSpec.maxScopes, 0);
-    assert.equal(pipelineSpec.sandboxConfirmNetwork, "enabled");
+    const response = await post(`/api/projects/${created.uuid}/runs`, { verb: "run", pipeline: true });
+    assert.equal(response.status, 409);
+    const pipeline = await json(response);
+    assert.equal(pipeline.roundComplete, true);
+    assert.equal(pipeline.continueCoverageRequired, true);
   });
 });
 
@@ -1055,10 +1051,10 @@ test("api: daemon pipeline worklist exposes verify candidates before confirm", a
       body: JSON.stringify({ jobId, project: "pipeline-verify-worklist", phase: "verify" }),
     }));
     assert.equal(verify.phase, "verify");
-    assert.equal(verify.verifyFindings.length, 1);
-    assert.equal(verify.verifyFindings[0].id, suspectedId);
-    assert.equal(verify.verifyFindings[0].originId, suspectedId);
-    assert.equal(verify.verifyFindings[0].finding_key, "suspected-bug");
+    assert.equal(verify.verifyFindings.length, 2, "distinct claims are not hidden by title-similarity heuristics");
+    const original = verify.verifyFindings.find((finding) => finding.id === suspectedId);
+    assert.equal(original.originId, suspectedId);
+    assert.equal(original.finding_key, "suspected-bug");
 
     const restartVerify = await json(await fetch(base + "/api/daemon/pipeline-worklist", {
       method: "POST",
@@ -1067,7 +1063,7 @@ test("api: daemon pipeline worklist exposes verify candidates before confirm", a
     }));
     assert.equal(restartVerify.phase, "verify");
     assert.equal(restartVerify.verifyFromStart, true);
-    assert.deepEqual(new Set(restartVerify.verifyFindings.map((finding) => finding.finding_key)), new Set(["suspected-bug", "confirmed-bug"]));
+    assert.deepEqual(new Set(restartVerify.verifyFindings.map((finding) => finding.finding_key)), new Set(["suspected-bug", "duplicate-suspected-bug", "confirmed-bug"]));
 
     const confirm = await json(await fetch(base + "/api/daemon/pipeline-worklist", {
       method: "POST",
@@ -1075,17 +1071,25 @@ test("api: daemon pipeline worklist exposes verify candidates before confirm", a
       body: JSON.stringify({ jobId, project: "pipeline-verify-worklist", phase: "confirm" }),
     }));
     assert.ok(confirm.confirmKeys.includes("confirmed-bug"));
-    assert.ok(confirm.confirmKeys.includes("kgateblocked"), "confirm worklist retries reproduced needs-human decisions whose submission gates remain open");
+    assert.ok(!confirm.confirmKeys.includes("kgateblocked"), "the same blocked confirm input does not rerun without a focused retry request");
     assert.ok(!confirm.confirmKeys.includes("kalreadyreproduced"), "confirm worklist skips prior decided findings");
     assert.ok(confirm.confirmFindings.some((finding) => finding.id === "confirmed-bug" && finding.originId), "confirm worklist carries DB-backed finding seeds");
-    assert.ok(confirm.confirmFindings.some((finding) => finding.id === "kgateblocked" && finding.originId), "confirm worklist carries DB-backed seeds for submission-readiness retries");
+    assert.ok(!confirm.confirmFindings.some((finding) => finding.id === "kgateblocked"), "blocked confirmation stays visible in lifecycle evidence instead of draining again");
     assert.deepEqual(confirm.confirmSettledRows.map((row) => row.bug), ["prior reproduced withdrawal proof"]);
     assert.ok(confirm.confirmKeys.some((key) => /^origin:\d+:confirmed-bug$/.test(key)), "worklist carries origin selector for verify-artifact recovery");
 
     const detail = await json(await fetch(base + `/api/projects/${created.uuid}`));
     const suspected = detail.allFindings.find((finding) => finding.finding_key === "suspected-bug");
     assert.equal(suspected.timeline[0].reason, "synthesis");
-    assert.equal(detail.allFindings.some((finding) => finding.finding_key === "duplicate-suspected-bug"), false);
+    assert.equal(detail.allFindings.some((finding) => finding.finding_key === "duplicate-suspected-bug"), true, "semantic similarity is visible until exact canonical identity or explicit duplicate tracking resolves it");
+    const blocked = detail.allFindings.find((finding) => finding.finding_key === "kgateblocked");
+    await json(await fetch(base + `/api/findings/${blocked.id}/retry`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ phase: "confirm" }) }));
+    const retriedConfirm = await json(await fetch(base + "/api/daemon/pipeline-worklist", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ jobId, project: "pipeline-verify-worklist", phase: "confirm" }),
+    }));
+    assert.ok(retriedConfirm.confirmKeys.includes("kgateblocked"), "focused retry reopens only the blocked confirm phase");
   });
 });
 
@@ -3731,6 +3735,47 @@ test("api: project findings endpoint paginates detailed rows", async () => {
   });
 });
 
+test("api: finding lifecycle exposes occurrences and blocked phase attempts, then reopens a focused retry", async () => {
+  await withServer(async (base, out) => {
+    const json = (response) => response.json();
+    const created = await json(await fetch(base + "/api/projects", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "finding-lifecycle", sourcePaths: ["./src"] }),
+    }));
+    const store = MetadataStore.openForOutput(out);
+    let findingId;
+    try {
+      const runId = store.startRun({ projectId: created.id, kind: "run", runDir: path.join(out, "lifecycle-run"), materialFingerprint: "sha256:lifecycle" });
+      store.upsertFindings(created.id, runId, [{ findingKey: "klifecycle", title: "Lifecycle claim", location: "src/Lifecycle.sol:7", severity: "high", status: "suspected" }]);
+      findingId = Number(store.listFindings(created.id)[0].id);
+      const verifyRun = store.startRun({ projectId: created.id, kind: "verify", runDir: path.join(out, "lifecycle-verify"), materialFingerprint: "sha256:lifecycle" });
+      store.recordFindingPhaseAttempt(created.id, verifyRun, { subjectType: "finding", subjectId: findingId, phase: "verify", inputFingerprint: "sha256:verify-input", state: "blocked", outcome: "no-verdict", blocker: "compiler unavailable" });
+    } finally {
+      store.close();
+    }
+
+    const lifecycle = await json(await fetch(base + `/api/findings/${findingId}/lifecycle`));
+    assert.equal(lifecycle.occurrences.length, 1);
+    assert.equal(lifecycle.attempts.length, 1);
+    assert.equal(lifecycle.attempts[0].state, "blocked");
+    assert.match(lifecycle.attempts[0].blocker, /compiler unavailable/);
+
+    const retry = await json(await fetch(base + `/api/findings/${findingId}/retry`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ phase: "verify" }),
+    }));
+    assert.equal(retry.ok, true);
+    const after = MetadataStore.openForOutput(out);
+    try {
+      assert.equal(after.phaseEligible(created.id, "finding", findingId, "verify", "sha256:verify-input"), true);
+    } finally {
+      after.close();
+    }
+  });
+});
+
 test("api: ignored findings are hidden from active filters and can be recovered", async () => {
   await withServer(async (base, out) => {
     const json = (r) => r.json();
@@ -3958,7 +4003,7 @@ test("api: duplicate findings from different scopes collapse to one user-facing 
   });
 });
 
-test("api: verified duplicates hide older suspected candidates at the same scope and location", async () => {
+test("api: similar titles at the same location remain distinct unless canonical identity is exact", async () => {
   await withServer(async (base, out) => {
     const json = (r) => r.json();
     const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -4002,17 +4047,17 @@ test("api: verified duplicates hide older suspected candidates at the same scope
 
     const projectPath = "/api/projects/" + created.uuid;
     const detail = await json(await fetch(base + projectPath));
-    assert.equal(detail.findingsTotal, 2);
-    assert.deepEqual(detail.allFindings.map((finding) => finding.finding_key).sort(), ["confirmed-normalize", "same-line-distinct"].sort());
-    assert.deepEqual(detail.statusCounts, { "confirmed-executable": 1, suspected: 1 });
+    assert.equal(detail.findingsTotal, 3);
+    assert.deepEqual(detail.allFindings.map((finding) => finding.finding_key).sort(), ["suspected-normalize", "confirmed-normalize", "same-line-distinct"].sort());
+    assert.deepEqual(detail.statusCounts, { "confirmed-executable": 1, suspected: 2 });
 
     const findings = await json(await fetch(base + projectPath + "/findings"));
-    assert.equal(findings.total, 2);
-    assert.deepEqual(findings.findings.map((finding) => finding.finding_key).sort(), ["confirmed-normalize", "same-line-distinct"].sort());
+    assert.equal(findings.total, 3);
+    assert.deepEqual(findings.findings.map((finding) => finding.finding_key).sort(), ["suspected-normalize", "confirmed-normalize", "same-line-distinct"].sort());
   });
 });
 
-test("api: strongly related suspected duplicates hide behind confirmed findings", async () => {
+test("api: cross-location semantic similarity never hides a distinct finding", async () => {
   await withServer(async (base, out) => {
     const json = (r) => r.json();
     const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -4056,17 +4101,17 @@ test("api: strongly related suspected duplicates hide behind confirmed findings"
 
     const projectPath = "/api/projects/" + created.uuid;
     const detail = await json(await fetch(base + projectPath));
-    assert.equal(detail.findingsTotal, 2);
-    assert.deepEqual(detail.allFindings.map((finding) => finding.finding_key).sort(), ["confirmed-bytecode-length", "distinct-bytecode"].sort());
-    assert.deepEqual(detail.statusCounts, { "confirmed-executable": 1, suspected: 1 });
+    assert.equal(detail.findingsTotal, 3);
+    assert.deepEqual(detail.allFindings.map((finding) => finding.finding_key).sort(), ["confirmed-bytecode-length", "suspected-bytecode-length", "distinct-bytecode"].sort());
+    assert.deepEqual(detail.statusCounts, { "confirmed-executable": 1, suspected: 2 });
 
     const findings = await json(await fetch(base + projectPath + "/findings"));
-    assert.equal(findings.total, 2);
-    assert.deepEqual(findings.findings.map((finding) => finding.finding_key).sort(), ["confirmed-bytecode-length", "distinct-bytecode"].sort());
+    assert.equal(findings.total, 3);
+    assert.deepEqual(findings.findings.map((finding) => finding.finding_key).sort(), ["confirmed-bytecode-length", "suspected-bytecode-length", "distinct-bytecode"].sort());
 
     const bugs = await json(await fetch(base + "/api/bugs"));
-    assert.equal(bugs.stats.total, 2);
-    assert.deepEqual(bugs.findings.map((finding) => finding.finding_key).sort(), ["confirmed-bytecode-length", "distinct-bytecode"].sort());
+    assert.equal(bugs.stats.total, 3);
+    assert.deepEqual(bugs.findings.map((finding) => finding.finding_key).sort(), ["confirmed-bytecode-length", "suspected-bytecode-length", "distinct-bytecode"].sort());
   });
 });
 

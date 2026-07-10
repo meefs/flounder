@@ -17,7 +17,7 @@ import { deriveScopeNote } from "../scope-note.js";
 import { specToConfig, type LaunchSpec, type ReportFindingSpec } from "./run-manager.js";
 import { toScopeRow, toFindingRow, configSnapshot, type RunTracker, type ConfirmDecisionInput, type FindingReportInput } from "../db/record.js";
 import { defaultConfig, defaultOutputDir, defaultWorkspaceDir, sandboxExecutionOptions, type AuditorConfig } from "../config.js";
-import type { Coverage, DiscoveryBacklogInput, RunKind, RunStatus } from "../db/store.js";
+import type { Coverage, DiscoveryBacklogInput, FindingPhaseAttemptInput, RunKind, RunStatus } from "../db/store.js";
 import type { AgentFinding, AuditScope } from "../agent/tools.js";
 import type { RunHealth } from "../agent/discovery-artifacts.js";
 import { assertProviderAuthenticated, knownRuntimeProviders, providerAuthStatus } from "../provider-auth.js";
@@ -559,6 +559,10 @@ class RemoteTracker implements RunTracker {
     this.enqueue(() => (this.runId ? this.req("PATCH", `/api/daemon/runs/${this.runId}`, { runScopes: { done, target } }) : Promise.resolve()));
   }
 
+  materialFingerprint(fingerprint: string): void {
+    this.enqueue(() => (this.runId ? this.req("PATCH", `/api/daemon/runs/${this.runId}`, { materialFingerprint: fingerprint }) : Promise.resolve()));
+  }
+
   findings(findings: AgentFinding[], runDir: string, reason?: string): void {
     const reportable = findings.filter((finding) => finding.severity !== "info" && finding.confirmationStatus !== "discharged");
     if (reportable.length === 0) return;
@@ -585,6 +589,10 @@ class RemoteTracker implements RunTracker {
   findingReports(reports: FindingReportInput[]): void {
     if (reports.length === 0) return;
     this.enqueue(() => (this.runId ? this.req("PATCH", `/api/daemon/runs/${this.runId}`, { findingReports: reports }) : Promise.resolve()));
+  }
+
+  phaseAttempt(input: FindingPhaseAttemptInput): void {
+    this.enqueue(() => (this.runId ? this.req("PATCH", `/api/daemon/runs/${this.runId}`, { phaseAttempt: input }) : Promise.resolve()));
   }
 
   finish(status: RunStatus, coverage?: Coverage, findingsTotal?: number): void {

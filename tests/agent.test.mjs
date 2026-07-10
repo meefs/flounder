@@ -73,6 +73,74 @@ class VerifyIsolationLlmClient {
   }
 }
 
+class VerifyProgressLlmClient {
+  async complete(input) {
+    const action = (thought, toolName, args) => JSON.stringify({ thought, tool: toolName, args });
+    if (input.user.includes("first missing verdict")) {
+      if (!input.user.includes('"path":"findings.json"')) return action("No executable verdict is available.", "write", { path: "findings.json", content: "[]" });
+      return JSON.stringify({ done: true, summary: "no verdict" });
+    }
+    if (input.user.includes("second settled verdict")) {
+      if (!input.user.includes('"path":"findings.json"')) {
+        return action("Record a refutation verdict.", "write", {
+          path: "findings.json",
+          content: JSON.stringify([{
+            id: "f1",
+            title: "REFUTED: second settled verdict",
+            severity: "info",
+            location: "halo2_missing_constraint.rs:5",
+            description: "The nearby binding check refutes the claim.",
+            evidence: "The value is compared before use.",
+            exploitSketch: "Not reproducible.",
+            fix: "No change required.",
+            confidence: 0.95,
+            confirmationStatus: "suspected",
+          }]),
+        });
+      }
+      return JSON.stringify({ done: true, summary: "settled" });
+    }
+    return JSON.stringify({ done: true, summary: "unexpected" });
+  }
+}
+
+class ManyScopeRefutationLlmClient {
+  constructor() {
+    this.mock = new MockAuditLlmClient();
+    this.refutedTags = [];
+  }
+
+  async complete(input) {
+    if (input.tag?.startsWith("refute_")) {
+      this.refutedTags.push(input.tag);
+      return JSON.stringify({ refuted: false, unrealistic: false, reason: "The execution-backed claim survives independent review." });
+    }
+    if (input.user.includes("Phase: MAP")) {
+      if (!input.user.includes("wrote scopes.json")) {
+        return JSON.stringify({
+          thought: "Checkpoint a complete synthetic inventory.",
+          tool: "write",
+          args: {
+            path: "scopes.json",
+            content: JSON.stringify(Array.from({ length: 9 }, (_, index) => ({
+              id: `S${index + 1}`,
+              obligation: `Region ${index + 1} must preserve its security invariant`,
+              region: "halo2_missing_constraint.rs:1-20",
+              lenses: ["spec"],
+              exposure: "high",
+              difficulty: "medium",
+              score: 100 - index,
+              why: "Synthetic full-refutation coverage fixture.",
+            }))),
+          },
+        });
+      }
+      return JSON.stringify({ done: true, summary: "mapped nine scopes" });
+    }
+    return this.mock.complete(input);
+  }
+}
+
 class AppendMapLlmClient {
   async complete(input) {
     const action = (thought, toolName, args) => JSON.stringify({ thought, tool: toolName, args });
@@ -1692,6 +1760,31 @@ test("map → dig: --deep enumerates scopes then deep-audits each, tagging findi
   }
 });
 
+test("post-dig refutation covers every confirmed candidate beyond one eight-item batch", async () => {
+  const dir = await tempDir();
+  try {
+    const cfg = defaultConfig();
+    cfg.targetName = "refutation-full-coverage";
+    cfg.sourcePaths = [fixtures];
+    cfg.corpusPaths = [fixtures];
+    cfg.outputDir = path.join(dir, "runs");
+    cfg.auditDeep = true;
+    cfg.auditMaxScopes = 9;
+    cfg.auditSynthesize = false;
+    cfg.auditAppeal = false;
+    cfg.auditChallengeDischarges = false;
+    const llm = new ManyScopeRefutationLlmClient();
+
+    const { runDir } = await runAudit(cfg, { llm });
+    assert.equal(llm.refutedTags.length, 9, "every confirmed candidate receives a skeptic verdict");
+    const events = (await readFile(path.join(runDir, "events.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    const stage = events.findLast((event) => event.kind === "audit_refutation");
+    assert.ok(stage, "refutation verdicts are persisted as evidence");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("map → dig: a zero scope target does not audit an extra pending scope", async () => {
   const dir = await tempDir();
   try {
@@ -1889,6 +1982,42 @@ test("verify mode isolates generated PoC files between candidates", async () => 
     assert.match(markerReads[0].observation, /no loaded or sandbox file matches "tests\/verify-marker\.poc\.test\.js"/);
     assert.ok((await stat(path.join(runDir, "audit", "verify-1", "tests", "verify-marker.poc.test.js"))).isFile());
     await assert.rejects(stat(path.join(runDir, "audit", "verify-2", "tests", "verify-marker.poc.test.js")), /ENOENT/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("verify progress counts settled verdicts instead of candidate indexes", async () => {
+  const dir = await tempDir();
+  try {
+    const verifyFile = path.join(dir, "to-verify.json");
+    await writeFile(verifyFile, JSON.stringify([
+      { title: "first missing verdict", location: "halo2_missing_constraint.rs:5", severity: "high", description: "no local setup" },
+      { title: "second settled verdict", location: "halo2_missing_constraint.rs:5", severity: "high", description: "trace the binding" },
+    ]), "utf8");
+    const cfg = defaultConfig();
+    cfg.targetName = "verify-progress-e2e";
+    cfg.sourcePaths = [fixtures];
+    cfg.corpusPaths = [fixtures];
+    cfg.outputDir = path.join(dir, "runs");
+    cfg.auditVerify = verifyFile;
+    cfg.auditVerifyConcurrency = 1;
+    cfg.auditRefute = false;
+    const progress = [];
+    const tracker = {
+      runDbId: undefined,
+      scopes() {},
+      runScopes(done, target) { progress.push({ done, target }); },
+      findings() {},
+      stage() {},
+      confirmDecisions() {},
+      findingReports() {},
+      finish() {},
+    };
+
+    await runAudit(cfg, { llm: new VerifyProgressLlmClient(), makeTracker: () => tracker });
+    assert.deepEqual(progress.at(-1), { done: 1, target: 2 });
+    assert.equal(progress.some((entry) => entry.done === 2), false, "a later verdict must not make an earlier missing verdict look complete");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

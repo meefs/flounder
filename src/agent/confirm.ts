@@ -125,6 +125,7 @@ export async function runConfirm(
   }
   // SQLite tracking: record a `confirm` run under the same project (failure-isolated).
   const recorder = (options.makeTracker ?? RunRecorder.start)(confirmCfg, logger.runDir, "confirm", logger);
+  if (confirmCfg.materialFingerprint) recorder.materialFingerprint?.(confirmCfg.materialFingerprint);
   if (recorder.runDbId !== undefined) options.onRun?.(recorder.runDbId);
   const confirmProgress = {
     commandRuns: 0,

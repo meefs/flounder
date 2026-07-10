@@ -61,6 +61,7 @@ export interface LaunchSpec {
   maxSteps?: number | undefined;
   digSamples?: number | undefined;
   digConcurrency?: number | undefined;
+  verifyConcurrency?: number | undefined;
   remap?: boolean | undefined; // run/map/audit: re-enumerate the scope inventory (restart)
   appendMap?: boolean | undefined; // run/map: expand the existing scope inventory without replacing prior scopes
   appendMapSeedPaths?: string[] | undefined; // run/map/audit append-map: extra prior scope inventories used only as covered-reference seed
@@ -88,6 +89,8 @@ export interface LaunchSpec {
   models?: ProviderRoles | undefined; // per-phase provider/model/thinking overrides (from the selected profile)
   scopeNote?: string | undefined; // map/audit: the "authorized scope note" prior — focuses map on the in-scope target (the pipeline auto-derives it from prepare's manifest; --scope-note also sets it)
   nextActions?: AuditNextAction[] | undefined; // project discovery backlog rows the agent should resolve before opening fresh coverage
+  materialFingerprint?: string | undefined;
+  synthesisContext?: Array<Record<string, unknown>> | undefined;
   sandboxBackend?: SandboxBackend | undefined;
   sandboxImage?: string | undefined;
   sandboxAllowHostFallback?: boolean | undefined;
@@ -134,6 +137,7 @@ export interface ReportFindingSpec {
   confidence?: number | undefined;
   decisions?: Array<Record<string, unknown>> | undefined;
   linkedFindings?: Array<Record<string, unknown>> | undefined;
+  phaseInputFingerprint?: string | undefined;
 }
 
 // Translate a launch spec into an AuditorConfig — the daemon's equivalent of the CLI's
@@ -170,6 +174,9 @@ export function specToConfig(spec: LaunchSpec, out: string, workspace?: string):
   if (spec.maxScopes !== undefined) cfg.auditMaxScopes = spec.maxScopes;
   if (spec.digSamples !== undefined) cfg.auditDigSamples = spec.digSamples;
   if (spec.digConcurrency !== undefined) cfg.auditDigConcurrency = spec.digConcurrency;
+  if (spec.verifyConcurrency !== undefined) cfg.auditVerifyConcurrency = spec.verifyConcurrency;
+  if (spec.materialFingerprint) cfg.materialFingerprint = spec.materialFingerprint;
+  if (spec.synthesisContext) cfg.auditSynthesisContext = spec.synthesisContext.map((finding) => ({ ...finding }));
   if (spec.verifyFromStart) cfg.auditVerifyFromStart = true;
   if (spec.remap) cfg.auditRemap = true; // re-enumerate scopes from scratch (restart)
   if (spec.appendMap) cfg.auditAppendMap = true; // expand persisted inventory, preserving existing scope statuses
@@ -292,6 +299,7 @@ export function buildArgs(spec: LaunchSpec): string[] {
   if (spec.maxSteps !== undefined) args.push("--max-steps", String(spec.maxSteps));
   if (spec.digSamples !== undefined) args.push("--dig-samples", String(spec.digSamples));
   if (spec.digConcurrency !== undefined) args.push("--dig-concurrency", String(spec.digConcurrency));
+  if (spec.verifyConcurrency !== undefined) args.push("--verify-concurrency", String(spec.verifyConcurrency));
   if (spec.remap && spec.verb !== "confirm") args.push("--remap");
   if (spec.appendMap && (spec.verb === "run" || spec.verb === "map")) args.push("--append-map");
   for (const seedPath of spec.appendMapSeedPaths ?? []) args.push("--append-map-seed", seedPath);

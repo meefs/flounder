@@ -11,9 +11,11 @@ import { writeLastRunPointer } from "../trace/last-run.js";
 import { RunLogger } from "../trace/logger.js";
 import type { AuditSummary, ConfirmationStatus, Doc, LlmClient, RankedFinding, Severity } from "../types.js";
 import { publicPath } from "../util/paths.js";
+import { materialFingerprint, phaseInputFingerprint } from "../util/material-fingerprint.js";
+import { canonicalFindingKey } from "../util/finding-identity.js";
 import { listWorkspaceFiles, normalizeRelativePath, prepareSandboxWorkspace, writeSandboxFiles, type SandboxWorkspace } from "../security/sandbox.js";
 import { runDifferentialConfirmation, type DifferentialResult } from "./differential.js";
-import { runDischargeChallenge, runRefutation } from "./refutation.js";
+import { runDischargeChallenge, runRefutation, type RefutationError, type RefutationVerdict } from "./refutation.js";
 import { runAuditLoop } from "./loop.js";
 import { ProjectMemory } from "./memory.js";
 import { loadScopeInventory, mergeScopeInventory, saveScopeInventory, scopeProgress } from "./scope-store.js";
@@ -66,6 +68,12 @@ export async function runAudit(
 
   const source = await loadSource(cfg.sourcePaths);
   const corpus = await loadCorpus(cfg.corpusPaths);
+  const buildDocs = cfg.buildRoot ? await loadSource([cfg.buildRoot]) : [];
+  cfg.materialFingerprint = materialFingerprint([
+    { label: "source", docs: source },
+    { label: "build", docs: buildDocs },
+    { label: "corpus", docs: corpus },
+  ]);
   await logger.event("audit_start", {
     target: cfg.targetName,
     sourcePaths: cfg.sourcePaths.map((sourcePath) => publicPath(sourcePath)),
@@ -203,6 +211,7 @@ export async function runAudit(
   // SQLite tracking: record the project + a running run, then update scope coverage,
   // findings, and final status as the run progresses. Failure-isolated (never throws).
   const recorder = (options.makeTracker ?? RunRecorder.start)(cfg, logger.runDir, options.kind ?? "run", logger);
+  recorder.materialFingerprint?.(cfg.materialFingerprint!);
   if (recorder.runDbId !== undefined) options.onRun?.(recorder.runDbId); // let an in-process caller learn the DB run id
   // Set when concurrent digs already ran differential confirmation in their own
   // isolated workspaces, so the shared post-loop differential stage skips them.
@@ -224,8 +233,28 @@ export async function runAudit(
     const aggregatedSteps: TranscriptStep[] = [];
     const workspaceRoots = cfg.buildRoot ? [cfg.buildRoot] : cfg.sourcePaths;
     recorder.runScopes(0, toVerify.length); // surface "verifying 0/N" before the first verdict lands
-    for (const [idx, finding] of toVerify.entries()) {
+    let verifyDone = 0;
+    const verifyOne = async (finding: Record<string, unknown>, idx: number): Promise<{
+      findings: AgentFinding[];
+      steps: TranscriptStep[];
+      commandRuns: AgentSession["commandRuns"];
+      scratchFiles: Array<[string, string]>;
+    }> => {
       const verifyLabel = `verify-${idx + 1}`;
+      const claimLabel = String(finding.title ?? "").slice(0, 90);
+      const originId = typeof finding.originId === "number" ? finding.originId : typeof finding.origin_id === "number" ? finding.origin_id : undefined;
+      const inheritedScopeId = typeof finding.scopeId === "string" ? finding.scopeId : typeof finding.scope_id === "string" ? finding.scope_id : undefined;
+      const suppliedAttempt = (finding.phaseAttempt ?? finding._phaseAttempt) as Record<string, unknown> | undefined;
+      const attempt = originId !== undefined
+        ? {
+            subjectType: "finding" as const,
+            subjectId: typeof suppliedAttempt?.subjectId === "number" ? suppliedAttempt.subjectId : originId,
+            inputFingerprint: typeof suppliedAttempt?.inputFingerprint === "string"
+              ? suppliedAttempt.inputFingerprint
+              : phaseInputFingerprint({ phase: "verify", material: cfg.materialFingerprint, originId, finding }),
+          }
+        : undefined;
+      if (attempt) recorder.phaseAttempt?.({ ...attempt, phase: "verify", state: "running" });
       const verifyWorkspace = await prepareSandboxWorkspace(workspaceRoots, logger.runDir, `audit/${verifyLabel}`);
       const verifySession = newSession();
       verifySession.workspace = verifyWorkspace;
@@ -235,11 +264,7 @@ export async function runAudit(
       const verifyCtx: ToolContext = { cfg: verifyCfg, source, corpus, memory, logger, session: verifySession };
       clearScratchFindings(verifySession);
       const phase = await runPhase(verifyCfg, { mode: "verify", verifySeed: buildVerifySeed(finding), maxSteps: cfg.auditDigSteps }, { ctx: verifyCtx, cwd: verifyWorkspace.absolute });
-      aggregatedSteps.push(...phase.steps);
       ingestFindingsFromScratch(verifySession);
-      const claimLabel = String(finding.title ?? "").slice(0, 90);
-      const originId = typeof finding.originId === "number" ? finding.originId : typeof finding.origin_id === "number" ? finding.origin_id : undefined;
-      const inheritedScopeId = typeof finding.scopeId === "string" ? finding.scopeId : typeof finding.scope_id === "string" ? finding.scope_id : undefined;
       if (verifySession.resourceRequests?.length) {
         session.resourceRequests = mergeResourceRequests(session.resourceRequests ?? [], verifySession.resourceRequests.map((request) => ({
           ...request,
@@ -258,13 +283,24 @@ export async function runAudit(
           steps: phase.steps.length,
           commandRuns: verifySession.commandRuns.length,
         });
+        if (attempt) recorder.phaseAttempt?.({
+          ...attempt,
+          phase: "verify",
+          state: "blocked",
+          outcome: "no-verdict",
+          blocker: verifySession.resourceRequests?.[0]?.reason || `verify ended ${phase.stoppedReason} without a verdict`,
+          metrics: { steps: phase.steps.length, commandRuns: verifySession.commandRuns.length },
+        });
       }
       // Carry the original suspected finding's identity onto THIS claim's verdict so it flips that
       // row (status + PoC) rather than inserting a duplicate. The link is positional — claim N is
       // seeded from input finding N — so it survives the verify session renaming the title. Only the
       // primary verdict inherits it; any extra finding the session split out stays its own new row.
       const primaryVerdict = verifySession.findings[0];
-      if (originId !== undefined && primaryVerdict) primaryVerdict.originId = originId;
+      if (originId !== undefined && primaryVerdict) {
+        primaryVerdict.originId = originId;
+        if (attempt) primaryVerdict.phaseAttempt = attempt;
+      }
       if (inheritedScopeId) {
         for (const produced of verifySession.findings) if (!produced.scopeId) produced.scopeId = inheritedScopeId;
       }
@@ -275,15 +311,28 @@ export async function runAudit(
         const result = await runDifferentialConfirmation({ workspace: verifyWorkspace, finding: produced, exploitRun, baselineFiles: verifySession.baselineFiles, cfg: verifyCfg, logger, ...(verifySession.buildCacheDir ? { cacheDir: verifySession.buildCacheDir } : {}) });
         if (result.confirmed) produced.confirmationStatus = "confirmed-differential";
       }
+      recorder.findings(verifySession.findings, logger.runDir, `verify ${idx + 1}/${toVerify.length}`); // persist this verdict live (flips the original when originId is set)
+      if (!missingVerdict) {
+        verifyDone += 1;
+        if (attempt) recorder.phaseAttempt?.({ ...attempt, phase: "verify", state: "settled", outcome: primaryVerdict?.confirmationStatus ?? "verdict", metrics: { findings: verifySession.findings.length, steps: phase.steps.length } });
+      }
+      recorder.runScopes(verifyDone, toVerify.length); // verdict count, independent of completion order
+      await logger.event("audit_verify_done", { index: idx + 1, of: toVerify.length, claim: claimLabel, produced: verifySession.findings.length, stoppedReason: phase.stoppedReason });
       const commandIdPrefix = `${verifyLabel}:`;
       for (const produced of verifySession.findings) if (produced.commandRunId) produced.commandRunId = `${commandIdPrefix}${produced.commandRunId}`;
-      session.commandRuns.push(...verifySession.commandRuns.map((run) => ({ ...run, id: `${commandIdPrefix}${run.id}` })));
-      for (const [scratchPath, content] of verifySession.scratchFiles) session.scratchFiles.set(`${verifyLabel}/${scratchPath}`, content);
-      for (const produced of verifySession.findings) aggregated.push(produced);
-      recorder.findings(verifySession.findings, logger.runDir, `verify ${idx + 1}/${toVerify.length}`); // persist this verdict live (flips the original when originId is set)
-      recorder.runScopes(missingVerdict ? idx : idx + 1, toVerify.length); // live progress for the UI; no verdict means this claim is not complete
-      await logger.event("audit_verify_done", { index: idx + 1, of: toVerify.length, claim: claimLabel, produced: verifySession.findings.length, stoppedReason: phase.stoppedReason });
-      if (missingVerdict && phase.stoppedReason === "error" && phase.steps.length === 0 && verifySession.commandRuns.length === 0) break;
+      return {
+        findings: verifySession.findings,
+        steps: phase.steps,
+        commandRuns: verifySession.commandRuns.map((run) => ({ ...run, id: `${commandIdPrefix}${run.id}` })),
+        scratchFiles: [...verifySession.scratchFiles.entries()].map(([scratchPath, content]) => [`${verifyLabel}/${scratchPath}`, content]),
+      };
+    };
+    const verifyResults = await runWithConcurrency(toVerify, Math.max(1, Math.floor(cfg.auditVerifyConcurrency)), (finding, idx) => verifyOne(finding as Record<string, unknown>, idx));
+    for (const result of verifyResults) {
+      aggregated.push(...result.findings);
+      aggregatedSteps.push(...result.steps);
+      session.commandRuns.push(...result.commandRuns);
+      for (const [scratchPath, content] of result.scratchFiles) session.scratchFiles.set(scratchPath, content);
     }
     aggregated.forEach((produced, i) => {
       produced.id = `f${i + 1}`;
@@ -566,18 +615,25 @@ export async function runAudit(
     // a security-critical sink in another) is invisible to them. Run one sink-driven composition
     // pass over the union of scopes + findings, then fold its chains into the finding set so they go
     // through the same differential/refutation/finalize. General method, no per-target special case.
-    if (cfg.auditSynthesize !== false && scopeInventory.length > 1 && aggregated.length > 0 && !options.signal?.aborted) {
+    const priorSynthesis = cfg.auditSynthesisContext ?? [];
+    const priorSynthesisKeys = new Set(priorSynthesis.map(synthesisIdentity));
+    const synthesisDelta = aggregated.filter((finding) => !priorSynthesisKeys.has(synthesisIdentity(finding as unknown as Record<string, unknown>)));
+    if (cfg.auditSynthesize !== false && scopeInventory.length > 1 && aggregated.length > 0 && synthesisDelta.length > 0 && !options.signal?.aborted) {
       clearScratchFindings(session);
-      await logger.event("audit_synthesis_start", { scopes: scopeInventory.length, findings: aggregated.length });
-      recorder.stage("synthesis", { scopes: scopeInventory.length, pool: aggregated.length, status: "running" });
-      const synthPhase = await runPhase(withRole(cfg, "dig"), { mode: "synthesize", synthSeed: buildSynthesisSeed(aggregated, scopeInventory), maxSteps: cfg.auditDigSteps });
+      const synthesisFingerprint = phaseInputFingerprint({ phase: "synthesis", material: cfg.materialFingerprint, prior: priorSynthesis.map(synthesisIdentity), delta: synthesisDelta.map((finding) => synthesisIdentity(finding as unknown as Record<string, unknown>)) });
+      await logger.event("audit_synthesis_start", { scopes: scopeInventory.length, findings: aggregated.length, prior: priorSynthesis.length, delta: synthesisDelta.length, inputFingerprint: synthesisFingerprint });
+      recorder.stage("synthesis", { scopes: scopeInventory.length, pool: aggregated.length, prior: priorSynthesis.length, delta: synthesisDelta.length, inputFingerprint: synthesisFingerprint, status: "running" });
+      const synthPhase = await runPhase(withRole(cfg, "dig"), { mode: "synthesize", synthSeed: buildSynthesisSeed(aggregated, scopeInventory, priorSynthesis), maxSteps: cfg.auditDigSteps });
       aggregatedSteps.push(...synthPhase.steps);
       ingestFindingsFromScratch(session);
       for (const composed of session.findings) aggregated.push(composed);
       const produced = session.findings.length;
       await logger.event("audit_synthesis_done", { produced });
       recorder.findings(aggregated, logger.runDir, "synthesis");
-      recorder.stage("synthesis", { scopes: scopeInventory.length, produced, pool: aggregated.length, status: "done" }); // funnel: cross-scope chains ADDED
+      recorder.stage("synthesis", { scopes: scopeInventory.length, produced, pool: aggregated.length, prior: priorSynthesis.length, delta: synthesisDelta.length, inputFingerprint: synthesisFingerprint, status: "done" }); // funnel: cross-scope chains ADDED
+    } else if (cfg.auditSynthesize !== false && priorSynthesis.length > 0 && aggregated.length > 0 && synthesisDelta.length === 0) {
+      recorder.stage("synthesis", { scopes: scopeInventory.length, pool: aggregated.length, prior: priorSynthesis.length, delta: 0, status: "skipped", reason: "no novel or changed finding inputs" });
+      await logger.event("audit_synthesis_skipped", { reason: "no-delta", prior: priorSynthesis.length, findings: aggregated.length });
     }
     // Each scope/dig session numbered its findings independently (f1, f2, …), so
     // aggregating across scopes collides. Re-id uniquely so every finding gets its
@@ -677,7 +733,37 @@ export async function runAudit(
       const pocFiles = [...session.scratchFiles.entries()]
         .filter(([scratchPath]) => /\.t\.(sol|rs|ts|js)$/i.test(scratchPath) || /(^|\/)tests?\//i.test(scratchPath) || /(poc|exploit)/i.test(scratchPath))
         .map(([scratchPath, content]) => ({ path: scratchPath, content }));
-      const refutation = await runRefutation({ findings: candidates, source, cfg: refuteCfg, llm: refuteLlm, logger, max: 8, onProgress: (id) => options.onActivity?.({ kind: "step", tool: `refute ${id}` }), ...(pocFiles.length > 0 ? { pocFiles } : {}) });
+      for (const finding of candidates) {
+        finding.refutationStatus = "running";
+        delete finding.refutationReason;
+      }
+      recorder.findings(session.findings, logger.runDir, "refutation running");
+      const refutation = { attempted: 0, verdicts: [] as RefutationVerdict[], errors: [] as RefutationError[] };
+      // Bound each model batch for context/transport safety, but cover every
+      // confirmed candidate. No finding silently escapes independent review.
+      for (let offset = 0; offset < candidates.length; offset += 8) {
+        const chunk = candidates.slice(offset, offset + 8);
+        const result = await runRefutation({ findings: chunk, source, cfg: refuteCfg, llm: refuteLlm, logger, max: chunk.length, onProgress: (id) => options.onActivity?.({ kind: "step", tool: `refute ${id}` }), ...(pocFiles.length > 0 ? { pocFiles } : {}) });
+        refutation.attempted += result.attempted;
+        refutation.verdicts.push(...result.verdicts);
+        refutation.errors.push(...result.errors);
+        const errorsById = new Map(result.errors.map((error) => [error.findingId, error.error]));
+        for (const finding of chunk) {
+          const error = errorsById.get(finding.id);
+          if (error) {
+            finding.refutationStatus = "blocked";
+            finding.refutationReason = error;
+          } else if (finding.refutation) {
+            finding.refutationStatus = finding.refutation.refuted ? "refuted" : "passed";
+            finding.refutationReason = finding.refutation.reason;
+          } else {
+            finding.refutationStatus = "blocked";
+            finding.refutationReason = "independent reviewer returned no structured verdict";
+            refutation.errors.push({ findingId: finding.id, error: finding.refutationReason });
+          }
+        }
+        recorder.findings(session.findings, logger.runDir, `refutation ${Math.min(offset + chunk.length, candidates.length)}/${candidates.length}`);
+      }
       refutationErrors.push(...refutation.errors.map((error) => ({ phase: "refutation" as const, ...error })));
       for (const finding of candidates) {
         if (!finding.refutation?.refuted) continue;
@@ -732,6 +818,8 @@ export async function runAudit(
               if (reConfirmed.commandRunId) finding.commandRunId = reConfirmed.commandRunId;
               if (reConfirmed.fixPatch) finding.fixPatch = reConfirmed.fixPatch;
               finding.disputed = false;
+              finding.refutationStatus = "passed";
+              finding.refutationReason = "appeal rebuilt a faithful PoC that survived independent review";
             }
           }
           finding.appeal = {
@@ -1100,7 +1188,7 @@ function buildVerifySeed(finding: Record<string, unknown>): string {
 // across components: the scope inventory (candidate sinks / gates / inputs) and the findings
 // (especially the suspected unbound-input / missing-constraint ones — exactly the links that may
 // complete a cross-scope chain). Compact; leads to CHAIN, not ground truth.
-function buildSynthesisSeed(findings: AgentFinding[], scopes: AuditScope[]): string {
+function buildSynthesisSeed(findings: AgentFinding[], scopes: AuditScope[], prior: Array<Record<string, unknown>> = []): string {
   const scopeLines = [...scopes]
     .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
     .slice(0, 50)
@@ -1115,11 +1203,22 @@ function buildSynthesisSeed(findings: AgentFinding[], scopes: AuditScope[]): str
       return `- (${f.confirmationStatus}) ${f.title} @ ${f.location}${lead ? ` — ${lead}` : ""}`;
     })
     .join("\n");
+  const priorLines = prior.slice(0, 80).map((finding) => {
+    const lead = String(finding.exploit_sketch ?? finding.exploitSketch ?? finding.description ?? "").replace(/\s+/g, " ").slice(0, 180);
+    return `- (${String(finding.status ?? finding.confirmationStatus ?? "unknown")}) ${String(finding.title ?? "Untitled")} @ ${String(finding.location ?? "unknown")}${lead ? ` — ${lead}` : ""}`;
+  }).join("\n");
   return `SCOPES (each a region + the obligation the per-scope dig checked there — candidate sinks, gates, and inputs):
 ${scopeLines || "(none)"}
 
-PER-SCOPE FINDINGS (each found in ONE scope in isolation; a 'suspected unbound input' is exactly the kind of link that may complete a cross-scope chain to a sink):
+PRIOR CANONICAL FINDINGS (settled in earlier batches; use only for cross-batch composition and duplicate avoidance):
+${priorLines || "(none)"}
+
+NEW BATCH FINDINGS (each found in ONE scope in isolation; compose these with each other and with prior findings):
 ${findLines || "(none)"}`;
+}
+
+function synthesisIdentity(finding: Record<string, unknown>): string {
+  return `${canonicalFindingKey(finding.title, finding.location, finding.canonical_key ?? finding.finding_key)}|${String(finding.status ?? finding.confirmationStatus ?? "")}`;
 }
 
 // Seed for the ONE appeal a refuted finding may make. Same claim the verify session
@@ -1281,7 +1380,7 @@ async function writeAppendMapExistingScopesSeed(scopes: AuditScope[], workspaceC
 
 // Bounded worker pool: run `worker` over `items` with at most `limit` in flight,
 // returning results in input order. Used to deep-audit scopes concurrently.
-async function runWithConcurrency<T, R>(items: T[], limit: number, worker: (item: T) => Promise<R>): Promise<R[]> {
+async function runWithConcurrency<T, R>(items: T[], limit: number, worker: (item: T, index: number) => Promise<R>): Promise<R[]> {
   const results = new Array<R>(items.length);
   let next = 0;
   const runner = async (): Promise<void> => {
@@ -1289,7 +1388,7 @@ async function runWithConcurrency<T, R>(items: T[], limit: number, worker: (item
       const idx = next;
       next += 1;
       if (idx >= items.length) return;
-      results[idx] = await worker(items[idx] as T);
+      results[idx] = await worker(items[idx] as T, idx);
     }
   };
   await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, runner));

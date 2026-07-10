@@ -277,6 +277,7 @@ async function parseConfig(args: string[]): Promise<{ cfg: AuditorConfig }> {
   cfg.auditDigSteps = readIntFlag(args, "--dig-steps") ?? cfg.auditDigSteps;
   cfg.auditDigSamples = readIntFlag(args, "--dig-samples") ?? cfg.auditDigSamples;
   cfg.auditDigConcurrency = readIntFlag(args, "--dig-concurrency") ?? cfg.auditDigConcurrency;
+  cfg.auditVerifyConcurrency = readIntFlag(args, "--verify-concurrency") ?? cfg.auditVerifyConcurrency;
   if (args.includes("--remap")) cfg.auditRemap = true;
   if (args.includes("--append-map") || args.includes("--expand-map")) cfg.auditAppendMap = true;
   cfg.auditAppendMapSeedPaths = readMultiFlag(args, "--append-map-seed");
@@ -349,6 +350,8 @@ function applyConfigOverrides(cfg: AuditorConfig, raw: Record<string, unknown>):
   if (typeof rawDigSamples === "number" && Number.isFinite(rawDigSamples)) cfg.auditDigSamples = Math.max(1, Math.floor(rawDigSamples));
   const rawDigConcurrency = raw.auditDigConcurrency ?? raw.audit_dig_concurrency;
   if (typeof rawDigConcurrency === "number" && Number.isFinite(rawDigConcurrency)) cfg.auditDigConcurrency = Math.max(1, Math.floor(rawDigConcurrency));
+  const rawVerifyConcurrency = raw.auditVerifyConcurrency ?? raw.audit_verify_concurrency;
+  if (typeof rawVerifyConcurrency === "number" && Number.isFinite(rawVerifyConcurrency)) cfg.auditVerifyConcurrency = Math.max(1, Math.floor(rawVerifyConcurrency));
   if (raw.thinkingLevel === "off" || raw.thinkingLevel === "minimal" || raw.thinkingLevel === "low" || raw.thinkingLevel === "medium" || raw.thinkingLevel === "high" || raw.thinkingLevel === "xhigh") {
     cfg.thinkingLevel = raw.thinkingLevel;
   }
@@ -594,6 +597,7 @@ function buildAuditSpec(cmd: "run" | "map" | "audit", rest: string[], cfg: Audit
   cap("--max-scopes", (n) => (spec.maxScopes = n));
   cap("--dig-samples", (n) => (spec.digSamples = n));
   cap("--dig-concurrency", (n) => (spec.digConcurrency = n));
+  cap("--verify-concurrency", (n) => (spec.verifyConcurrency = n));
   return spec;
 }
 
@@ -744,7 +748,7 @@ function firstPositional(args: string[]): string | undefined {
     "--config", "--provider", "--audit-model", "--model", "--thinking", "--out",
     "--history-dir", "--server", "--clue", "--posture", "--endpoint", "--rpc",
     "--max-steps", "--map-steps", "--dig-steps", "--max-scopes", "--dig-samples",
-    "--dig-concurrency", "--scope", "--scope-note", "--max-tokens", "--repro-timeout-ms",
+    "--dig-concurrency", "--verify-concurrency", "--scope", "--scope-note", "--max-tokens", "--repro-timeout-ms",
     "--sandbox-backend", "--sandbox-image", "--prepare-network", "--confirm-network",
     "--sandbox-memory-mb", "--sandbox-cpus", "--prepare-timeout-ms", "--scope-coverage-mode",
     "--coverage", "--append-map-seed",
@@ -1214,6 +1218,7 @@ run / map / audit deep-phase options:
   --dig-steps <n>         cap each scope's dig (default: UNBOUNDED; the dig stops when its obligations are discharged)
   --dig-samples <n>       independent dig passes per scope, findings unioned (raises recall), default 1
   --dig-concurrency <n>   scopes deep-audited in parallel (isolated workspaces), default 1
+  --verify-concurrency <n> findings verified in parallel (isolated workspaces), default 2
   --max-scopes <n>        one-run cap for un-audited scopes; UI Standard defaults to auditing until 30 project scopes are done
   --remap                 re-enumerate scopes from scratch (default resumes the persisted inventory)
   --append-map            expand the persisted inventory by asking MAP for novel scopes, preserving existing scope status
@@ -1290,6 +1295,7 @@ Options:
   --max-steps <n>           one-off global turn cap
   --dig-samples <n>         one-off samples per scope
   --dig-concurrency <n>     one-off parallel scopes
+  --verify-concurrency <n>  one-off parallel Verify findings
   --mock-llm                use the deterministic mock model on the daemon
   --server <url>            control plane URL`);
 }

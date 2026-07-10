@@ -27,6 +27,7 @@ import { projectHistoryDir } from "../trace/history.js";
 import { loadScopeInventory, saveScopeInventory } from "../agent/scope-store.js";
 import { deriveScopeNote } from "../scope-note.js";
 import { confirmSelectorsForFinding } from "../util/confirm-selector.js";
+import { phaseInputFingerprint } from "../util/material-fingerprint.js";
 import { isResumeSettledDecision, isSubmissionReadyDecision, needsSubmissionReadinessWork } from "../util/submission-readiness.js";
 import { isSandboxBackend, type SandboxBackend } from "../security/sandbox.js";
 import { normalizeRunGroupManifest, normalizeWorkItemInput } from "../evaluation/contracts.js";
@@ -280,7 +281,7 @@ const ROUTES: Route[] = [
       continueCoverage: "boolean? — explicit opt-in to open the next mapped scope batch after the current pipeline round is fully settled",
       scopeCoverageMode: "focused|standard|half|full|custom? — one-off coverage mode for this run; standard means audit until the project has 30 audited scopes; pass continueCoverage:true to explicitly start another scope batch after verify/confirm/report are settled. Bug-bounty contest projects default to short custom batches unless overridden.",
       maxScopes: "number? — one-off scope cap for this run, or the custom target when scopeCoverageMode=custom", mapSteps: "number? — one-off map turn cap", digSteps: "number? — one-off per-scope dig turn cap",
-      maxSteps: "number? — one-off global turn cap", digSamples: "number? — one-off samples per scope", digConcurrency: "number? — one-off parallel scopes",
+      maxSteps: "number? — one-off global turn cap", digSamples: "number? — one-off samples per scope", digConcurrency: "number? — one-off parallel scopes", verifyConcurrency: "number? — one-off parallel Verify findings (isolated workspaces)",
       findingId: "number? — confirm/report: reproduce or report one selected finding",
       findingIds: "number[]? — confirm/report: reproduce selected pending audit-confirmed findings, or generate/regenerate formal reports for selected reproduced findings. Report without selection only generates missing reports.",
       inputRunDir: "string? — confirm: the finished run dir to reproduce",
@@ -330,6 +331,19 @@ const ROUTES: Route[] = [
     summary: "Read one finding's submission report markdown from DB-backed finding data. Local run artifacts are provenance only, not the UI source of truth.",
     params: { id: "finding id" },
     handler: findingReport,
+  }),
+  route({
+    method: "GET", path: "/api/findings/:id/lifecycle",
+    summary: "Read one canonical finding's occurrences, status timeline, and per-phase Verify/Confirm/Report attempts.",
+    params: { id: "finding id" },
+    handler: findingLifecycle,
+  }),
+  route({
+    method: "POST", path: "/api/findings/:id/retry",
+    summary: "Explicitly reopen one blocked finding lifecycle phase. The next Continue retries only that phase against the same inputs; changed inputs are eligible automatically.",
+    params: { id: "finding id" },
+    body: { phase: "verify|confirm|report" },
+    handler: findingPhaseRetry,
   }),
   route({
     method: "GET", path: "/api/confirm-decisions/:id/report",
@@ -490,18 +504,17 @@ const ROUTES: Route[] = [
     handler: (c) => {
       const projectUuid = c.url.searchParams.get("project") || c.url.searchParams.get("projectUuid") || undefined;
       const status = c.url.searchParams.get("status") || undefined;
-      const exactStatus = status === "execution-confirmed" ? undefined : status;
       const tracking = c.url.searchParams.get("tracking") || undefined;
-      const exactTracking = tracking === "active" ? undefined : tracking;
       const source = normalizeFindingSourceFilter(c.url.searchParams.get("source"));
       if (!source) return sendJson(c.res, 400, { error: "source must be project, evaluation, or all" });
       const limit = clampInt(c.url.searchParams.get("limit"), 200, 1, 500);
       const offset = clampInt(c.url.searchParams.get("offset"), 0, 0, 1_000_000);
-      const statsRows = reportableFindings(c.store.listGlobalFindings({ projectUuid, source, limit: 10_000, offset: 0 }));
-      const all = reportableFindings(c.store.listGlobalFindings({ projectUuid, source, status: exactStatus, tracking: exactTracking, limit: 10_000, offset: 0 }))
-        .filter((finding) => findingStatusMatches(finding, status))
-        .filter((finding) => findingTrackingMatches(finding, tracking));
-      sendJson(c.res, 200, { findings: all.slice(offset, offset + limit).map(findingSummaryRow), total: all.length, limit, offset, stats: globalFindingStats(statsRows) });
+      const filter = { projectUuid, source, status, tracking };
+      const findings = c.store.listGlobalFindings({ ...filter, limit, offset });
+      const total = c.store.countGlobalFindings(filter);
+      const rawStats = c.store.globalFindingStats({ projectUuid, source });
+      const stats = { ...rawStats, active: rawStats.total - (rawStats.byTracking.ignored ?? 0) };
+      sendJson(c.res, 200, { findings: withLatestFindingAttempts(c.store, findings).map(findingSummaryRow), total, limit, offset, stats });
     },
   }),
   route({
@@ -966,7 +979,8 @@ async function projectGet(c: Ctx): Promise<void> {
       ? []
       : reportableFindings(c.store.listFindings(id).filter((row) => rowBelongsToCurrentMaterial(row, currentRunIds, materialBoundary)));
     const activeFindings = allFindings.filter((finding) => !isIgnoredFinding(finding));
-    const findingSummaries = allFindings.map((finding) => findingSummaryRow({ ...finding, timeline: c.store.findingTimeline(Number(finding.id)) }));
+    const findingSummaries = withLatestFindingAttempts(c.store, allFindings)
+      .map((finding) => findingSummaryRow({ ...finding, timeline: c.store.findingTimeline(Number(finding.id)) }));
     const auditConfirmedFindings = countAuditConfirmedFindings(activeFindings);
     const confirmDecisions = activePrepareRefresh
       ? []
@@ -1055,6 +1069,9 @@ function latestScopeInventoryBoundaryRun(runs: Array<Record<string, unknown>>): 
 
 function isCurrentMaterialRun(run: Record<string, unknown>, boundary?: Record<string, unknown>): boolean {
   if (!boundary) return true;
+  const boundaryFingerprint = stringValue(boundary.material_fingerprint);
+  const runFingerprint = stringValue(run.material_fingerprint);
+  if (boundaryFingerprint && runFingerprint) return boundaryFingerprint === runFingerprint || Number(run.id) === Number(boundary.id);
   const runStarted = stringValue(run.started_at);
   const boundaryStarted = stringValue(boundary.started_at);
   if (!runStarted || !boundaryStarted) return true;
@@ -2291,6 +2308,9 @@ async function runLaunch(c: Ctx): Promise<void> {
   const scopeView = currentScopeView(c.store, projectId, currentRuns, undefined, scopeBoundary, !materialBoundary);
   const progress = scopeView.hasInventory ? scopeView.progress : emptyProgress();
   const spec = launchSpec(c.store, project, body, c.out, profile, progress, phaseProfiles);
+  const currentMaterialFingerprint = currentResultRuns(currentRuns, scopeBoundary).map((run) => stringValue(run.material_fingerprint)).find(Boolean)
+    || stringValue(materialBoundary?.material_fingerprint);
+  if (currentMaterialFingerprint) spec.materialFingerprint = currentMaterialFingerprint;
   if (spec.verb === "run") {
     if (spec.sourcePaths.length > 0) {
       applyProjectSourceDefaults(spec, project);
@@ -2322,6 +2342,20 @@ async function runLaunch(c: Ctx): Promise<void> {
   if (nextActions.length > 0) {
     spec.nextActions = nextActions;
     applyNextActionRunDefaults(spec, nextActions, progress);
+  }
+  if ((spec.verb === "run" || spec.verb === "audit") && currentResultRunIds.size > 0) {
+    spec.synthesisContext = reportableFindings(c.store.listFindings(projectId)
+      .filter((finding) => rowBelongsToCurrentMaterial(finding, currentResultRunIds, materialBoundary)))
+      .map((finding) => ({
+        id: finding.id,
+        canonical_key: finding.canonical_key,
+        finding_key: finding.finding_key,
+        title: finding.title,
+        location: finding.location,
+        status: finding.status,
+        description: finding.description,
+        exploit_sketch: finding.exploit_sketch,
+      }));
   }
   if (
     spec.verb === "run"
@@ -2647,7 +2681,10 @@ function confirmWorkRows(
       const key = stringValue((row as Record<string, unknown>).finding_key).toLowerCase();
       return Boolean(key && readinessKeys.has(key));
     });
-  return uniqueRowsByFindingKey([...pending, ...readiness]);
+  return uniqueRowsByFindingKey([...pending, ...readiness]).filter((row) => {
+    const inputFingerprint = findingPhaseFingerprint(store, row, "confirm", materialBoundary);
+    return store.phaseEligible(projectId, "finding", Number(row.id), "confirm", inputFingerprint);
+  });
 }
 
 function uniqueRowsByFindingKey(rows: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
@@ -2700,6 +2737,10 @@ function verifyMaterialDrift(store: MetadataStore, projectId: number, verifyFind
     if (!Number.isFinite(runId)) continue;
     const newerPrepare = store.latestPrepareAfterRun(projectId, runId);
     if (!newerPrepare || !isSuccessfulPrepareRun(newerPrepare)) continue;
+    const findingRun = store.getRun(runId);
+    const findingFingerprint = stringValue(findingRun?.material_fingerprint);
+    const prepareFingerprint = stringValue(newerPrepare.material_fingerprint);
+    if (findingFingerprint && prepareFingerprint && findingFingerprint === prepareFingerprint) continue;
     drifted.push({
       findingId: id,
       title: stringValue(finding.title),
@@ -2759,7 +2800,8 @@ function reportWorklist(
     if (isIgnoredFinding(row)) return false;
     if (!selected && !includeExistingReports && rowHasFormalReport(row)) return false;
     if (!rowBelongsToCurrentMaterial(row, currentRunIds ?? new Set(), materialBoundary)) return false;
-    return isExecutionConfirmedFindingStatus(String(row.status ?? "").toLowerCase());
+    if (!isExecutionConfirmedFindingStatus(String(row.status ?? "").toLowerCase())) return false;
+    return Boolean(selected) || store.phaseEligible(projectId, "finding", Number(row.id), "report", findingPhaseFingerprint(store, row, "report", materialBoundary));
   });
   if (selected && rows.length !== selected.size) {
     const found = new Set(rows.map((row) => Number(row.id)));
@@ -2787,6 +2829,7 @@ function reportWorklist(
       fix: stringValue(row.fix) || undefined,
       confidence: Number.isFinite(Number(row.confidence)) ? Number(row.confidence) : undefined,
       decisions: [],
+      phaseInputFingerprint: findingPhaseFingerprint(store, row, "report", materialBoundary),
     })),
   };
 }
@@ -2813,6 +2856,7 @@ function decisionReportWorklist(
     .filter((decision) => isSubmissionReadyDecision(decision, { requireImpactInventory: false }))
     .filter((decision) => isRealTargetDecisionEvidence(stringValue(decision.evidence_level)))
     .filter((decision) => selected || includeExistingReports || !decisionHasFormalReport(decision))
+    .filter((decision) => Boolean(selected) || store.phaseEligible(projectId, "decision", Number(decision.id), "report", decisionReportFingerprint(store, decision, materialBoundary)))
     .filter((decision) => {
       if (!selected) return true;
       const linked = decisionLinkedFindingRows(decision, findingsByKey).filter((finding) => !isIgnoredFinding(finding));
@@ -2858,9 +2902,25 @@ function decisionReportWorklist(
         confidence: maxConfidenceFromRows(linkedFindings),
         decisions: [confirmDecisionDisplayRow(decision)],
         linkedFindings: linkedFindings.map(reportLinkedFindingRow),
+        phaseInputFingerprint: decisionReportFingerprint(store, decision, materialBoundary),
       };
     }),
   };
+}
+
+function decisionReportFingerprint(store: MetadataStore, decision: Record<string, unknown>, boundary?: Record<string, unknown>): string {
+  const runId = Number(decision.run_id);
+  const run = Number.isFinite(runId) ? store.getRun(runId) : undefined;
+  return phaseInputFingerprint({
+    phase: "report",
+    material: run?.material_fingerprint ?? boundary?.material_fingerprint ?? null,
+    decisionId: Number(decision.id),
+    reproduced: decision.reproduced,
+    recommendation: decision.recommendation,
+    evidenceLevel: decision.evidence_level,
+    submissionConfidence: decision.submission_confidence,
+    members: decision.members_json,
+  });
 }
 
 function decisionLinkedFindingRows(decision: Record<string, unknown>, findingsByKey: Map<string, Record<string, unknown>>): Array<Record<string, unknown>> {
@@ -3116,7 +3176,7 @@ function normalizeLaunchSpec(body: Record<string, unknown>, target: string, verb
 // The project-row config_json for a launched ad-hoc run (display only; the daemon runs the spec).
 function launchDisplayConfig(spec: LaunchSpec): Record<string, unknown> {
   const cfg: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries({ provider: spec.provider, model: spec.model, thinking: spec.thinking, maxScopes: spec.maxScopes, mapSteps: spec.mapSteps, digSteps: spec.digSteps, digSamples: spec.digSamples, digConcurrency: spec.digConcurrency, sandboxBackend: spec.sandboxBackend, sandboxImage: spec.sandboxImage, sandboxAllowHostFallback: spec.sandboxAllowHostFallback, sandboxPrepareNetwork: spec.sandboxPrepareNetwork, sandboxConfirmNetwork: spec.sandboxConfirmNetwork, sandboxMemoryMb: spec.sandboxMemoryMb, sandboxCpus: spec.sandboxCpus })) {
+  for (const [k, v] of Object.entries({ provider: spec.provider, model: spec.model, thinking: spec.thinking, maxScopes: spec.maxScopes, mapSteps: spec.mapSteps, digSteps: spec.digSteps, digSamples: spec.digSamples, digConcurrency: spec.digConcurrency, verifyConcurrency: spec.verifyConcurrency, sandboxBackend: spec.sandboxBackend, sandboxImage: spec.sandboxImage, sandboxAllowHostFallback: spec.sandboxAllowHostFallback, sandboxPrepareNetwork: spec.sandboxPrepareNetwork, sandboxConfirmNetwork: spec.sandboxConfirmNetwork, sandboxMemoryMb: spec.sandboxMemoryMb, sandboxCpus: spec.sandboxCpus })) {
     if (v !== undefined) cfg[k] = v;
   }
   return cfg;
@@ -3136,24 +3196,32 @@ function findingsList(c: Ctx): void {
     const currentRuns = currentVisibleRuns(allRuns, materialBoundary, activePrepareRefresh);
     const scopeBoundary = latestScopeInventoryBoundaryRun(currentRuns);
     const currentResultRunIds = runIdSet(currentResultRuns(currentRuns, scopeBoundary));
-    const rows = reportableFindings(c.store.listFindings(id)
-      .filter((finding) => includeStale || (!activePrepareRefresh && rowBelongsToCurrentMaterial(finding, currentResultRunIds, materialBoundary))))
-      .map((finding) => annotateFindingMaterialStaleness(finding, currentResultRunIds, materialBoundary, activePrepareRefresh))
-      .filter((finding) => findingStatusMatches(finding, status))
-      .filter((finding) => findingTrackingMatches(finding, tracking))
-      .filter((finding) => findingSearchMatches(finding, search))
-      .sort((a, b) => findingSeverityScore(b) - findingSeverityScore(a) || String(b.updated_at ?? "").localeCompare(String(a.updated_at ?? "")));
-    const findings = rows.slice(offset, offset + limit).map((finding) => findingDetailRow({ ...finding, timeline: c.store.findingTimeline(Number(finding.id)) }));
-    sendJson(c.res, 200, { findings, total: rows.length, limit, offset });
+    const filter = {
+      status,
+      tracking,
+      search,
+      reportable: true,
+      ...(!includeStale && (activePrepareRefresh || materialBoundary) ? { runIds: activePrepareRefresh ? [] : [...currentResultRunIds] } : {}),
+    };
+    const total = c.store.countFindings(id, filter);
+    const rows = c.store.queryFindings(id, { ...filter, limit, offset })
+      .map((finding) => annotateFindingMaterialStaleness(finding, currentResultRunIds, materialBoundary, activePrepareRefresh));
+    const findings = withLatestFindingAttempts(c.store, rows)
+      .map((finding) => findingDetailRow({ ...finding, timeline: c.store.findingTimeline(Number(finding.id)) }));
+    sendJson(c.res, 200, { findings, total, limit, offset });
   });
 }
 
-function findingSearchMatches(row: Record<string, unknown>, search?: string): boolean {
-  const query = search?.trim().toLowerCase();
-  if (!query) return true;
-  const idMatch = query.match(/^#?(\d+)$/);
-  if (idMatch && String(row.id ?? "") === idMatch[1]) return true;
-  return `${row.title ?? ""} ${row.location ?? ""}`.toLowerCase().includes(query);
+function withLatestFindingAttempts(store: MetadataStore, rows: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  const attempts = store.latestFindingPhaseAttempts("finding", rows.map((row) => Number(row.id)));
+  const byFinding = new Map<number, Array<Record<string, unknown>>>();
+  for (const attempt of attempts) {
+    const id = Number(attempt.subject_id);
+    const current = byFinding.get(id) ?? [];
+    current.push(attempt);
+    byFinding.set(id, current);
+  }
+  return rows.map((row) => ({ ...row, phase_attempts: byFinding.get(Number(row.id)) ?? [] }));
 }
 
 function annotateFindingMaterialStaleness(row: Record<string, unknown>, currentRunIds: Set<number>, boundary?: Record<string, unknown>, activePrepareRefreshStartedAt?: string): Record<string, unknown> {
@@ -3166,24 +3234,17 @@ function annotateFindingMaterialStaleness(row: Record<string, unknown>, currentR
   };
 }
 
-function findingSeverityScore(finding: Record<string, unknown>): number {
-  const severity = String(finding.severity ?? "").toLowerCase();
-  if (severity === "critical") return 5;
-  if (severity === "high") return 4;
-  if (severity === "medium") return 3;
-  if (severity === "low") return 2;
-  if (severity === "info") return 1;
-  return 0;
-}
-
 function reportableFindings(rows: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
-  return dedupeFindingRows(rows.filter(isReportableFinding));
+  // Canonical identity and occurrence provenance are enforced when findings are
+  // ingested. Read paths must not hide distinct claims with title-similarity guesses.
+  return rows.filter(isReportableFinding);
 }
 
 function findingSummaryRow(row: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const key of [
     "id",
+    "uuid",
     "project_id",
     "project_name",
     "project_uuid",
@@ -3192,6 +3253,8 @@ function findingSummaryRow(row: Record<string, unknown>): Record<string, unknown
     "evaluation_uuid",
     "run_id",
     "finding_key",
+    "canonical_key",
+    "occurrence_count",
     "title",
     "location",
     "severity",
@@ -3200,6 +3263,9 @@ function findingSummaryRow(row: Record<string, unknown>): Record<string, unknown
     "duplicate_of_finding_id",
     "scope_id",
     "confidence",
+    "refutation_status",
+    "refutation_reason",
+    "phase_attempts",
     "tracking_status",
     "created_at",
     "updated_at",
@@ -3279,6 +3345,45 @@ function findingReport(c: Ctx): void {
     markdown: stored || renderFindingReportMarkdown(display, decisions),
     source: stored ? "db" : "generated",
   });
+}
+
+function findingLifecycle(c: Ctx): void {
+  const id = Number(c.params.id);
+  const finding = c.store.getFinding(id);
+  if (!finding) return sendJson(c.res, 404, { error: "no such finding" });
+  const decisions = c.store.listConfirmDecisionsForFinding(Number(finding.project_id), String(finding.finding_key ?? ""));
+  sendJson(c.res, 200, {
+    finding: findingSummaryRow(finding),
+    timeline: c.store.findingTimeline(id),
+    occurrences: c.store.findingOccurrences(id),
+    attempts: c.store.listFindingPhaseAttempts("finding", id),
+    decisions: decisions.map((decision) => ({
+      ...confirmDecisionDisplayRow(decision),
+      attempts: c.store.listFindingPhaseAttempts("decision", Number(decision.id)),
+    })),
+  });
+}
+
+async function findingPhaseRetry(c: Ctx): Promise<void> {
+  const id = Number(c.params.id);
+  const finding = c.store.getFinding(id);
+  if (!finding) return sendJson(c.res, 404, { error: "no such finding" });
+  const body = (await readBody(c.req)) as { phase?: string };
+  if (body.phase !== "verify" && body.phase !== "confirm" && body.phase !== "report") {
+    return sendJson(c.res, 400, { error: "phase must be verify, confirm, or report" });
+  }
+  let subjectType: "finding" | "decision" = "finding";
+  let subjectId = id;
+  if (body.phase === "report") {
+    const decisions = c.store.listConfirmDecisionsForFinding(Number(finding.project_id), String(finding.finding_key ?? ""));
+    const decision = decisions.find((row) => c.store.latestFindingPhaseAttempt("decision", Number(row.id), "report")?.state === "blocked") ?? decisions[0];
+    if (decision) {
+      subjectType = "decision";
+      subjectId = Number(decision.id);
+    }
+  }
+  const ok = c.store.requestFindingPhaseRetry(Number(finding.project_id), subjectType, subjectId, body.phase);
+  sendJson(c.res, ok ? 200 : 409, ok ? { ok: true, phase: body.phase, subjectType, subjectId } : { error: "phase retry could not be queued" });
 }
 
 function confirmDecisionReport(c: Ctx): void {
@@ -3493,15 +3598,6 @@ function isIgnoredFinding(row: Record<string, unknown>): boolean {
   return String(row.tracking_status ?? "open") === "ignored";
 }
 
-const FINDING_STATUS_RANK: Record<string, number> = {
-  discharged: 0,
-  refuted: 1,
-  suspected: 2,
-  "confirmed-source": 3,
-  "confirmed-executable": 4,
-  "confirmed-differential": 5,
-};
-
 const FINDING_SEVERITY_RANK: Record<string, number> = {
   info: 0,
   low: 1,
@@ -3510,102 +3606,8 @@ const FINDING_SEVERITY_RANK: Record<string, number> = {
   critical: 4,
 };
 
-function dedupeFindingRows(rows: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
-  const best = new Map<string, Record<string, unknown>>();
-  for (const row of rows) {
-    const key = findingDisplayDedupeKey(row);
-    const current = best.get(key);
-    if (!current || compareFindingRows(row, current) > 0) best.set(key, row);
-  }
-  const exactDeduped = rows.filter((row) => best.get(findingDisplayDedupeKey(row)) === row);
-  const confirmed = exactDeduped.filter((row) => isConfirmedFindingStatus(String(row.status ?? "").toLowerCase()));
-  return exactDeduped.filter((row) => {
-    if (isConfirmedFindingStatus(String(row.status ?? "").toLowerCase())) return true;
-    return !confirmed.some((candidate) => likelyVerifiedDuplicate(row, candidate));
-  });
-}
-
-function findingDisplayDedupeKey(row: Record<string, unknown>): string {
-  const project = normalizeDedupePart(row.project_id ?? row.project_uuid ?? "");
-  const title = normalizeDedupePart(cleanFindingTitle(row.title));
-  const location = normalizeDedupePart(row.location);
-  if (title || location) return `${project}|${location}|${title}`;
-  return `${project}|${normalizeDedupePart(row.finding_key ?? row.id ?? "")}`;
-}
-
-function normalizeDedupePart(value: unknown): string {
-  return String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
-}
-
-function likelyVerifiedDuplicate(row: Record<string, unknown>, confirmed: Record<string, unknown>): boolean {
-  if (rank(FINDING_STATUS_RANK, confirmed.status) <= rank(FINDING_STATUS_RANK, row.status)) return false;
-  if (normalizeDedupePart(row.project_id ?? row.project_uuid ?? "") !== normalizeDedupePart(confirmed.project_id ?? confirmed.project_uuid ?? "")) return false;
-  const scope = normalizeDedupePart(row.scope_id ?? "");
-  const location = normalizeDedupePart(row.location ?? "");
-  if (scope && scope === normalizeDedupePart(confirmed.scope_id ?? "") && location && location === normalizeDedupePart(confirmed.location ?? "")) {
-    return relatedFindingTitles(row.title, confirmed.title);
-  }
-  return stronglyRelatedFindingTitles(row.title, confirmed.title);
-}
-
-function relatedFindingTitles(a: unknown, b: unknown): boolean {
-  const aTokens = findingTitleTokens(a);
-  const bTokens = findingTitleTokens(b);
-  if (aTokens.size === 0 || bTokens.size === 0) return false;
-  let overlap = 0;
-  for (const token of aTokens) if (bTokens.has(token)) overlap += 1;
-  return overlap >= Math.min(3, Math.min(aTokens.size, bTokens.size));
-}
-
-function stronglyRelatedFindingTitles(a: unknown, b: unknown): boolean {
-  const aTokens = findingTitleTokens(a);
-  const bTokens = findingTitleTokens(b);
-  if (aTokens.size < 5 || bTokens.size < 5) return false;
-  let overlap = 0;
-  for (const token of aTokens) if (bTokens.has(token)) overlap += 1;
-  const smaller = Math.min(aTokens.size, bTokens.size);
-  const larger = Math.max(aTokens.size, bTokens.size);
-  return overlap >= 5 && overlap / smaller >= 0.7 && overlap / larger >= 0.5;
-}
-
-const FINDING_TITLE_STOPWORDS = new Set(["a", "an", "and", "are", "at", "be", "by", "can", "for", "from", "in", "is", "it", "of", "on", "or", "the", "to", "with"]);
-
-function findingTitleTokens(value: unknown): Set<string> {
-  return new Set(
-    normalizeDedupePart(cleanFindingTitle(value))
-      .split(/[^a-z0-9]+/i)
-      .filter((token) => token.length >= 3 && !FINDING_TITLE_STOPWORDS.has(token)),
-  );
-}
-
-function compareFindingRows(a: Record<string, unknown>, b: Record<string, unknown>): number {
-  for (const delta of [
-    rank(FINDING_STATUS_RANK, a.status) - rank(FINDING_STATUS_RANK, b.status),
-    rank(FINDING_SEVERITY_RANK, a.severity) - rank(FINDING_SEVERITY_RANK, b.severity),
-    numberish(a.confidence) - numberish(b.confidence),
-    findingRichness(a) - findingRichness(b),
-    timestampMs(a.updated_at) - timestampMs(b.updated_at),
-  ]) {
-    if (delta !== 0) return delta;
-  }
-  return numberish(a.id) - numberish(b.id);
-}
-
 function rank(table: Record<string, number>, value: unknown): number {
   return table[String(value ?? "").toLowerCase()] ?? -1;
-}
-
-function numberish(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : Number(value) || 0;
-}
-
-function timestampMs(value: unknown): number {
-  const n = Date.parse(String(value ?? ""));
-  return Number.isFinite(n) ? n : 0;
-}
-
-function findingRichness(row: Record<string, unknown>): number {
-  return ["description", "evidence", "exploit_sketch", "fix"].reduce((sum, key) => sum + String(row[key] ?? "").trim().length, 0);
 }
 
 function findingCounts(rows: Array<Record<string, unknown>>): Record<string, number> {
@@ -3616,16 +3618,6 @@ function findingCounts(rows: Array<Record<string, unknown>>): Record<string, num
     counts[status] = (counts[status] ?? 0) + 1;
   }
   return counts;
-}
-
-function globalFindingStats(rows: Array<Record<string, unknown>>): { total: number; active: number; byStatus: Record<string, number>; byTracking: Record<string, number> } {
-  const byStatus = findingCounts(rows);
-  const byTracking: Record<string, number> = {};
-  for (const row of rows) {
-    const tracking = String(row.tracking_status ?? "open") || "open";
-    byTracking[tracking] = (byTracking[tracking] ?? 0) + 1;
-  }
-  return { total: rows.length, active: rows.filter((row) => !isIgnoredFinding(row)).length, byStatus, byTracking };
 }
 
 function confirmDecisionsList(c: Ctx): void {
@@ -4462,6 +4454,8 @@ async function daemonRunUpdate(c: Ctx): Promise<void> {
     confirmDecisions?: Parameters<MetadataStore["upsertConfirmDecisions"]>[2];
     decisionPath?: string;
     runScopes?: { done: number; target: number };
+    materialFingerprint?: string;
+    phaseAttempt?: Parameters<MetadataStore["recordFindingPhaseAttempt"]>[2];
     stage?: { name: string; info: Record<string, unknown> };
     health?: Parameters<MetadataStore["recordRunHealth"]>[1];
     backlog?: Parameters<MetadataStore["replaceDiscoveryBacklog"]>[2];
@@ -4473,6 +4467,8 @@ async function daemonRunUpdate(c: Ctx): Promise<void> {
     c.store.updateRunCoverage(runId, c.store.scopeProgress(projectId));
   }
   if (body.runScopes) c.store.updateRunScopes(runId, body.runScopes.done, body.runScopes.target);
+  if (typeof body.materialFingerprint === "string" && body.materialFingerprint.trim()) c.store.updateRunMaterialFingerprint(runId, body.materialFingerprint.trim());
+  if (body.phaseAttempt) c.store.recordFindingPhaseAttempt(projectId, runId, body.phaseAttempt);
   if (body.stage) c.store.recordStage(runId, body.stage.name, body.stage.info);
   if (body.health) c.store.recordRunHealth(runId, body.health);
   if (body.backlog) c.store.replaceDiscoveryBacklog(projectId, runId, body.backlog);
@@ -4588,7 +4584,30 @@ function verifyWorklist(store: MetadataStore, projectId: number, currentResultRu
       if (!fromStart || row.confirm_status != null) return false;
       return status === "confirmed-executable" || status === "confirmed-differential";
     })
-    .map((row) => normalizeProjectVerifyFindings(store, projectId, findingDetailRow(row)));
+    .map((row) => {
+      const inputFingerprint = findingPhaseFingerprint(store, row, "verify", materialBoundary);
+      return { row, inputFingerprint };
+    })
+    .filter(({ row, inputFingerprint }) => store.phaseEligible(projectId, "finding", Number(row.id), "verify", inputFingerprint))
+    .map(({ row, inputFingerprint }) => ({
+      ...(normalizeProjectVerifyFindings(store, projectId, findingDetailRow(row)) as Record<string, unknown>),
+      _phaseAttempt: { subjectType: "finding", subjectId: Number(row.id), inputFingerprint },
+    }));
+}
+
+function findingPhaseFingerprint(store: MetadataStore, row: Record<string, unknown>, phase: "verify" | "confirm" | "report", boundary?: Record<string, unknown>): string {
+  const full = Number.isFinite(Number(row.id)) ? store.getFinding(Number(row.id)) ?? row : row;
+  const runId = Number(full.run_id);
+  const run = Number.isFinite(runId) ? store.getRun(runId) : undefined;
+  return phaseInputFingerprint({
+    phase,
+    material: run?.material_fingerprint ?? boundary?.material_fingerprint ?? null,
+    findingId: Number(full.id),
+    canonicalKey: full.canonical_key ?? full.finding_key,
+    status: full.status,
+    ...(phase === "verify" ? { confirmStatus: full.confirm_status ?? null } : {}),
+    updatedAt: full.updated_at,
+  });
 }
 
 async function daemonJobStatus(c: Ctx): Promise<void> {
@@ -5060,6 +5079,7 @@ function launchSpec(store: MetadataStore, project: Record<string, unknown>, body
     maxSteps: num(merged.maxSteps),
     digSamples: num(merged.digSamples),
     digConcurrency: num(merged.digConcurrency),
+    verifyConcurrency: num(merged.verifyConcurrency),
     sandboxBackend: backend(merged.sandboxBackend),
     sandboxImage: str(merged.sandboxImage),
     sandboxAllowHostFallback: typeof merged.sandboxAllowHostFallback === "boolean" ? merged.sandboxAllowHostFallback : undefined,
@@ -5111,6 +5131,7 @@ function runBodyConfigOverrides(body: Record<string, unknown>): Record<string, u
     "maxSteps",
     "digSamples",
     "digConcurrency",
+    "verifyConcurrency",
     "sandboxBackend",
     "sandboxImage",
     "sandboxAllowHostFallback",

@@ -734,3 +734,65 @@ test("store: ambiguous reproduced decisions do not default to real-target eviden
   assert.equal(db.countConfirmedBugs(projectId), 0);
   db.close();
 });
+
+test("store: exact findings across runs keep one canonical row with occurrence and alias provenance", async () => {
+  const db = await tempDb();
+  const projectId = db.upsertProject({ name: "canonical" });
+  const firstRun = db.startRun({ projectId, kind: "run", runDir: "/runs/canonical-1", materialFingerprint: "sha256:same" });
+  assert.equal(db.getRun(firstRun).material_fingerprint, "sha256:same");
+  db.upsertFindings(projectId, firstRun, [{ findingKey: "kfirst", title: "Recipient is not bound", location: "src/Vault.sol:41", severity: "high", status: "suspected" }]);
+  const secondRun = db.startRun({ projectId, kind: "audit", runDir: "/runs/canonical-2", materialFingerprint: "sha256:same" });
+  db.upsertFindings(projectId, secondRun, [{ findingKey: "ksecond", title: "Recipient is not bound", location: "src/Vault.sol:41", severity: "high", status: "confirmed-executable" }]);
+
+  const rows = db.listFindings(projectId);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].finding_key, "kfirst", "the canonical key stays immutable");
+  assert.equal(rows[0].status, "confirmed-executable");
+  assert.equal(rows[0].occurrence_count, 2);
+  assert.equal(db.findingOccurrences(Number(rows[0].id)).length, 2);
+  assert.equal(db.setFindingConfirmStatus(projectId, "ksecond", "reproduced"), true, "a later occurrence key resolves through aliases");
+  assert.equal(db.getFinding(Number(rows[0].id)).confirm_status, "reproduced");
+  db.close();
+});
+
+test("store: completed finding identity migrations do not rewrite alias provenance on restart", async () => {
+  const { dbPath } = await tempDbPath();
+  const db = new MetadataStore(dbPath);
+  const projectId = db.upsertProject({ name: "stable-identity-migration" });
+  const runId = db.startRun({ projectId, kind: "run", runDir: "/runs/stable-identity" });
+  db.upsertFindings(projectId, runId, [{ findingKey: "stable-key", title: "Stable finding", location: "src/x.ts:1", status: "suspected" }]);
+  db.close();
+
+  const before = new DatabaseSync(dbPath);
+  before.prepare("UPDATE finding_key_alias SET updated_at = 'provenance-sentinel' WHERE alias_key = 'stable-key'").run();
+  before.close();
+
+  const reopened = new MetadataStore(dbPath);
+  reopened.close();
+  const after = new DatabaseSync(dbPath);
+  const alias = after.prepare("SELECT updated_at FROM finding_key_alias WHERE alias_key = 'stable-key'").get();
+  after.close();
+  assert.equal(alias.updated_at, "provenance-sentinel");
+});
+
+test("store: blocked finding phases are idempotent until inputs change or an operator requests retry", async () => {
+  const db = await tempDb();
+  const projectId = db.upsertProject({ name: "attempts" });
+  const auditRun = db.startRun({ projectId, kind: "run", runDir: "/runs/attempts-audit" });
+  db.upsertFindings(projectId, auditRun, [{ findingKey: "kblocked", title: "Blocked claim", location: "x.ts:1", severity: "high", status: "suspected" }]);
+  const finding = db.listFindings(projectId)[0];
+  const verifyRun = db.startRun({ projectId, kind: "verify", runDir: "/runs/attempts-verify" });
+  db.recordFindingPhaseAttempt(projectId, verifyRun, { subjectType: "finding", subjectId: Number(finding.id), phase: "verify", inputFingerprint: "sha256:input-a", state: "blocked", outcome: "no-verdict", blocker: "toolchain unavailable" });
+
+  assert.equal(db.phaseEligible(projectId, "finding", Number(finding.id), "verify", "sha256:input-a"), false);
+  assert.equal(db.phaseEligible(projectId, "finding", Number(finding.id), "verify", "sha256:input-b"), true, "changed materials reopen the phase automatically");
+  assert.equal(db.requestFindingPhaseRetry(projectId, "finding", Number(finding.id), "verify"), true);
+  assert.equal(db.phaseEligible(projectId, "finding", Number(finding.id), "verify", "sha256:input-a"), true);
+
+  const retryRun = db.startRun({ projectId, kind: "verify", runDir: "/runs/attempts-retry" });
+  db.recordFindingPhaseAttempt(projectId, retryRun, { subjectType: "finding", subjectId: Number(finding.id), phase: "verify", inputFingerprint: "sha256:input-a", state: "running" });
+  db.recordFindingPhaseAttempt(projectId, retryRun, { subjectType: "finding", subjectId: Number(finding.id), phase: "verify", inputFingerprint: "sha256:input-a", state: "settled", outcome: "refuted" });
+  const attempts = db.listFindingPhaseAttempts("finding", Number(finding.id));
+  assert.deepEqual(attempts.map((attempt) => [attempt.attempt_number, attempt.state]), [[1, "blocked"], [2, "settled"]]);
+  db.close();
+});

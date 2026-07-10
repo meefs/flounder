@@ -63,6 +63,15 @@ export interface AgentFinding {
    * (flips its status + attaches the PoC) instead of being recorded as a new finding. The link is
    * known by construction (claim N is seeded from input finding N), never re-matched by content. */
   originId?: number;
+  /** Durable lifecycle attempt context supplied by the project worklist. */
+  phaseAttempt?: {
+    subjectType: "finding" | "decision";
+    subjectId: number;
+    inputFingerprint: string;
+  };
+  /** Explicit coverage state for the independent refutation pass. */
+  refutationStatus?: "pending" | "running" | "passed" | "refuted" | "blocked";
+  refutationReason?: string;
 }
 
 export interface CommandRunRecord {
