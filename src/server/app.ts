@@ -24,6 +24,7 @@ import { getProviders, getModels } from "@earendil-works/pi-ai/compat";
 import { type LaunchSpec, ActivityBus, type Activity, type ReportFindingSpec, type ConfirmSettledRow } from "./run-manager.js";
 import { THINKING_LEVELS } from "../config.js";
 import { projectHistoryDir } from "../trace/history.js";
+import { positiveIntegerId } from "../util/ids.js";
 import { loadScopeInventory, saveScopeInventory } from "../agent/scope-store.js";
 import { deriveScopeNote } from "../scope-note.js";
 import { confirmSelectorsForFinding } from "../util/confirm-selector.js";
@@ -57,6 +58,10 @@ const PERSISTED_ACTIVITY_TAIL_BYTES = 16 * 1024 * 1024;
 const BUG_BOUNTY_CONTEST_KIND = "bug-bounty-contest";
 const DEFAULT_CONTEST_BATCH_SCOPES = 10;
 const DEFAULT_CONTEST_DIG_CONCURRENCY = 5;
+const VERIFY_ARTIFACT_RECONCILIATION_VERSION = 1;
+const VERIFY_ARTIFACT_RECONCILIATION_LIMIT = 50;
+const MAX_VERIFY_ARTIFACT_REPLAY_ROWS = 1_000;
+const MAX_VERIFY_ARTIFACT_REPLAY_BYTES = 8 * 1024 * 1024;
 type ProjectStatusFilter = (typeof PROJECT_STATUS_FILTERS)[number];
 type ProjectStatusCounts = Record<"all" | ProjectStatusFilter, number>;
 
@@ -694,6 +699,8 @@ const ROUTES: Route[] = [
   route({ method: "GET", path: "/api/daemon/stream", summary: "(daemon) SSE: poll/cancel nudges from the server.", hidden: true, handler: daemonStream }),
   route({ method: "POST", path: "/api/daemon/claim", summary: "(daemon) Atomically claim the oldest queued job.", hidden: true, handler: daemonClaim }),
   route({ method: "POST", path: "/api/daemon/runs", summary: "(daemon) Start a run row for a claimed job; links job→run.", hidden: true, handler: daemonRunStart }),
+  route({ method: "POST", path: "/api/daemon/reconciliation/worklist", summary: "(daemon) List terminal verify artifacts owned by this daemon that need semantic replay.", hidden: true, handler: daemonReconciliationWorklist }),
+  route({ method: "POST", path: "/api/daemon/reconciliation/runs/:id", summary: "(daemon) Replay bounded terminal verify verdict artifacts through canonical lifecycle reconciliation.", hidden: true, handler: daemonReconcileRunArtifacts }),
   route({ method: "PATCH", path: "/api/daemon/runs/:id", summary: "(daemon) Report run progress: scopes / findings / confirm-decisions / finish.", hidden: true, handler: daemonRunUpdate }),
   route({ method: "POST", path: "/api/daemon/runs/:id/activity", summary: "(daemon) Push a batch of token-level activity events for the live log.", hidden: true, handler: daemonRunActivity }),
   route({ method: "POST", path: "/api/daemon/pipeline-worklist", summary: "(daemon) Resolve verify/confirm/report work for an in-process pipeline job.", hidden: true, handler: daemonPipelineWorklist }),
@@ -2474,6 +2481,9 @@ async function runLaunch(c: Ctx): Promise<void> {
     spec.pipelineStart = "settle";
     spec.maxScopes = 0;
   }
+  if (hasInvalidVerifyOriginId(spec.verifyFindings)) {
+    return sendJson(c.res, 400, { error: "verifyFindings originId/origin_id must be a positive integer" });
+  }
   const materialDrift = verifyMaterialDrift(c.store, projectId, spec.verifyFindings, body.allowMaterialDrift === true);
   if (materialDrift) return sendJson(c.res, 409, materialDrift);
   if (spec.verb === "run" && spec.pipeline && pipelineRoundComplete(spec, progress, c.store, projectId, currentResultRunIds, materialBoundary, requiresRealTargetConfirmation)) {
@@ -2788,7 +2798,12 @@ function confirmWorkRows(
       const key = stringValue((row as Record<string, unknown>).finding_key).toLowerCase();
       return Boolean(key && readinessKeys.has(key));
     });
-  return uniqueRowsByFindingKey([...pending, ...readiness]).filter((row) => {
+  const conflictRetries = store.confirmableContext(projectId)
+    .filter((row) => row.refutation_status === "conflict")
+    .filter((row) => store.hasFindingPhaseRetry(projectId, "finding", Number(row.id), "confirm"))
+    .filter((row) => confirmableRunDir(row as unknown as Record<string, unknown>))
+    .filter((row) => rowBelongsToCurrentMaterial(row as unknown as Record<string, unknown>, currentResultRunIds, materialBoundary));
+  return uniqueRowsByFindingKey([...pending, ...readiness, ...conflictRetries]).filter((row) => {
     const inputFingerprint = findingPhaseFingerprint(store, row, "confirm", materialBoundary);
     return store.phaseEligible(projectId, "finding", Number(row.id), "confirm", inputFingerprint);
   });
@@ -2881,12 +2896,22 @@ function extractVerifyOriginIds(input: unknown): number[] {
     if (!value || typeof value !== "object") return;
     const row = value as Record<string, unknown>;
     for (const key of ["originId", "origin_id", "id"]) {
-      const raw = row[key];
-      if (typeof raw === "number" && Number.isInteger(raw)) out.add(raw);
+      const id = positiveIntegerId(row[key]);
+      if (id !== undefined) out.add(id);
     }
   };
   visit(input);
   return [...out];
+}
+
+function hasInvalidVerifyOriginId(input: unknown): boolean {
+  if (Array.isArray(input)) return input.some(hasInvalidVerifyOriginId);
+  if (!input || typeof input !== "object") return false;
+  const row = input as Record<string, unknown>;
+  for (const key of ["originId", "origin_id"]) {
+    if (key in row && positiveIntegerId(row[key]) === undefined) return true;
+  }
+  return false;
 }
 
 function reportWorklist(
@@ -2905,6 +2930,7 @@ function reportWorklist(
   const rows = reportableFindings(store.listFindings(projectId)).filter((row) => {
     if (selected && !selected.has(Number(row.id))) return false;
     if (isIgnoredFinding(row)) return false;
+    if (row.refutation_status === "conflict") return false;
     if (!selected && !includeExistingReports && rowHasFormalReport(row)) return false;
     if (!rowBelongsToCurrentMaterial(row, currentRunIds ?? new Set(), materialBoundary)) return false;
     if (!isExecutionConfirmedFindingStatus(String(row.status ?? "").toLowerCase())) return false;
@@ -2962,6 +2988,8 @@ function decisionReportWorklist(
   const decisions = currentConfirmDecisions(store.listConfirmDecisions(projectId).filter((row) => rowBelongsToCurrentMaterial(row, currentIds, materialBoundary)))
     .filter((decision) => isSubmissionReadyDecision(decision, { requireImpactInventory: false }))
     .filter((decision) => isRealTargetDecisionEvidence(stringValue(decision.evidence_level)))
+    .filter((decision) => decisionLinkedFindingRows(decision, findingsByKey)
+      .every((finding) => finding.refutation_status !== "conflict"))
     .filter((decision) => selected || includeExistingReports || !decisionHasFormalReport(decision))
     .filter((decision) => Boolean(selected) || store.phaseEligible(projectId, "decision", Number(decision.id), "report", decisionReportFingerprint(store, decision, materialBoundary)))
     .filter((decision) => {
@@ -2974,6 +3002,12 @@ function decisionReportWorklist(
   if (selected) {
     const missing = [...selected].filter((id) => !selectedCovered.has(id));
     if (missing.length > 0) {
+      const conflicted = missing.filter((id) => findingsById.get(id)?.refutation_status === "conflict");
+      if (conflicted.length > 0) {
+        const subject = conflicted.length === 1 ? "finding" : "findings";
+        const verb = conflicted.length === 1 ? "has" : "have";
+        return { error: `${subject} ${conflicted.join(", ")} ${verb} an unresolved local/real-target evidence conflict` };
+      }
       const unknown = missing.filter((id) => !findingsById.has(id));
       const suffix = unknown.length > 0 ? " is not a current finding for this project" : " is not linked to a submission-ready decision";
       return { error: `finding ${missing.join(", ")}${suffix}` };
@@ -3675,7 +3709,7 @@ function isReportableFinding(row: Record<string, unknown>): boolean {
   const status = String(row.status ?? "").toLowerCase();
   if (status === "discharged") return false;
   const severity = String(row.severity ?? "").toLowerCase();
-  if (severity === "info" && !isConfirmedFindingStatus(status)) return false;
+  if (severity === "info" && status !== "refuted" && !isConfirmedFindingStatus(status)) return false;
   return true;
 }
 
@@ -4656,6 +4690,25 @@ function authorizedDaemonRun(c: Ctx, daemon: Record<string, unknown>, runId: num
   return { run, job };
 }
 
+/** Historical artifact replay is authorized by the immutable executor stamped on
+ * the run, never by job.run_id (which intentionally follows the active phase). */
+function authorizedDaemonOwnedRun(c: Ctx, daemon: Record<string, unknown>, runId: number): Record<string, unknown> | null {
+  if (!Number.isInteger(runId) || runId <= 0) {
+    sendJson(c.res, 400, { error: "a valid run id is required" });
+    return null;
+  }
+  const run = c.store.getRun(runId);
+  if (!run) {
+    sendJson(c.res, 404, { error: "no such run" });
+    return null;
+  }
+  if (Number(run.daemon_id) !== Number(daemon.id)) {
+    sendJson(c.res, 403, { error: "run is assigned to another daemon" });
+    return null;
+  }
+  return run;
+}
+
 async function daemonRegister(c: Ctx): Promise<void> {
   const daemon = daemonAuth(c);
   if (!daemon) return;
@@ -4706,6 +4759,92 @@ function daemonClaim(c: Ctx): void {
   sendJson(c.res, 200, job ? { job } : {});
 }
 
+async function daemonReconciliationWorklist(c: Ctx): Promise<void> {
+  const daemon = daemonAuth(c);
+  if (!daemon) return;
+  const body = (await readBody(c.req)) as { beforeId?: unknown; limit?: unknown };
+  const beforeId = body.beforeId === undefined ? undefined : Number(body.beforeId);
+  if (beforeId !== undefined && (!Number.isInteger(beforeId) || beforeId <= 0)) {
+    return sendJson(c.res, 400, { error: "beforeId must be a positive integer" });
+  }
+  const requestedLimit = body.limit === undefined ? VERIFY_ARTIFACT_RECONCILIATION_LIMIT : Number(body.limit);
+  if (!Number.isInteger(requestedLimit) || requestedLimit <= 0) {
+    return sendJson(c.res, 400, { error: "limit must be a positive integer" });
+  }
+  const rows = c.store.listDaemonArtifactReconciliationRuns(
+    Number(daemon.id),
+    VERIFY_ARTIFACT_RECONCILIATION_VERSION,
+    beforeId,
+    Math.min(requestedLimit, 100),
+  );
+  sendJson(c.res, 200, {
+    version: VERIFY_ARTIFACT_RECONCILIATION_VERSION,
+    runs: rows.map((run) => ({ runId: run.id, runDir: run.run_dir })),
+    ...(rows.length > 0 ? { nextBeforeId: rows[rows.length - 1]!.id } : {}),
+  });
+}
+
+async function daemonReconcileRunArtifacts(c: Ctx): Promise<void> {
+  const daemon = daemonAuth(c);
+  if (!daemon) return;
+  const runId = Number(c.params.id);
+  const run = authorizedDaemonOwnedRun(c, daemon, runId);
+  if (!run) return;
+  if (run.status === "running") return sendJson(c.res, 409, { error: "only terminal runs can replay artifacts" });
+  if (!daemonRunIsVerify(run)) return sendJson(c.res, 400, { error: "only verify runs can replay verdict artifacts" });
+
+  const body = (await readBody(c.req)) as { version?: unknown; artifacts?: unknown };
+  if (body.version !== VERIFY_ARTIFACT_RECONCILIATION_VERSION) {
+    return sendJson(c.res, 409, { error: "unsupported artifact reconciliation version", version: VERIFY_ARTIFACT_RECONCILIATION_VERSION });
+  }
+  if (!Array.isArray(body.artifacts) || body.artifacts.length > MAX_VERIFY_ARTIFACT_REPLAY_ROWS) {
+    return sendJson(c.res, 400, { error: `artifacts must be an array of at most ${MAX_VERIFY_ARTIFACT_REPLAY_ROWS} rows` });
+  }
+  if (Buffer.byteLength(JSON.stringify(body.artifacts), "utf8") > MAX_VERIFY_ARTIFACT_REPLAY_BYTES) {
+    return sendJson(c.res, 413, { error: "artifact replay payload is too large" });
+  }
+  const artifacts = normalizeVerifyArtifactReplay(body.artifacts);
+  if (!artifacts) return sendJson(c.res, 400, { error: "artifact replay rows must be unique negative verify verdicts with positive origin ids" });
+  const applied = c.store.reconcileTerminalVerifyArtifacts(runId, artifacts, VERIFY_ARTIFACT_RECONCILIATION_VERSION);
+  if (!applied) return sendJson(c.res, 409, { error: "run is not eligible for artifact reconciliation" });
+  sendJson(c.res, 200, { ok: true, version: VERIFY_ARTIFACT_RECONCILIATION_VERSION, verdicts: artifacts.length });
+}
+
+function daemonRunIsVerify(run: Record<string, unknown>): boolean {
+  if (run.kind === "verify") return true;
+  const budgets = safeParse(run.budgets_json);
+  return Boolean(budgets && typeof budgets === "object" && !Array.isArray(budgets) && (budgets as Record<string, unknown>).verify === true);
+}
+
+function normalizeVerifyArtifactReplay(input: unknown[]): Array<Record<string, unknown>> | null {
+  const allowedText = ["title", "location", "severity", "scopeId", "scope_id", "description", "evidence", "exploitSketch", "exploit_sketch", "fix", "confirmationStatus", "status"] as const;
+  const seen = new Set<number>();
+  const rows: Array<Record<string, unknown>> = [];
+  for (const value of input) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const raw = value as Record<string, unknown>;
+    const originId = positiveIntegerId(raw.originId ?? raw.origin_id);
+    if (originId === undefined || seen.has(originId)) return null;
+    const title = typeof raw.title === "string" ? raw.title : "";
+    const status = typeof (raw.confirmationStatus ?? raw.status) === "string" ? String(raw.confirmationStatus ?? raw.status) : "";
+    if (!/^\s*REFUTED\s*:/i.test(title) && status !== "suspected") return null;
+    const row: Record<string, unknown> = { originId };
+    for (const key of allowedText) {
+      const field = raw[key];
+      if (field === undefined) continue;
+      if (typeof field !== "string" || field.length > 1_000_000) return null;
+      row[key] = field;
+    }
+    if (raw.confidence !== undefined) {
+      if (typeof raw.confidence !== "number" || !Number.isFinite(raw.confidence)) return null;
+      row.confidence = raw.confidence;
+    }
+    seen.add(originId);
+    rows.push(row);
+  }
+  return rows;
+}
+
 async function daemonRunStart(c: Ctx): Promise<void> {
   const daemon = daemonAuth(c);
   if (!daemon) return;
@@ -4737,6 +4876,7 @@ async function daemonRunStart(c: Ctx): Promise<void> {
     : c.store.upsertProject({ name: trackingName, origin: expectedOrigin, config: body.budgets });
   const runId = c.store.startRun({
     projectId,
+    daemonId: Number(daemon.id),
     kind: body.kind ?? "run",
     runDir: body.runDir,
     provider: body.provider,
@@ -4868,6 +5008,12 @@ async function daemonPipelineWorklist(c: Ctx): Promise<void> {
       return sendJson(c.res, 200, { phase, requiresRealTargetConfirmation, inputRunDirs: [], confirmKeys: [] });
     }
     const rows = pending;
+    const conflictRetryKeys = new Set(rows
+      .filter((row) => row.refutation_status === "conflict")
+      .map((row) => stringValue((row as Record<string, unknown>).finding_key).toLowerCase())
+      .filter(Boolean));
+    const settledRows = currentDecisions.filter((decision) =>
+      !confirmDecisionMemberKeys(decision).some((key) => conflictRetryKeys.has(key)));
     return sendJson(c.res, 200, {
       phase,
       requiresRealTargetConfirmation,
@@ -4875,7 +5021,7 @@ async function daemonPipelineWorklist(c: Ctx): Promise<void> {
       inputRunDir: rows[0] ? confirmableRunDir(rows[0] as unknown as Record<string, unknown>) || undefined : undefined,
       confirmKeys: rows.flatMap((row) => confirmSelectorsForFinding(row as unknown as { id?: unknown; finding_key?: unknown })),
       confirmFindings: confirmFindingSeeds(c.store, projectId, rows),
-      confirmSettledRows: confirmSettledRows(currentDecisions),
+      confirmSettledRows: confirmSettledRows(settledRows),
     });
   }
 
@@ -4894,6 +5040,8 @@ function verifyWorklist(store: MetadataStore, projectId: number, currentResultRu
     .filter((row) => !isIgnoredFinding(row)))
     .filter((row) => {
       const status = String(row.status ?? "");
+      if (row.refutation_status === "conflict"
+        && store.hasFindingPhaseRetry(projectId, "finding", Number(row.id), "verify")) return true;
       if (status === "suspected" || status === "confirmed-source") return true;
       if (!fromStart || row.confirm_status != null) return false;
       return status === "confirmed-executable" || status === "confirmed-differential";
@@ -5431,13 +5579,14 @@ function normalizeProjectVerifyFindings(store: MetadataStore, projectId: number,
   if (Array.isArray(input)) return input.map((item) => normalizeProjectVerifyFindings(store, projectId, item));
   if (!input || typeof input !== "object") return input;
   const row = input as Record<string, unknown>;
-  if (typeof row.originId === "number" || typeof row.origin_id === "number") return input;
-  if (typeof row.id !== "number" || !Number.isFinite(row.id)) return input;
-  const finding = store.getFinding(row.id);
+  if (positiveIntegerId(row.originId ?? row.origin_id) !== undefined) return input;
+  const id = positiveIntegerId(row.id);
+  if (id === undefined) return input;
+  const finding = store.getFinding(id);
   if (finding && Number(finding.project_id) === projectId) {
-    return { ...findingDetailRow(finding), ...row, originId: row.id };
+    return { ...findingDetailRow(finding), ...row, originId: id };
   }
-  return { ...row, originId: row.id };
+  return { ...row, originId: id };
 }
 
 function runBodyConfigOverrides(body: Record<string, unknown>): Record<string, unknown> {

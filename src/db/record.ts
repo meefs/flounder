@@ -8,7 +8,7 @@ import path from "node:path";
 import { renderDisclosure, reportArtifactName } from "../reports/disclosure.js";
 import { findingContentKey } from "../util/finding-key.js";
 import type { AuditorConfig } from "../config.js";
-import type { AgentFinding, AuditScope } from "../agent/tools.js";
+import { isRefutedFindingTitle, type AgentFinding, type AuditScope } from "../agent/tools.js";
 import type { CoverageGap, ResourceRequest, RunHealth } from "../agent/discovery-artifacts.js";
 import type { RankedFinding } from "../types.js";
 import { MetadataStore, type Coverage, type DiscoveryBacklogInput, type FindingPhaseAttemptInput, type FindingRow, type FindingStatus, type RunKind, type RunStatus, type ScopeRow } from "./store.js";
@@ -248,17 +248,14 @@ export class RunRecorder implements RunTracker {
   }
 }
 
-// The DB status is the kernel's confirmationStatus, except a skeptic-disputed finding or a
-// verify-mode REFUTED verdict is surfaced as structured "refuted" state instead of leaving it
-// in the suspected queue with a status prefix embedded in the title.
-function toFindingStatus(finding: AgentFinding): FindingStatus {
-  if (finding.disputed || isRefutedTitle(finding.title)) return "refuted";
+// The DB status is the kernel's confirmationStatus, except an explicitly REFUTED verify verdict
+// (or a skeptic-disputed hypothesis) is surfaced as structured "refuted" state. A differential
+// confirmation that merely has a human-review dispute remains execution-confirmed and keeps its
+// disclosure trail; its `disputed` metadata carries the skeptic objection.
+export function toFindingStatus(finding: AgentFinding): FindingStatus {
+  if (isRefutedFindingTitle(finding.title) || (finding.disputed && !isConfirmedLike(finding.confirmationStatus))) return "refuted";
   if (finding.originId != null && finding.confirmationStatus === "suspected") return "needs-evidence";
   return finding.confirmationStatus as FindingStatus;
-}
-
-function isRefutedTitle(title: string): boolean {
-  return /^\s*REFUTED\s*:/i.test(title);
 }
 
 function stripFindingStatusPrefix(title: string): string {
@@ -279,15 +276,16 @@ function stableFindingKey(finding: AgentFinding): string {
 }
 
 export function toFindingRow(finding: AgentFinding, runDir: string, targetName = "Flounder audit target"): FindingRow {
+  const status = toFindingStatus(finding);
   return {
     findingKey: stableFindingKey(finding),
     title: stripFindingStatusPrefix(finding.title),
     location: finding.location,
     severity: finding.severity,
-    status: toFindingStatus(finding),
+    status,
     // Only confirmed findings get a disclosure report artifact (written at finalize under the final id).
-    reportPath: finding.id && isConfirmedLike(finding.confirmationStatus) ? path.join(runDir, reportArtifactName(finding.id)) : undefined,
-    reportMarkdown: renderFindingDisclosure(targetName, finding),
+    reportPath: finding.id && isConfirmedLike(status) ? path.join(runDir, reportArtifactName(finding.id)) : undefined,
+    reportMarkdown: isConfirmedLike(status) ? renderFindingDisclosure(targetName, finding) : undefined,
     scopeId: finding.scopeId,
     // The rich content, so the DB holds the finding in full (the verify/confirm pipeline + UI read
     // it from here instead of scraping the run dir's audit_hypotheses / audit_findings artifacts).

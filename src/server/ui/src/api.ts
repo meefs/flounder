@@ -190,7 +190,7 @@ export interface FindingRow {
   exploit_sketch?: string | null;
   fix?: string | null;
   confidence?: number | null;
-  refutation_status?: "pending" | "running" | "passed" | "refuted" | "blocked" | null;
+  refutation_status?: "pending" | "running" | "passed" | "refuted" | "blocked" | "conflict" | null;
   refutation_reason?: string | null;
   phase_attempts?: FindingPhaseAttempt[];
   created_at?: string | null;

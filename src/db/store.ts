@@ -66,6 +66,8 @@ export interface RunInput {
   projectId: number;
   kind: RunKind;
   runDir: string;
+  /** Immutable executor ownership for remotely-created runs. Local runs leave this unset. */
+  daemonId?: number | undefined;
   provider?: string | undefined;
   model?: string | undefined;
   thinking?: string | undefined;
@@ -233,7 +235,7 @@ export interface RunGroupInput {
   budget?: unknown;
 }
 
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 9;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -260,6 +262,7 @@ CREATE TABLE IF NOT EXISTS project(
 CREATE TABLE IF NOT EXISTS run(
   id INTEGER PRIMARY KEY,
   project_id INTEGER NOT NULL REFERENCES project(id),
+  daemon_id INTEGER REFERENCES daemon(id) ON DELETE SET NULL,
   kind TEXT NOT NULL,
   run_dir TEXT,
   status TEXT NOT NULL,
@@ -279,6 +282,7 @@ CREATE TABLE IF NOT EXISTS run(
   run_scopes_target INTEGER,
   run_scopes_done INTEGER,
   findings_total INTEGER,
+  artifact_reconcile_version INTEGER NOT NULL DEFAULT 0,
   started_at TEXT NOT NULL,
   dig_started_at TEXT,            -- map->dig boundary for a combined run (stamped at dig-loop start), so the UI can split map vs dig elapsed
   ended_at TEXT
@@ -583,6 +587,8 @@ const ADDITIVE_COLUMNS = [
   ["project", "pinned_at", "ALTER TABLE project ADD COLUMN pinned_at TEXT"],
   ["project", "sort_order", "ALTER TABLE project ADD COLUMN sort_order INTEGER"],
   ["daemon", "workspace", "ALTER TABLE daemon ADD COLUMN workspace TEXT"],
+  ["run", "daemon_id", "ALTER TABLE run ADD COLUMN daemon_id INTEGER REFERENCES daemon(id) ON DELETE SET NULL"],
+  ["run", "artifact_reconcile_version", "ALTER TABLE run ADD COLUMN artifact_reconcile_version INTEGER NOT NULL DEFAULT 0"],
   ["run", "run_scopes_target", "ALTER TABLE run ADD COLUMN run_scopes_target INTEGER"],
   ["run", "material_fingerprint", "ALTER TABLE run ADD COLUMN material_fingerprint TEXT"],
   ["run", "run_scopes_done", "ALTER TABLE run ADD COLUMN run_scopes_done INTEGER"],
@@ -909,6 +915,29 @@ function findingStatusRank(status: string): number {
   return CANONICAL_STATUS_RANK[status] ?? -1;
 }
 
+function isFindingDisclosureStatus(status: string): boolean {
+  return status === "confirmed-source" || status === "confirmed-executable" || status === "confirmed-differential";
+}
+
+type VerifyArtifactRun = {
+  id: number;
+  project_id: number;
+  daemon_id: number | null;
+  kind: string;
+  run_dir: string;
+  status: string;
+  budgets_json: string | null;
+  material_fingerprint: string | null;
+  artifact_reconcile_version: number;
+};
+
+type VerifyArtifactEntry = {
+  run: VerifyArtifactRun;
+  artifact: Record<string, unknown>;
+  originId: number;
+  status?: "refuted" | "needs-evidence";
+};
+
 export class MetadataStore {
   private readonly db: InstanceType<typeof DatabaseSync>;
 
@@ -946,10 +975,13 @@ export class MetadataStore {
       }
       this.db.exec("CREATE INDEX IF NOT EXISTS idx_project_origin ON project(origin)");
       this.db.exec("CREATE INDEX IF NOT EXISTS idx_finding_project_canonical ON finding(project_id, canonical_key)");
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_run_daemon ON run(daemon_id, id)");
     }, "immediate");
     this.ensureProjectUuids();
     this.ensureFindingIdentities();
+    this.reconcileConfirmDecisionMembers();
     this.reconcileConfirmStatuses();
+    this.reconcileReproducedFindingInvariants();
     this.runDataMigrations();
     this.db
       .prepare("INSERT INTO meta(key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
@@ -1049,7 +1081,6 @@ export class MetadataStore {
         novelty: string | null;
       }>;
     if (rows.length === 0) return;
-    const update = this.db.prepare("UPDATE finding SET confirm_status = ? WHERE project_id = ? AND id = ? AND confirm_status IS NULL");
     for (const row of rows) {
       const members = jsonParseOrNull(row.members_json);
       if (!Array.isArray(members)) continue;
@@ -1060,14 +1091,46 @@ export class MetadataStore {
         if (typeof member !== "string") continue;
         for (const key of confirmMemberKeys(member)) {
           const finding = this.resolveFindingByKey(row.project_id, key);
-          if (finding) update.run(outcome, row.project_id, Number(finding.id));
+          if (finding) this.applyFindingConfirmStatus(row.project_id, Number(finding.id), outcome, { onlyIfNull: true });
         }
       }
     }
   }
 
+  /** Older decision sheets can retain a finding-key alias after identity
+   * migration collapsed the underlying rows. Canonicalize those links once so
+   * every API/UI consumer sees the same durable finding identity. */
+  private reconcileConfirmDecisionMembers(): void {
+    const rows = this.db.prepare("SELECT id, project_id, members_json FROM confirm_decision WHERE members_json IS NOT NULL")
+      .all() as Array<{ id: number; project_id: number; members_json: string }>;
+    if (rows.length === 0) return;
+    this.transaction(() => {
+      const update = this.db.prepare("UPDATE confirm_decision SET members_json = ? WHERE id = ?");
+      for (const row of rows) {
+        const members = parseJsonArray(row.members_json).filter((member): member is string => typeof member === "string");
+        const normalized = this.canonicalConfirmMembers(row.project_id, members);
+        if (JSON.stringify(members) !== JSON.stringify(normalized)) update.run(JSON.stringify(normalized), row.id);
+      }
+    }, "immediate");
+  }
+
+  private reconcileReproducedFindingInvariants(): void {
+    this.transaction(() => {
+      const rows = this.db.prepare("SELECT id, project_id FROM finding WHERE confirm_status = 'reproduced'")
+        .all() as Array<{ id: number; project_id: number }>;
+      for (const row of rows) this.applyFindingConfirmStatus(row.project_id, row.id, "reproduced");
+    }, "immediate");
+  }
+
   private runDataMigrations(): void {
     this.transaction(() => {
+      // `job.run_id` intentionally follows the active pipeline phase. It can only
+      // prove ownership for the phase it currently references, so backfill that
+      // exact row and never infer older phase ownership from timestamps or paths.
+      this.db.exec(`UPDATE run
+                       SET daemon_id = (SELECT j.daemon_id FROM job j WHERE j.run_id = run.id)
+                     WHERE daemon_id IS NULL
+                       AND EXISTS (SELECT 1 FROM job j WHERE j.run_id = run.id AND j.daemon_id IS NOT NULL)`);
       if (this.hasColumn("run_group", "finished_at")) {
         this.db.exec("UPDATE run_group SET ended_at = COALESCE(ended_at, finished_at) WHERE finished_at IS NOT NULL");
       }
@@ -1087,12 +1150,14 @@ export class MetadataStore {
              WHERE r_normal.project_id = p.id
                AND NOT EXISTS (SELECT 1 FROM work_item wi_run WHERE wi_run.run_id = r_normal.id)
                AND NOT EXISTS (SELECT 1 FROM work_item_attempt wia_run WHERE wia_run.run_id = r_normal.id)
-          )`);
+      )`);
       this.reconcileFindingReportRunIds();
-      this.reconcileRefutedVerifyArtifacts();
       this.reconcileConfirmDecisionReports();
       this.reconcileAuditedScopeBacklog();
     }, "immediate");
+    // Artifact paths may be remote, slow, or large. Parse them without holding the
+    // SQLite writer lock, then apply the collected immutable verdicts atomically.
+    this.reconcileRefutedVerifyArtifacts();
   }
 
   private hasColumn(table: string, column: string): boolean {
@@ -1195,58 +1260,238 @@ export class MetadataStore {
 
   private reconcileRefutedVerifyArtifacts(): void {
     const runs = this.db
-      .prepare("SELECT id, project_id, kind, run_dir, budgets_json FROM run WHERE run_dir IS NOT NULL AND run_dir <> ''")
-      .all() as Array<{ id: number; project_id: number; kind: string; run_dir: string; budgets_json: string | null }>;
+      .prepare("SELECT id, project_id, daemon_id, kind, run_dir, status, budgets_json, material_fingerprint, artifact_reconcile_version FROM run WHERE run_dir IS NOT NULL AND run_dir <> ''")
+      .all() as VerifyArtifactRun[];
     if (runs.length === 0) return;
 
-    const selectOriginal = this.db.prepare("SELECT id, project_id, title, status FROM finding WHERE id = ?");
-    const updateOriginal = this.db.prepare(
-      `UPDATE finding SET run_id = ?, title = ?, location = ?, severity = ?, status = ?,
-         scope_id = COALESCE(?, scope_id),
-         report_markdown = COALESCE(NULLIF(?, ''), report_markdown),
-         description = COALESCE(NULLIF(?, ''), description), evidence = COALESCE(NULLIF(?, ''), evidence),
-         exploit_sketch = COALESCE(NULLIF(?, ''), exploit_sketch), fix = COALESCE(NULLIF(?, ''), fix),
-         confidence = COALESCE(?, confidence), updated_at = ? WHERE id = ? AND project_id = ?`,
-    );
-
+    const artifactsByRun = new Map<number, Array<Record<string, unknown>>>();
     for (const run of runs) {
-      const artifacts = [
+      // A running process may still be writing its checkpoint. Startup repair must
+      // never guess that a partial artifact is its terminal verdict.
+      if (!runIsVerify(run) || run.status === "running") continue;
+      artifactsByRun.set(run.id, [
         ...readFindingArtifact(path.join(run.run_dir, "audit_hypotheses.json")),
         ...readFindingArtifact(path.join(run.run_dir, "audit_findings.json")),
-      ];
-      for (const artifact of artifacts) {
+      ]);
+    }
+    this.applyRefutedVerifyArtifacts(runs, artifactsByRun);
+  }
+
+  /** Terminal verify runs whose artifacts live on a particular daemon and have not
+   * been replayed for the current protocol version. Ownership is immutable on the
+   * run; `job.run_id` remains the mutable active-phase pointer. */
+  listDaemonArtifactReconciliationRuns(daemonId: number, version: number, beforeId?: number, limit = 50): VerifyArtifactRun[] {
+    const boundedLimit = Math.max(1, Math.min(100, Math.floor(limit)));
+    const before = Number.isInteger(beforeId) && Number(beforeId) > 0 ? Number(beforeId) : Number.MAX_SAFE_INTEGER;
+    return this.db.prepare(
+      `SELECT id, project_id, daemon_id, kind, run_dir, status, budgets_json, material_fingerprint, artifact_reconcile_version
+         FROM run
+        WHERE daemon_id = ?
+          AND id < ?
+          AND status <> 'running'
+          AND run_dir IS NOT NULL AND run_dir <> ''
+          AND COALESCE(artifact_reconcile_version, 0) < ?
+          AND (kind = 'verify' OR (json_valid(budgets_json) AND json_extract(budgets_json, '$.verify') = 1))
+        ORDER BY id DESC
+        LIMIT ?`,
+    ).all(daemonId, before, version, boundedLimit) as VerifyArtifactRun[];
+  }
+
+  /** Apply a daemon-uploaded terminal verify artifact through the exact same
+   * canonical ordering, conflict, and real-target protection logic as local startup
+   * repair. The version marker is committed in the same transaction. */
+  reconcileTerminalVerifyArtifacts(runId: number, artifacts: Array<Record<string, unknown>>, version: number): boolean {
+    const run = this.db.prepare(
+      `SELECT id, project_id, daemon_id, kind, run_dir, status, budgets_json, material_fingerprint, artifact_reconcile_version
+         FROM run WHERE id = ?`,
+    ).get(runId) as VerifyArtifactRun | undefined;
+    if (!run || run.status === "running" || !runIsVerify(run)) return false;
+    if (run.artifact_reconcile_version >= version) return true;
+    this.applyRefutedVerifyArtifacts([run], new Map([[run.id, artifacts]]), () => {
+      this.db.prepare("UPDATE run SET artifact_reconcile_version = ? WHERE id = ? AND artifact_reconcile_version < ?")
+        .run(version, run.id, version);
+    });
+    return true;
+  }
+
+  private applyRefutedVerifyArtifacts(
+    runs: VerifyArtifactRun[],
+    artifactsByRun: Map<number, Array<Record<string, unknown>>>,
+    onApplied?: () => void,
+  ): void {
+    const byOrigin = new Map<number, VerifyArtifactEntry[]>();
+    for (const run of runs) {
+      for (const artifact of artifactsByRun.get(run.id) ?? []) {
         const status = artifactTitleIsRefuted(artifact)
           ? "refuted"
-          : runIsVerify(run) && artifactStatus(artifact) === "suspected"
+          : artifactStatus(artifact) === "suspected"
             ? "needs-evidence"
             : undefined;
-        if (!status) continue;
         const originId = artifactOriginId(artifact);
         if (originId === undefined) continue;
-        const original = selectOriginal.get(originId) as { id: number; project_id: number; title: string | null; status: string } | undefined;
-        if (!original || original.project_id !== run.project_id || original.status === status) continue;
-
-        const ts = now();
-        updateOriginal.run(
-          run.id,
-          cleanArtifactTitle(stringValue(artifact.title)) ?? original.title ?? null,
-          stringValue(artifact.location) ?? null,
-          stringValue(artifact.severity) ?? null,
-          status,
-          stringValue(artifact.scopeId) ?? null,
-          "", // refuted hypotheses do not have a submit-ready report body.
-          stringValue(artifact.description) ?? null,
-          stringValue(artifact.evidence) ?? null,
-          stringValue(artifact.exploitSketch) ?? null,
-          stringValue(artifact.fix) ?? null,
-          numberValue(artifact.confidence),
-          ts,
-          original.id,
-          run.project_id,
-        );
-        this.recordStatusEvent(original.id, original.status, status, "verify artifact migration", run.id, ts);
+        const entries = byOrigin.get(originId) ?? [];
+        entries.push({ run, artifact, originId, ...(status ? { status } : {}) });
+        byOrigin.set(originId, entries);
       }
     }
+
+    const selectOriginal = this.db.prepare(
+      `SELECT id, project_id, run_id, title, location, severity, status, scope_id,
+              report_path, report_markdown, description, evidence, exploit_sketch, fix, confidence,
+              confirm_status, refutation_status, refutation_reason
+         FROM finding WHERE id = ?`,
+    );
+    const selectLatestAttempt = this.db.prepare(
+      `SELECT run_id FROM finding_phase_attempt
+        WHERE project_id = ? AND subject_type = 'finding' AND subject_id = ? AND phase = 'verify'
+        ORDER BY attempt_number DESC LIMIT 1`,
+    );
+    const updateOriginal = this.db.prepare(
+      `UPDATE finding SET run_id = ?, title = ?, location = ?, severity = ?, status = ?,
+         scope_id = ?, report_path = NULL, report_markdown = NULL,
+         description = ?, evidence = ?, exploit_sketch = ?, fix = ?, confidence = ?,
+         refutation_status = NULL, refutation_reason = NULL, updated_at = ?
+       WHERE id = ? AND project_id = ?`,
+    );
+    const updateAttempt = this.db.prepare(
+      `UPDATE finding_phase_attempt
+          SET state = 'settled', outcome = ?, blocker = NULL, updated_at = ?, ended_at = COALESCE(ended_at, ?)
+        WHERE project_id = ? AND subject_type = 'finding' AND subject_id = ? AND phase = 'verify' AND run_id = ?
+          AND (state IS NOT 'settled' OR outcome IS NOT ? OR blocker IS NOT NULL OR ended_at IS NULL)`,
+    );
+    const preserveReproduced = this.db.prepare(
+      `UPDATE finding SET status = ?, refutation_status = ?, refutation_reason = ?, updated_at = ?
+        WHERE id = ? AND project_id = ?`,
+    );
+
+    this.transaction(() => {
+      for (const [originId, entries] of byOrigin) {
+        const original = selectOriginal.get(originId) as Record<string, unknown> | undefined;
+        if (!original) continue;
+        const projectId = Number(original.project_id);
+        const projectEntries = entries.filter((entry) => entry.run.project_id === projectId);
+        if (projectEntries.length === 0) continue;
+
+        const entriesByRun = new Map<number, VerifyArtifactEntry[]>();
+        for (const entry of projectEntries) {
+          const runEntries = entriesByRun.get(entry.run.id) ?? [];
+          runEntries.push(entry);
+          entriesByRun.set(entry.run.id, runEntries);
+        }
+        // A run that emitted multiple verdict artifacts for one origin is internally
+        // inconsistent. Do not guess which stochastic worker won; preserve both
+        // artifacts for diagnosis and require an explicit retry.
+        const unambiguousNegative = (runEntries: VerifyArtifactEntry[]): VerifyArtifactEntry | undefined =>
+          runEntries.length === 1 && runEntries[0]?.status ? runEntries[0] : undefined;
+        // Repair each unambiguous historical attempt independently. Conflicting runs
+        // remain untouched and cannot mutate the canonical finding below.
+        for (const runEntries of entriesByRun.values()) {
+          const verdict = unambiguousNegative(runEntries);
+          if (!verdict?.status) continue;
+          const ts = now();
+          updateAttempt.run(verdict.status, ts, ts, projectId, originId, verdict.run.id, verdict.status);
+        }
+
+        const latestAttempt = selectLatestAttempt.get(projectId, originId) as { run_id: number | null } | undefined;
+        const authoritativeRunId = latestAttempt
+          ? Number(latestAttempt.run_id)
+          : Math.max(...projectEntries.map((entry) => entry.run.id));
+        // All artifacts from the latest run act as an ordering barrier. If that run
+        // confirmed the finding (or produced no complete semantic verdict), an older
+        // REFUTED artifact is not allowed to win by migration order.
+        const sameRun = entriesByRun.get(authoritativeRunId) ?? [];
+        const authoritative = unambiguousNegative(sameRun);
+        if (!authoritative?.status) continue;
+        // The latest verify attempt orders the verify chain. A newer canonical run
+        // is a barrier only when it carries terminal/stronger evidence; an ordinary
+        // suspected rediscovery must not hide an older execution-backed refutation.
+        const canonicalStatus = String(original.status);
+        const canonicalHasBarrierEvidence = isFindingDisclosureStatus(canonicalStatus)
+          || canonicalStatus === "refuted"
+          || original.confirm_status === "reproduced";
+        const canonicalRunId = Number(original.run_id ?? 0);
+        if (authoritative.run.id < canonicalRunId) {
+          const canonicalRun = this.getRun(canonicalRunId);
+          const sameKnownMaterial = Boolean(authoritative.run.material_fingerprint)
+            && authoritative.run.material_fingerprint === canonicalRun?.material_fingerprint;
+          if (canonicalHasBarrierEvidence || !sameKnownMaterial) continue;
+        }
+
+        if (original.confirm_status === "reproduced") {
+          const previousStatus = String(original.status);
+          const protectedStatus = isFindingDisclosureStatus(previousStatus) ? previousStatus : "confirmed-executable";
+          const conflict = authoritative.status === "refuted";
+          const protectedRefutationStatus = conflict ? "conflict" : nullableText(original.refutation_status);
+          const protectedRefutationReason = conflict
+            ? "Local verification conflicts with an existing real-target reproduction; human adjudication is required."
+            : nullableText(original.refutation_reason);
+          if (previousStatus !== protectedStatus
+            || nullableText(original.refutation_status) !== protectedRefutationStatus
+            || nullableText(original.refutation_reason) !== protectedRefutationReason) {
+            const ts = now();
+            preserveReproduced.run(protectedStatus, protectedRefutationStatus, protectedRefutationReason, ts, originId, projectId);
+            if (previousStatus !== protectedStatus) {
+              this.recordStatusEvent(originId, previousStatus, protectedStatus, "real-target reproduction preserved against local conflict", authoritative.run.id, ts);
+            }
+          }
+          continue;
+        }
+
+        const artifact = authoritative.artifact;
+        const desired = {
+          runId: authoritative.run.id,
+          title: cleanArtifactTitle(stringValue(artifact.title)) ?? nullableText(original.title),
+          location: stringValue(artifact.location) ?? nullableText(original.location),
+          severity: stringValue(artifact.severity) ?? nullableText(original.severity),
+          status: authoritative.status,
+          scopeId: stringValue(artifact.scopeId ?? artifact.scope_id) ?? nullableText(original.scope_id),
+          description: stringValue(artifact.description) ?? nullableText(original.description),
+          evidence: stringValue(artifact.evidence) ?? nullableText(original.evidence),
+          exploitSketch: stringValue(artifact.exploitSketch ?? artifact.exploit_sketch) ?? nullableText(original.exploit_sketch),
+          fix: stringValue(artifact.fix) ?? nullableText(original.fix),
+          confidence: numberValue(artifact.confidence) ?? nullableNumber(original.confidence),
+        };
+        const changed = Number(original.run_id ?? 0) !== desired.runId
+          || nullableText(original.title) !== desired.title
+          || nullableText(original.location) !== desired.location
+          || nullableText(original.severity) !== desired.severity
+          || String(original.status) !== desired.status
+          || nullableText(original.scope_id) !== desired.scopeId
+          || original.report_path != null
+          || original.report_markdown != null
+          || nullableText(original.description) !== desired.description
+          || nullableText(original.evidence) !== desired.evidence
+          || nullableText(original.exploit_sketch) !== desired.exploitSketch
+          || nullableText(original.fix) !== desired.fix
+          || nullableNumber(original.confidence) !== desired.confidence
+          || original.refutation_status != null
+          || original.refutation_reason != null;
+        if (!changed) continue;
+
+        const previousStatus = String(original.status);
+        const ts = now();
+        updateOriginal.run(
+          desired.runId,
+          desired.title,
+          desired.location,
+          desired.severity,
+          desired.status,
+          desired.scopeId,
+          desired.description,
+          desired.evidence,
+          desired.exploitSketch,
+          desired.fix,
+          desired.confidence,
+          ts,
+          originId,
+          projectId,
+        );
+        if (previousStatus !== desired.status) {
+          this.recordStatusEvent(originId, previousStatus, desired.status, "verify artifact migration", desired.runId, ts);
+        }
+      }
+      onApplied?.();
+    }, "immediate");
   }
 
   /** Open the store for a config's output root (DB lives at <outputDir>/flounder.db). */
@@ -1418,11 +1663,12 @@ export class MetadataStore {
   startRun(input: RunInput): number {
     const info = this.db
       .prepare(
-        `INSERT INTO run(project_id, kind, run_dir, status, pid, provider, model, thinking, budgets_json, material_fingerprint, started_at)
-         VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO run(project_id, daemon_id, kind, run_dir, status, pid, provider, model, thinking, budgets_json, material_fingerprint, started_at)
+         VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.projectId,
+        input.daemonId ?? null,
         input.kind,
         input.runDir,
         input.pid ?? null,
@@ -1880,6 +2126,7 @@ export class MetadataStore {
           : undefined;
         const existing = origin ?? alias ?? canonical;
         if (!existing) {
+          const hasDisclosureReport = isFindingDisclosureStatus(f.status);
           const info = this.db
             .prepare(
               `INSERT INTO finding(uuid, project_id, run_id, finding_key, canonical_key, occurrence_count,
@@ -1887,7 +2134,7 @@ export class MetadataStore {
                  evidence, exploit_sketch, fix, confidence, refutation_status, refutation_reason, created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             )
-            .run(randomUUID(), projectId, runId, f.findingKey, canonicalKey, f.title ?? null, f.location ?? null, f.severity ?? null, f.status, f.reportPath ?? null, f.reportMarkdown ?? null, f.scopeId ?? null, f.description ?? null, f.evidence ?? null, f.exploitSketch ?? null, f.fix ?? null, f.confidence ?? null, f.refutationStatus ?? null, f.refutationReason ?? null, ts, ts);
+            .run(randomUUID(), projectId, runId, f.findingKey, canonicalKey, f.title ?? null, f.location ?? null, f.severity ?? null, f.status, hasDisclosureReport ? f.reportPath ?? null : null, hasDisclosureReport ? f.reportMarkdown ?? null : null, f.scopeId ?? null, f.description ?? null, f.evidence ?? null, f.exploitSketch ?? null, f.fix ?? null, f.confidence ?? null, f.refutationStatus ?? null, f.refutationReason ?? null, ts, ts);
           const findingId = Number(info.lastInsertRowid);
           this.recordStatusEvent(findingId, null, f.status, reason, runId, ts);
           this.recordFindingOccurrence(findingId, projectId, runId, f, reason, ts);
@@ -1896,8 +2143,52 @@ export class MetadataStore {
           const findingId = Number(existing.id);
           const previousStatus = String(existing.status);
           const sameRun = Number(existing.run_id) === runId;
+          const latestVerifyAttempt = origin
+            ? this.db.prepare(
+              `SELECT run_id FROM finding_phase_attempt
+                WHERE project_id = ? AND subject_type = 'finding' AND subject_id = ? AND phase = 'verify'
+                ORDER BY attempt_number DESC LIMIT 1`,
+            ).get(projectId, findingId) as { run_id: number | null } | undefined
+            : undefined;
+          const existingRunId = Number(existing.run_id ?? 0);
+          const canonicalRunIsNewer = existingRunId > runId;
+          const incomingRun = canonicalRunIsNewer ? this.getRun(runId) : undefined;
+          const canonicalRun = canonicalRunIsNewer ? this.getRun(existingRunId) : undefined;
+          const sameKnownMaterial = canonicalRunIsNewer
+            && typeof incomingRun?.material_fingerprint === "string"
+            && incomingRun.material_fingerprint.length > 0
+            && incomingRun.material_fingerprint === canonicalRun?.material_fingerprint;
+          const canonicalHasBarrierEvidence = isFindingDisclosureStatus(String(existing.status))
+            || existing.status === "refuted"
+            || existing.confirm_status === "reproduced";
+          const staleOriginVerdict = Boolean(origin)
+            && (Number(latestVerifyAttempt?.run_id ?? 0) > runId
+              || (canonicalRunIsNewer && (canonicalHasBarrierEvidence || !sameKnownMaterial)));
           const authoritative = Boolean(origin) || sameRun;
-          const nextStatus = authoritative || findingStatusRank(f.status) >= findingStatusRank(previousStatus) ? f.status : previousStatus as FindingStatus;
+          if (!staleOriginVerdict) {
+          const acceptsIncoming = authoritative || findingStatusRank(f.status) >= findingStatusRank(previousStatus);
+          // Real-target reproduction is stronger evidence than a later sealed/local
+          // negative verdict. Preserve the reproduced canonical finding and surface
+          // the disagreement for human adjudication instead of deleting its report.
+          const reproducedConflict = existing.confirm_status === "reproduced"
+            && !isFindingDisclosureStatus(f.status)
+            && acceptsIncoming;
+          const reproducedPositiveDowngrade = existing.confirm_status === "reproduced"
+            && isFindingDisclosureStatus(previousStatus)
+            && isFindingDisclosureStatus(f.status)
+            && findingStatusRank(f.status) < findingStatusRank(previousStatus);
+          const reproducedProtection = reproducedConflict || reproducedPositiveDowngrade;
+          const nextStatus = reproducedProtection
+            ? (isFindingDisclosureStatus(previousStatus) ? previousStatus : "confirmed-executable")
+            : acceptsIncoming ? f.status : previousStatus as FindingStatus;
+          const hasDisclosureReport = isFindingDisclosureStatus(nextStatus);
+          const updateCanonicalContent = !reproducedProtection;
+          const replaceRefutation = (reproducedConflict && f.status === "refuted")
+            || (!reproducedConflict && !sameRun && acceptsIncoming);
+          const nextRefutationStatus = reproducedConflict && f.status === "refuted" ? "conflict" : f.refutationStatus ?? null;
+          const nextRefutationReason = reproducedConflict && f.status === "refuted"
+            ? "Local verification conflicts with an existing real-target reproduction; human adjudication is required."
+            : f.refutationReason ?? null;
           // COALESCE(NULLIF(?, ''), col): keep the stored content when a later re-persist (a status
           // flip through differential / refutation / appeal) carries an empty value, so detail is
           // never wiped — mirrors the dig_seconds keep-on-omit rule.
@@ -1907,19 +2198,41 @@ export class MetadataStore {
                  title = CASE WHEN ? THEN COALESCE(NULLIF(?, ''), title) ELSE title END,
                  location = CASE WHEN ? THEN COALESCE(NULLIF(?, ''), location) ELSE location END,
                  severity = CASE WHEN ? THEN COALESCE(?, severity) ELSE severity END,
-                 status = ?, report_path = COALESCE(?, report_path), report_markdown = COALESCE(NULLIF(?, ''), report_markdown), scope_id = COALESCE(?, scope_id),
-                 description = COALESCE(NULLIF(?, ''), description),
-                 evidence = COALESCE(NULLIF(?, ''), evidence),
-                 exploit_sketch = COALESCE(NULLIF(?, ''), exploit_sketch),
-                 fix = COALESCE(NULLIF(?, ''), fix),
-                 confidence = COALESCE(?, confidence),
-                 refutation_status = COALESCE(?, refutation_status),
-                 refutation_reason = COALESCE(NULLIF(?, ''), refutation_reason),
+                 status = ?,
+                 report_path = CASE WHEN ? THEN COALESCE(?, report_path) ELSE NULL END,
+                 report_markdown = CASE WHEN ? THEN COALESCE(NULLIF(?, ''), report_markdown) ELSE NULL END,
+                 scope_id = CASE WHEN ? THEN COALESCE(?, scope_id) ELSE scope_id END,
+                 description = CASE WHEN ? THEN COALESCE(NULLIF(?, ''), description) ELSE description END,
+                 evidence = CASE WHEN ? THEN COALESCE(NULLIF(?, ''), evidence) ELSE evidence END,
+                 exploit_sketch = CASE WHEN ? THEN COALESCE(NULLIF(?, ''), exploit_sketch) ELSE exploit_sketch END,
+                 fix = CASE WHEN ? THEN COALESCE(NULLIF(?, ''), fix) ELSE fix END,
+                 confidence = CASE WHEN ? THEN COALESCE(?, confidence) ELSE confidence END,
+                 refutation_status = CASE WHEN ? THEN ? ELSE COALESCE(?, refutation_status) END,
+                 refutation_reason = CASE WHEN ? THEN NULLIF(?, '') ELSE COALESCE(NULLIF(?, ''), refutation_reason) END,
                  updated_at = ? WHERE id = ?`,
             )
-            .run(runId, authoritative ? 1 : 0, f.title ?? null, authoritative ? 1 : 0, f.location ?? null, authoritative || findingStatusRank(f.status) >= findingStatusRank(previousStatus) ? 1 : 0, f.severity ?? null, nextStatus, f.reportPath ?? null, f.reportMarkdown ?? null, f.scopeId ?? null, f.description ?? null, f.evidence ?? null, f.exploitSketch ?? null, f.fix ?? null, f.confidence ?? null, f.refutationStatus ?? null, f.refutationReason ?? null, ts, findingId);
+            .run(
+              reproducedProtection ? (existing.run_id == null ? null : Number(existing.run_id)) : runId,
+              authoritative && updateCanonicalContent ? 1 : 0, f.title ?? null,
+              authoritative && updateCanonicalContent ? 1 : 0, f.location ?? null,
+              acceptsIncoming && updateCanonicalContent ? 1 : 0, f.severity ?? null,
+              nextStatus,
+              hasDisclosureReport ? 1 : 0, f.reportPath ?? null,
+              hasDisclosureReport ? 1 : 0, f.reportMarkdown ?? null,
+              updateCanonicalContent ? 1 : 0, f.scopeId ?? null,
+              updateCanonicalContent ? 1 : 0, f.description ?? null,
+              updateCanonicalContent ? 1 : 0, f.evidence ?? null,
+              updateCanonicalContent ? 1 : 0, f.exploitSketch ?? null,
+              updateCanonicalContent ? 1 : 0, f.fix ?? null,
+              updateCanonicalContent ? 1 : 0, f.confidence ?? null,
+              replaceRefutation ? 1 : 0, nextRefutationStatus, nextRefutationStatus,
+              replaceRefutation ? 1 : 0, nextRefutationReason, nextRefutationReason,
+              ts,
+              findingId,
+            );
           if (previousStatus !== nextStatus) {
-            this.recordStatusEvent(findingId, previousStatus, nextStatus, reason, runId, ts);
+            this.recordStatusEvent(findingId, previousStatus, nextStatus, reproducedConflict ? "real-target reproduction preserved against local conflict" : reason, runId, ts);
+          }
           }
           this.recordFindingOccurrence(findingId, projectId, runId, f, reason, ts);
           this.upsertFindingAlias(projectId, f.findingKey, findingId, ts);
@@ -1951,14 +2264,14 @@ export class MetadataStore {
     this.db.prepare("UPDATE finding SET occurrence_count = (SELECT COUNT(*) FROM finding_occurrence WHERE finding_id = ?) WHERE id = ?").run(findingId, findingId);
   }
 
-  private recordStatusEvent(findingId: number, from: string | null, to: string, reason: string | undefined, runId: number, ts: string): void {
+  private recordStatusEvent(findingId: number, from: string | null, to: string, reason: string | undefined, runId: number | null, ts: string): void {
     this.db
       .prepare("INSERT INTO finding_status_event(finding_id, from_status, to_status, reason, run_id, ts) VALUES (?, ?, ?, ?, ?, ?)")
       .run(findingId, from, to, reason ?? null, runId, ts);
   }
 
   listFindings(projectId: number): Array<Record<string, unknown>> {
-    return this.db.prepare("SELECT * FROM finding WHERE project_id = ? ORDER BY updated_at DESC").all(projectId) as Array<Record<string, unknown>>;
+    return this.db.prepare("SELECT * FROM finding WHERE project_id = ? ORDER BY updated_at DESC, id DESC").all(projectId) as Array<Record<string, unknown>>;
   }
 
   getFinding(id: number): Record<string, unknown> | undefined {
@@ -1974,7 +2287,7 @@ export class MetadataStore {
     const limit = Math.max(1, Math.floor(opts.limit ?? 200));
     const offset = Math.max(0, Math.floor(opts.offset ?? 0));
     return this.db
-      .prepare(globalFindingSelect(where) + " ORDER BY f.updated_at DESC LIMIT ? OFFSET ?")
+      .prepare(globalFindingSelect(where) + " ORDER BY f.updated_at DESC, f.id DESC LIMIT ? OFFSET ?")
       .all(...params, limit, offset) as Array<Record<string, unknown>>;
   }
 
@@ -2030,17 +2343,17 @@ export class MetadataStore {
   /** All audit-confirmed findings that belong in a project-level confirm context, including
    * findings that already have a real-target decision. Confirm needs this complete set so later
    * batches can consolidate newly pending findings against prior reproduced/not-reproduced rows. */
-  confirmableContext(projectId: number): Array<{ id: number; finding_key: string; title: string; run_id: number | null; run_dir: string | null; report_path: string | null; confirm_status: string | null }> {
+  confirmableContext(projectId: number): Array<{ id: number; finding_key: string; title: string; run_id: number | null; run_dir: string | null; report_path: string | null; confirm_status: string | null; refutation_status: string | null }> {
     return this.db
       .prepare(
-        `SELECT f.id, f.finding_key, f.title, f.run_id, r.run_dir, f.report_path, f.confirm_status
+        `SELECT f.id, f.finding_key, f.title, f.run_id, r.run_dir, f.report_path, f.confirm_status, f.refutation_status
            FROM finding f LEFT JOIN run r ON r.id = f.run_id
           WHERE f.project_id = ?
             AND COALESCE(f.tracking_status, 'open') <> 'ignored'
             AND f.status IN ('confirmed-differential','confirmed-executable','confirmed-source')
           ORDER BY f.status, f.id`,
       )
-      .all(projectId) as Array<{ id: number; finding_key: string; title: string; run_id: number | null; run_dir: string | null; report_path: string | null; confirm_status: string | null }>;
+      .all(projectId) as Array<{ id: number; finding_key: string; title: string; run_id: number | null; run_dir: string | null; report_path: string | null; confirm_status: string | null; refutation_status: string | null }>;
   }
 
   /** One pending confirmable finding by project + id (for finding-level confirm). */
@@ -2057,21 +2370,116 @@ export class MetadataStore {
   }
 
   /** Set a finding's real-target confirm state, addressed by its content key within a project
-   * (the same key the confirm work list carries). Does not touch updated_at. */
+   * (the same key the confirm work list carries). A reproduced result also restores the
+   * disclosure invariant and therefore updates the finding timestamp when repair is needed. */
   setFindingConfirmStatus(projectId: number, findingKey: string, confirmStatus: string | null): boolean {
     const finding = this.resolveFindingByKey(projectId, findingKey);
     if (!finding) return false;
-    return this.db.prepare("UPDATE finding SET confirm_status = ? WHERE project_id = ? AND id = ?")
-      .run(confirmStatus, projectId, Number(finding.id)).changes > 0;
+    return this.applyFindingConfirmStatus(projectId, Number(finding.id), confirmStatus);
   }
 
-  private resolveFindingByKey(projectId: number, findingKey: string): Record<string, unknown> | undefined {
+  private applyFindingConfirmStatus(
+    projectId: number,
+    findingId: number,
+    confirmStatus: string | null,
+    options: { onlyIfNull?: boolean; runId?: number } = {},
+  ): boolean {
+    const finding = this.db.prepare(
+      "SELECT id, status, confirm_status, report_path, report_markdown, refutation_status, refutation_reason FROM finding WHERE project_id = ? AND id = ?",
+    ).get(projectId, findingId) as Record<string, unknown> | undefined;
+    if (!finding || (options.onlyIfNull && finding.confirm_status != null)) return false;
+    if (confirmStatus !== "reproduced") {
+      if (confirmStatus === "not-reproduced" && finding.refutation_status === "conflict") {
+        const previousStatus = String(finding.status);
+        const ts = now();
+        const changed = this.db.prepare(
+          `UPDATE finding SET confirm_status = 'not-reproduced', status = 'refuted',
+             report_path = NULL, report_markdown = NULL,
+             refutation_status = 'refuted',
+             refutation_reason = 'A later real-target confirmation no longer reproduced the claim; the local refutation is authoritative.',
+             updated_at = ?
+           WHERE project_id = ? AND id = ?`,
+        ).run(ts, projectId, findingId).changes > 0;
+        if (changed && previousStatus !== "refuted") {
+          this.recordStatusEvent(findingId, previousStatus, "refuted", "real-target retry resolved the evidence conflict in favor of the local refutation", options.runId ?? null, ts);
+        }
+        return changed;
+      }
+      return this.db.prepare("UPDATE finding SET confirm_status = ? WHERE project_id = ? AND id = ?")
+        .run(confirmStatus, projectId, findingId).changes > 0;
+    }
+
+    let restoredPath: string | null = null;
+    let restoredMarkdown: string | null = null;
+    const occurrences = this.db.prepare(
+      `SELECT payload_json FROM finding_occurrence
+        WHERE finding_id = ? AND status IN ('confirmed-source','confirmed-executable','confirmed-differential')
+        ORDER BY id DESC`,
+    ).all(findingId) as Array<{ payload_json: string | null }>;
+    for (const occurrence of occurrences) {
+      const payload = typeof occurrence.payload_json === "string" ? jsonParseOrNull(occurrence.payload_json) : null;
+      if (!isRecord(payload)) continue;
+      restoredPath ??= stringValue(payload.reportPath ?? payload.report_path) ?? null;
+      restoredMarkdown ??= stringValue(payload.reportMarkdown ?? payload.report_markdown) ?? null;
+      if (restoredPath && restoredMarkdown) break;
+    }
+
+    const previousStatus = String(finding.status);
+    const localConflict = previousStatus === "refuted";
+    const nextStatus = isFindingDisclosureStatus(previousStatus) ? previousStatus : "confirmed-executable";
+    const nextRefutationStatus = localConflict ? "conflict" : nullableText(finding.refutation_status);
+    const nextRefutationReason = localConflict
+      ? "Local verification conflicts with an existing real-target reproduction; human adjudication is required."
+      : nullableText(finding.refutation_reason);
+    const nextReportPath = nullableText(finding.report_path) ?? restoredPath;
+    const nextReportMarkdown = nullableText(finding.report_markdown) ?? restoredMarkdown;
+    if (finding.confirm_status === "reproduced"
+      && previousStatus === nextStatus
+      && nullableText(finding.report_path) === nextReportPath
+      && nullableText(finding.report_markdown) === nextReportMarkdown
+      && nullableText(finding.refutation_status) === nextRefutationStatus
+      && nullableText(finding.refutation_reason) === nextRefutationReason) return false;
+    const ts = now();
+    const changed = this.db.prepare(
+      `UPDATE finding SET confirm_status = 'reproduced', status = ?,
+         report_path = COALESCE(report_path, ?), report_markdown = COALESCE(report_markdown, ?),
+         refutation_status = ?, refutation_reason = ?, updated_at = ?
+       WHERE project_id = ? AND id = ?`,
+    ).run(nextStatus, nextReportPath, nextReportMarkdown, nextRefutationStatus, nextRefutationReason, ts, projectId, findingId).changes > 0;
+    if (previousStatus !== nextStatus) {
+      this.recordStatusEvent(findingId, previousStatus, nextStatus, "real-target reproduction superseded local verdict", options.runId ?? null, ts);
+    }
+    return changed;
+  }
+
+  resolveFindingByKey(projectId: number, findingKey: string): Record<string, unknown> | undefined {
     return this.db.prepare(
       `SELECT f.* FROM finding f
        LEFT JOIN finding_key_alias a ON a.finding_id = f.id AND a.project_id = f.project_id
        WHERE f.project_id = ? AND (LOWER(f.finding_key) = LOWER(?) OR LOWER(a.alias_key) = LOWER(?))
        ORDER BY f.id LIMIT 1`,
     ).get(projectId, findingKey, findingKey) as Record<string, unknown> | undefined;
+  }
+
+  private canonicalConfirmMembers(projectId: number, members: string[]): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const member of members) {
+      let canonical = member;
+      for (const key of confirmMemberKeys(member)) {
+        const finding = this.resolveFindingByKey(projectId, key);
+        const findingKey = finding ? nullableText(finding.finding_key) : null;
+        if (findingKey) {
+          canonical = findingKey;
+          break;
+        }
+      }
+      const dedupeKey = canonical.toLowerCase();
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      out.push(canonical);
+    }
+    return out;
   }
 
   /** Finding counts per status — one GROUP BY, for the dashboard + filter chips. */
@@ -2094,7 +2502,7 @@ export class MetadataStore {
     const limit = Math.max(1, Math.floor(opts.limit ?? 50));
     const offset = Math.max(0, Math.floor(opts.offset ?? 0));
     return this.db
-      .prepare("SELECT * FROM finding " + where.sql + " ORDER BY CASE LOWER(COALESCE(severity,'')) WHEN 'critical' THEN 5 WHEN 'high' THEN 4 WHEN 'medium' THEN 3 WHEN 'low' THEN 2 WHEN 'info' THEN 1 ELSE 0 END DESC, updated_at DESC LIMIT ? OFFSET ?")
+      .prepare("SELECT * FROM finding " + where.sql + " ORDER BY CASE LOWER(COALESCE(severity,'')) WHEN 'critical' THEN 5 WHEN 'high' THEN 4 WHEN 'medium' THEN 3 WHEN 'low' THEN 2 WHEN 'info' THEN 1 ELSE 0 END DESC, updated_at DESC, id DESC LIMIT ? OFFSET ?")
       .all(...where.params, limit, offset) as Array<Record<string, unknown>>;
   }
 
@@ -2114,7 +2522,7 @@ export class MetadataStore {
     const terminal = input.state !== "running";
     if (existing) {
       this.db.prepare(
-        `UPDATE finding_phase_attempt SET input_fingerprint = ?, state = ?, outcome = ?, blocker = ?, metrics_json = ?,
+        `UPDATE finding_phase_attempt SET input_fingerprint = ?, state = ?, outcome = ?, blocker = ?, metrics_json = COALESCE(?, metrics_json),
            updated_at = ?, started_at = COALESCE(started_at, ?), ended_at = ? WHERE id = ?`,
       ).run(input.inputFingerprint, input.state, input.outcome ?? null, input.blocker ?? null, jsonOrNull(input.metrics), ts, ts, terminal ? ts : null, existing.id);
       if (input.state === "running") this.clearFindingPhaseRetry(projectId, input.subjectType, input.subjectId, input.phase);
@@ -2161,6 +2569,12 @@ export class MetadataStore {
     return !(latest?.state === "blocked" && latest.input_fingerprint === inputFingerprint);
   }
 
+  hasFindingPhaseRetry(projectId: number, subjectType: "finding" | "decision", subjectId: number, phase: FindingPhase): boolean {
+    return Boolean(this.db.prepare(
+      "SELECT 1 AS yes FROM phase_retry_request WHERE project_id = ? AND subject_type = ? AND subject_id = ? AND phase = ?",
+    ).get(projectId, subjectType, subjectId, phase));
+  }
+
   requestFindingPhaseRetry(projectId: number, subjectType: "finding" | "decision", subjectId: number, phase: FindingPhase): boolean {
     const subject = subjectType === "finding" ? this.getFinding(subjectId) : this.getConfirmDecision(subjectId);
     if (!subject || Number(subject.project_id) !== projectId) return false;
@@ -2199,18 +2613,17 @@ export class MetadataStore {
       // back to findings: reflect each decision's real-target outcome into its findings'
       // confirm_status (reproduced -> reproduced, settled-but-not -> not-reproduced). This is what
       // makes confirm finding-grained + resumable (a later confirm skips non-NULL confirm_status).
-      const setConfirm = this.db.prepare("UPDATE finding SET confirm_status = ? WHERE project_id = ? AND id = ?");
       const markDuplicate = this.db.prepare(
         `UPDATE finding
             SET tracking_status = 'duplicate', duplicate_of_finding_id = ?
           WHERE project_id = ? AND id = ?
             AND COALESCE(tracking_status, 'open') IN ('open', 'triaging', 'duplicate')`,
       );
-      type ConfirmFindingMetadata = { id: number; severity?: string; updatedAt?: string; canonicalKey?: string; status?: string; confirmStatus?: string | null; trackingStatus?: string | null; runId?: number };
+      type ConfirmFindingMetadata = { id: number; findingKey: string; severity?: string; updatedAt?: string; canonicalKey?: string; status?: string; confirmStatus?: string | null; trackingStatus?: string | null; runId?: number };
       const findingsByKey = new Map<string, ConfirmFindingMetadata>();
       for (const row of this.db.prepare("SELECT id, run_id, finding_key, canonical_key, severity, status, confirm_status, tracking_status, updated_at FROM finding WHERE project_id = ?").all(projectId) as Array<{ id: number; run_id: number | null; finding_key: string | null; canonical_key: string | null; severity: string | null; status: string | null; confirm_status: string | null; tracking_status: string | null; updated_at: string | null }>) {
         if (!row.finding_key) continue;
-        const metadata: ConfirmFindingMetadata = { id: row.id, confirmStatus: row.confirm_status, trackingStatus: row.tracking_status };
+        const metadata: ConfirmFindingMetadata = { id: row.id, findingKey: row.finding_key, confirmStatus: row.confirm_status, trackingStatus: row.tracking_status };
         if (row.severity) metadata.severity = row.severity;
         if (row.updated_at) metadata.updatedAt = row.updated_at;
         if (row.canonical_key) metadata.canonicalKey = row.canonical_key;
@@ -2225,7 +2638,14 @@ export class MetadataStore {
         if (canonical) findingsByKey.set(alias.alias_key.toLowerCase(), canonical);
       }
       for (const r of readyRows) {
-        const linked = linkedFindingMetadata(findingsByKey, r.members ?? []);
+        const members = [...new Set((r.members ?? []).map((member) => {
+          for (const key of confirmMemberKeys(member)) {
+            const finding = findingsByKey.get(key.toLowerCase());
+            if (finding) return finding.findingKey;
+          }
+          return member;
+        }))];
+        const linked = linkedFindingMetadata(findingsByKey, members);
         const evidenceLevel = decisionEvidenceLevel(r);
         const submissionConfidence = decisionSubmissionConfidence(r, evidenceLevel);
         stmt.run(
@@ -2234,7 +2654,7 @@ export class MetadataStore {
           r.bug,
           r.reproduced ?? null,
           r.recommendation ?? null,
-          jsonOrNull(r.members),
+          jsonOrNull(members),
           r.severity ?? maxSeverity(linked.map((entry) => entry.severity)),
           evidenceLevel,
           submissionConfidence,
@@ -2253,12 +2673,12 @@ export class MetadataStore {
         );
         const outcome = decisionConfirmOutcome(r, evidenceLevel);
         const linkedIds = new Set<number>();
-        for (const member of r.members ?? []) {
+        for (const member of members) {
           for (const key of confirmMemberKeys(member)) {
             const finding = findingsByKey.get(key.toLowerCase());
             if (!finding) continue;
             linkedIds.add(finding.id);
-            if (outcome) setConfirm.run(outcome, projectId, finding.id);
+            if (outcome) this.applyFindingConfirmStatus(projectId, finding.id, outcome, { runId });
           }
         }
         // `mergedFrom` is emitted only by the execution-based fix-equivalence
@@ -2287,7 +2707,9 @@ export class MetadataStore {
         const blocked = r.reproduced === "could-not-set-up" || r.reproduced === "unknown" || needsSubmissionReadinessWork(r);
         for (const findingId of linkedIds) {
           const metadata = byId.get(findingId);
-          const sourceRun = metadata?.runId !== undefined ? this.getRun(metadata.runId) : undefined;
+          const current = this.getFinding(findingId);
+          const currentRunId = current?.run_id != null ? Number(current.run_id) : metadata?.runId;
+          const sourceRun = currentRunId !== undefined ? this.getRun(currentRunId) : undefined;
           this.recordFindingPhaseAttempt(projectId, runId, {
             subjectType: "finding",
             subjectId: findingId,
@@ -2296,9 +2718,9 @@ export class MetadataStore {
               phase: "confirm",
               material: sourceRun?.material_fingerprint ?? null,
               findingId,
-              canonicalKey: metadata?.canonicalKey ?? null,
-              status: metadata?.status ?? null,
-              updatedAt: metadata?.updatedAt ?? null,
+              canonicalKey: current?.canonical_key ?? metadata?.canonicalKey ?? null,
+              status: current?.status ?? metadata?.status ?? null,
+              updatedAt: current?.updated_at ?? metadata?.updatedAt ?? null,
             }),
             state: blocked ? "blocked" : "settled",
             outcome: r.reproduced ?? "unknown",
@@ -2768,6 +3190,7 @@ export class MetadataStore {
     this.transaction(() => {
       this.db.prepare("UPDATE job SET daemon_id = NULL WHERE daemon_id = ?").run(id);
       this.db.prepare("UPDATE project SET daemon_id = NULL WHERE daemon_id = ?").run(id);
+      this.db.prepare("UPDATE run SET daemon_id = NULL WHERE daemon_id = ?").run(id);
       removed = this.db.prepare("DELETE FROM daemon WHERE id = ?").run(id).changes > 0;
     });
     return removed;
@@ -3032,6 +3455,14 @@ function numberValue(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+function nullableText(value: unknown): string | null {
+  return value === undefined || value === null ? null : String(value);
+}
+
+function nullableNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
 function normalizeDiscoveryBacklogStatus(status: unknown): DiscoveryBacklogStatus {
   return status === "resolved" || status === "stale" || status === "ignored" ? status : "open";
 }
@@ -3063,7 +3494,7 @@ const FINDING_SOURCE_SQL = `CASE
 END`;
 
 function globalFindingWhere(opts: { projectUuid?: string | undefined; status?: string | undefined; tracking?: string | undefined; source?: "project" | "evaluation" | "all" | undefined }): { where: string; params: Array<string | number> } {
-  const cond: string[] = ["f.status <> 'discharged'", "(LOWER(COALESCE(f.severity, '')) <> 'info' OR f.status IN ('confirmed-source','confirmed-executable','confirmed-differential'))"];
+  const cond: string[] = ["f.status <> 'discharged'", "(LOWER(COALESCE(f.severity, '')) <> 'info' OR f.status IN ('confirmed-source','confirmed-executable','confirmed-differential','refuted'))"];
   const params: Array<string | number> = [];
   if (opts.projectUuid) { cond.push("p.uuid = ?"); params.push(opts.projectUuid); }
   if (opts.status === "execution-confirmed") cond.push("f.status IN ('confirmed-executable','confirmed-differential')");
@@ -3146,6 +3577,6 @@ function findingWhere(projectId: number, filter: FindingFilter): { sql: string; 
       params.push(...filter.runIds);
     }
   }
-  if (filter.reportable) clauses.push("status <> 'discharged' AND (LOWER(COALESCE(severity, '')) <> 'info' OR status IN ('confirmed-source','confirmed-executable','confirmed-differential'))");
+  if (filter.reportable) clauses.push("status <> 'discharged' AND (LOWER(COALESCE(severity, '')) <> 'info' OR status IN ('confirmed-source','confirmed-executable','confirmed-differential','refuted'))");
   return { sql: "WHERE " + clauses.join(" AND "), params };
 }

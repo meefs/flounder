@@ -18,7 +18,7 @@ async function loadTsModule(relativePath) {
   return import(`data:text/javascript;base64,${Buffer.from(compiled.outputText).toString("base64")}`);
 }
 
-const { bugBountyEngagementLabel, contestReviewState, isVerifyRun, normalizeActivityBody, splitActivitySummaries, phaseState, projectSourceState, runProgress, sortConfirmDecisionsForSubmission } = await loadTsModule("../src/server/ui/src/domain.ts");
+const { bugBountyEngagementLabel, contestReviewState, decisionHasUnresolvedEvidenceConflict, hasUnresolvedEvidenceConflict, isVerifyRun, normalizeActivityBody, splitActivitySummaries, phaseState, projectSourceState, reportableDecisions, reportableFindings, runProgress, sortConfirmDecisionsForSubmission } = await loadTsModule("../src/server/ui/src/domain.ts");
 const { nextDialogFocusIndex } = await loadTsModule("../src/server/ui/src/dialog-focus.ts");
 const appSource = readFileSync(new URL("../src/server/ui/src/App.tsx", import.meta.url), "utf8");
 const stylesSource = readFileSync(new URL("../src/server/ui/src/styles.css", import.meta.url), "utf8");
@@ -70,6 +70,37 @@ test("ui: findings expose a compact lifecycle summary and focused blocked-phase 
   assert.match(appSource, /function LifecycleEvidencePanel/);
   assert.match(appSource, /api\.retryFindingPhase/);
   assert.match(appSource, /will run on the next Continue/);
+});
+
+test("ui: unresolved local and real-target evidence conflicts require review and are not reportable", () => {
+  const finding = {
+    id: 7,
+    finding_key: "kconflict",
+    status: "confirmed-executable",
+    confirm_status: "reproduced",
+    refutation_status: "conflict",
+  };
+  const decision = {
+    id: 11,
+    bug: "Conflicted bug",
+    members_json: JSON.stringify(["kconflict"]),
+    reproduced: "yes",
+    recommendation: "submit-candidate",
+    evidence_level: "real-target-reproduced",
+  };
+
+  assert.equal(hasUnresolvedEvidenceConflict(finding), true);
+  assert.equal(decisionHasUnresolvedEvidenceConflict(decision, [finding]), true);
+  assert.deepEqual(reportableFindings([finding]), []);
+  assert.deepEqual(reportableDecisions([decision], [finding]), []);
+  assert.match(appSource, /Resolve evidence conflict/);
+  assert.match(appSource, /Local verification conflicts with real-target reproduction/);
+  assert.match(appSource, /Evidence conflict/);
+  assert.match(appSource, /Report held/);
+  assert.match(appSource, /Retry Verify/);
+  assert.match(appSource, /Retry Confirm/);
+  assert.match(appSource, /Reporting stays held until the evidence agrees/);
+  assert.match(stylesSource, /\.refutation-conflict/);
 });
 
 test("ui: source setup is ready when prepare produced an audit-ready workspace", () => {

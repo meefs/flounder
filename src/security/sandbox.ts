@@ -685,7 +685,7 @@ async function copyDirectoryContents(sourceDir: string, targetDir: string): Prom
 }
 
 interface DirectoryMergeOptions {
-  acceptFile?: (sourcePath: string) => Promise<boolean>;
+  acceptFile?: (copiedPath: string, logicalSourcePath?: string) => Promise<boolean>;
   atomicFiles?: boolean;
 }
 
@@ -704,20 +704,27 @@ async function mergeDirectoryContents(sourceDir: string, targetDir: string, opti
       continue;
     }
     if (!info.isFile()) continue;
-    if (options.acceptFile && !(await options.acceptFile(sourcePath))) continue;
     await mkdir(path.dirname(targetPath), { recursive: true });
-    if (options.atomicFiles) await copyFileAtomically(sourcePath, targetPath);
+    // Validate the private copy that will actually be published. Validating the
+    // source path first leaves a TOCTOU window where a detached build process can
+    // replace or truncate it between validation and copy.
+    if (options.atomicFiles || options.acceptFile) await copyFileAtomically(sourcePath, targetPath, options.acceptFile);
     else await copyFile(sourcePath, targetPath);
   }
 }
 
-async function copyFileAtomically(sourcePath: string, targetPath: string): Promise<void> {
+async function copyFileAtomically(
+  sourcePath: string,
+  targetPath: string,
+  acceptFile?: (copiedPath: string, logicalSourcePath?: string) => Promise<boolean>,
+): Promise<void> {
   const tempPath = path.join(
     path.dirname(targetPath),
     `${CACHE_TEMP_PREFIX}${process.pid}-${randomBytes(8).toString("hex")}.tmp`,
   );
   try {
     await copyFile(sourcePath, tempPath);
+    if (acceptFile && !(await acceptFile(tempPath, sourcePath))) return;
     await rename(tempPath, targetPath);
   } finally {
     await rm(tempPath, { force: true });
@@ -734,14 +741,14 @@ async function removeTruncatedFoundryCompilers(root: string): Promise<void> {
       await removeTruncatedFoundryCompilers(entryPath);
       continue;
     }
-    if (entry.isFile() && isFoundryCompilerName(entry.name) && await isDefinitelyTruncatedElf(entryPath)) {
+    if (entry.isFile() && isFoundryCompilerName(entry.name) && await isDefinitelyInvalidFoundryCompiler(entryPath)) {
       await rm(entryPath, { force: true });
     }
   }
 }
 
-async function isCompleteFoundryCacheFile(sourcePath: string): Promise<boolean> {
-  return !isFoundryCompilerName(path.basename(sourcePath)) || !(await isDefinitelyTruncatedElf(sourcePath));
+async function isCompleteFoundryCacheFile(copiedPath: string, logicalSourcePath = copiedPath): Promise<boolean> {
+  return !isFoundryCompilerName(path.basename(logicalSourcePath)) || !(await isDefinitelyInvalidFoundryCompiler(copiedPath));
 }
 
 function isFoundryCompilerName(name: string): boolean {
@@ -749,19 +756,28 @@ function isFoundryCompilerName(name: string): boolean {
 }
 
 /**
- * Detect only ELF files whose declared structure extends beyond EOF. Unknown
- * formats are allowed so explicit host backends and future platforms keep
- * working; this is a truncation guard, not an authenticity check.
+ * Reject incomplete or unknown native compiler cache entries. Foundry installs
+ * native solc executables, so the supported cache formats are ELF, Mach-O, and
+ * PE; accepting arbitrary bytes would let an interrupted pre-header download
+ * become durable poison.
  */
-async function isDefinitelyTruncatedElf(filePath: string): Promise<boolean> {
+async function isDefinitelyInvalidFoundryCompiler(filePath: string): Promise<boolean> {
   const handle = await open(filePath, "r");
   try {
     const fileInfo = await handle.stat();
+    // No supported native compiler executable can be shorter than its four-byte
+    // magic. Treat an interruption before the ELF identifier is fully flushed as
+    // conclusively incomplete even though its eventual platform is not yet known.
+    if (fileInfo.size < 4) return true;
     const fileSize = BigInt(fileInfo.size);
     const header = Buffer.alloc(64);
     const headerRead = await handle.read(header, 0, header.length, 0);
-    if (headerRead.bytesRead < 4 || header[0] !== 0x7f || header[1] !== 0x45 || header[2] !== 0x4c || header[3] !== 0x46) {
-      return false;
+    if (headerRead.bytesRead < 4) return true;
+    if (header[0] !== 0x7f || header[1] !== 0x45 || header[2] !== 0x4c || header[3] !== 0x46) {
+      // Keep the handle open until the format-specific parser finishes its
+      // positioned reads. Returning the bare promise would enter `finally`
+      // immediately and close it underneath Mach-O/PE validation.
+      return await isDefinitelyInvalidNonElfCompiler(handle, header, headerRead.bytesRead, fileSize);
     }
     // Once the ELF magic is present, a partial e_ident is conclusively an
     // interrupted ELF file rather than an unknown executable format.
@@ -769,7 +785,7 @@ async function isDefinitelyTruncatedElf(filePath: string): Promise<boolean> {
 
     const elfClass = header[4];
     const dataEncoding = header[5];
-    if ((elfClass !== 1 && elfClass !== 2) || (dataEncoding !== 1 && dataEncoding !== 2)) return false;
+    if ((elfClass !== 1 && elfClass !== 2) || (dataEncoding !== 1 && dataEncoding !== 2)) return true;
     const is64Bit = elfClass === 2;
     const littleEndian = dataEncoding === 1;
     const headerSize = is64Bit ? 64 : 52;
@@ -782,39 +798,38 @@ async function isDefinitelyTruncatedElf(filePath: string): Promise<boolean> {
     const sectionEntrySize = Number(readElfInteger(header, is64Bit ? 58 : 46, 2, littleEndian));
     const sectionCount = Number(readElfInteger(header, is64Bit ? 60 : 48, 2, littleEndian));
 
-    // Extended ELF counts require section-zero interpretation. They are rare
-    // for executables; allow them rather than risk deleting a complete binary.
-    if (programCount === 0xffff || (sectionCount === 0 && sectionOffset !== 0n)) return false;
+    // Extended ELF counts require section-zero interpretation. Reject those
+    // entries here rather than treating an unvalidated table layout as a
+    // complete compiler cache object.
+    if (programCount === 0xffff || (sectionCount === 0 && sectionOffset !== 0n)) return true;
     if (tableExtendsPastEnd(programOffset, programEntrySize, programCount, fileSize)) return true;
     if (tableExtendsPastEnd(sectionOffset, sectionEntrySize, sectionCount, fileSize)) return true;
 
     if (programCount > 0 && programCount <= 4096) {
       const minimumEntrySize = is64Bit ? 56 : 32;
-      if (programEntrySize >= minimumEntrySize) {
-        for (let index = 0; index < programCount; index += 1) {
-          const entryOffset = programOffset + BigInt(index * programEntrySize);
-          const entry = await readElfEntry(handle, entryOffset, minimumEntrySize);
-          if (!entry) return true;
-          const segmentOffset = readElfInteger(entry, is64Bit ? 8 : 4, is64Bit ? 8 : 4, littleEndian);
-          const segmentSize = readElfInteger(entry, is64Bit ? 32 : 16, is64Bit ? 8 : 4, littleEndian);
-          if (segmentSize > 0n && segmentOffset + segmentSize > fileSize) return true;
-        }
+      if (programEntrySize < minimumEntrySize) return true;
+      for (let index = 0; index < programCount; index += 1) {
+        const entryOffset = programOffset + BigInt(index * programEntrySize);
+        const entry = await readFileSlice(handle, entryOffset, minimumEntrySize);
+        if (!entry) return true;
+        const segmentOffset = readElfInteger(entry, is64Bit ? 8 : 4, is64Bit ? 8 : 4, littleEndian);
+        const segmentSize = readElfInteger(entry, is64Bit ? 32 : 16, is64Bit ? 8 : 4, littleEndian);
+        if (segmentSize > 0n && segmentOffset + segmentSize > fileSize) return true;
       }
     }
 
     if (sectionCount > 0 && sectionCount <= 8192) {
       const minimumEntrySize = is64Bit ? 64 : 40;
-      if (sectionEntrySize >= minimumEntrySize) {
-        for (let index = 0; index < sectionCount; index += 1) {
-          const entryOffset = sectionOffset + BigInt(index * sectionEntrySize);
-          const entry = await readElfEntry(handle, entryOffset, minimumEntrySize);
-          if (!entry) return true;
-          const sectionType = Number(readElfInteger(entry, 4, 4, littleEndian));
-          if (sectionType === 8) continue; // SHT_NOBITS has no file-backed bytes.
-          const contentsOffset = readElfInteger(entry, is64Bit ? 24 : 16, is64Bit ? 8 : 4, littleEndian);
-          const contentsSize = readElfInteger(entry, is64Bit ? 32 : 20, is64Bit ? 8 : 4, littleEndian);
-          if (contentsSize > 0n && contentsOffset + contentsSize > fileSize) return true;
-        }
+      if (sectionEntrySize < minimumEntrySize) return true;
+      for (let index = 0; index < sectionCount; index += 1) {
+        const entryOffset = sectionOffset + BigInt(index * sectionEntrySize);
+        const entry = await readFileSlice(handle, entryOffset, minimumEntrySize);
+        if (!entry) return true;
+        const sectionType = Number(readElfInteger(entry, 4, 4, littleEndian));
+        if (sectionType === 8) continue; // SHT_NOBITS has no file-backed bytes.
+        const contentsOffset = readElfInteger(entry, is64Bit ? 24 : 16, is64Bit ? 8 : 4, littleEndian);
+        const contentsSize = readElfInteger(entry, is64Bit ? 32 : 20, is64Bit ? 8 : 4, littleEndian);
+        if (contentsSize > 0n && contentsOffset + contentsSize > fileSize) return true;
       }
     }
 
@@ -824,13 +839,126 @@ async function isDefinitelyTruncatedElf(filePath: string): Promise<boolean> {
   }
 }
 
+async function isDefinitelyInvalidNonElfCompiler(
+  handle: Awaited<ReturnType<typeof open>>,
+  header: Buffer,
+  headerBytes: number,
+  fileSize: bigint,
+): Promise<boolean> {
+  const magic = header.readUInt32BE(0);
+  if (magic === 0xfeedface) return isTruncatedMachO(handle, header, headerBytes, fileSize, false, false);
+  if (magic === 0xcefaedfe) return isTruncatedMachO(handle, header, headerBytes, fileSize, true, false);
+  if (magic === 0xfeedfacf) return isTruncatedMachO(handle, header, headerBytes, fileSize, false, true);
+  if (magic === 0xcffaedfe) return isTruncatedMachO(handle, header, headerBytes, fileSize, true, true);
+  if (magic === 0xcafebabe) return isTruncatedFatMachO(handle, header, headerBytes, fileSize, false, false);
+  if (magic === 0xbebafeca) return isTruncatedFatMachO(handle, header, headerBytes, fileSize, true, false);
+  if (magic === 0xcafebabf) return isTruncatedFatMachO(handle, header, headerBytes, fileSize, false, true);
+  if (magic === 0xbfbafeca) return isTruncatedFatMachO(handle, header, headerBytes, fileSize, true, true);
+  if (header[0] === 0x4d && header[1] === 0x5a) return isTruncatedPe(handle, header, headerBytes, fileSize);
+  return true;
+}
+
+async function isTruncatedMachO(
+  handle: Awaited<ReturnType<typeof open>>,
+  header: Buffer,
+  headerBytes: number,
+  fileSize: bigint,
+  littleEndian: boolean,
+  is64Bit: boolean,
+): Promise<boolean> {
+  const headerSize = is64Bit ? 32 : 28;
+  if (headerBytes < headerSize) return true;
+  const read32 = (buffer: Buffer, offset: number): number => littleEndian ? buffer.readUInt32LE(offset) : buffer.readUInt32BE(offset);
+  const ncmds = read32(header, 16);
+  const sizeofcmds = read32(header, 20);
+  if (ncmds === 0 || sizeofcmds === 0 || ncmds > 16_384) return true;
+  const commandsEnd = BigInt(headerSize) + BigInt(sizeofcmds);
+  if (commandsEnd > fileSize) return true;
+  let commandOffset = BigInt(headerSize);
+  for (let index = 0; index < ncmds; index += 1) {
+    const commandHeader = await readFileSlice(handle, commandOffset, 8);
+    if (!commandHeader) return true;
+    const command = read32(commandHeader, 0) & 0x7fffffff;
+    const commandSize = read32(commandHeader, 4);
+    if (commandSize < 8 || commandOffset + BigInt(commandSize) > commandsEnd) return true;
+    if (command === 0x19 || command === 0x1) {
+      const segmentSize = command === 0x19 ? 72 : 56;
+      if (commandSize < segmentSize) return true;
+      const segment = await readFileSlice(handle, commandOffset, segmentSize);
+      if (!segment) return true;
+      const fileOffset = command === 0x19
+        ? readNativeInteger(segment, 40, 8, littleEndian)
+        : readNativeInteger(segment, 32, 4, littleEndian);
+      const backedSize = command === 0x19
+        ? readNativeInteger(segment, 48, 8, littleEndian)
+        : readNativeInteger(segment, 36, 4, littleEndian);
+      if (backedSize > 0n && fileOffset + backedSize > fileSize) return true;
+    }
+    commandOffset += BigInt(commandSize);
+  }
+  return commandOffset !== commandsEnd;
+}
+
+async function isTruncatedFatMachO(
+  handle: Awaited<ReturnType<typeof open>>,
+  header: Buffer,
+  headerBytes: number,
+  fileSize: bigint,
+  littleEndian: boolean,
+  is64Bit: boolean,
+): Promise<boolean> {
+  if (headerBytes < 8) return true;
+  const count = littleEndian ? header.readUInt32LE(4) : header.readUInt32BE(4);
+  if (count === 0 || count > 256) return true;
+  const entrySize = is64Bit ? 32 : 20;
+  if (8n + BigInt(entrySize * count) > fileSize) return true;
+  for (let index = 0; index < count; index += 1) {
+    const entry = await readFileSlice(handle, 8n + BigInt(index * entrySize), entrySize);
+    if (!entry) return true;
+    const offset = readNativeInteger(entry, 8, is64Bit ? 8 : 4, littleEndian);
+    const size = readNativeInteger(entry, is64Bit ? 16 : 12, is64Bit ? 8 : 4, littleEndian);
+    if (size === 0n || offset + size > fileSize) return true;
+  }
+  return false;
+}
+
+async function isTruncatedPe(
+  handle: Awaited<ReturnType<typeof open>>,
+  header: Buffer,
+  headerBytes: number,
+  fileSize: bigint,
+): Promise<boolean> {
+  if (headerBytes < 64) return true;
+  const peOffset = header.readUInt32LE(60);
+  if (BigInt(peOffset) + 24n > fileSize) return true;
+  const coff = await readFileSlice(handle, BigInt(peOffset), 24);
+  if (!coff || coff[0] !== 0x50 || coff[1] !== 0x45 || coff[2] !== 0 || coff[3] !== 0) return true;
+  const sectionCount = coff.readUInt16LE(6);
+  const optionalHeaderSize = coff.readUInt16LE(20);
+  if (sectionCount === 0 || sectionCount > 4096 || optionalHeaderSize < 2) return true;
+  const optionalHeader = await readFileSlice(handle, BigInt(peOffset + 24), optionalHeaderSize);
+  if (!optionalHeader) return true;
+  const optionalMagic = optionalHeader.readUInt16LE(0);
+  if (optionalMagic !== 0x10b && optionalMagic !== 0x20b) return true;
+  const sectionTable = BigInt(peOffset + 24 + optionalHeaderSize);
+  if (sectionTable + BigInt(sectionCount * 40) > fileSize) return true;
+  for (let index = 0; index < sectionCount; index += 1) {
+    const section = await readFileSlice(handle, sectionTable + BigInt(index * 40), 40);
+    if (!section) return true;
+    const rawSize = BigInt(section.readUInt32LE(16));
+    const rawOffset = BigInt(section.readUInt32LE(20));
+    if (rawSize > 0n && rawOffset + rawSize > fileSize) return true;
+  }
+  return false;
+}
+
 function tableExtendsPastEnd(offset: bigint, entrySize: number, count: number, fileSize: bigint): boolean {
   if (count === 0) return false;
   if (entrySize === 0) return false;
   return offset + BigInt(entrySize) * BigInt(count) > fileSize;
 }
 
-async function readElfEntry(
+async function readFileSlice(
   handle: Awaited<ReturnType<typeof open>>,
   offset: bigint,
   size: number,
@@ -839,6 +967,11 @@ async function readElfEntry(
   const entry = Buffer.alloc(size);
   const result = await handle.read(entry, 0, size, Number(offset));
   return result.bytesRead === size ? entry : undefined;
+}
+
+function readNativeInteger(buffer: Buffer, offset: number, byteLength: 4 | 8, littleEndian: boolean): bigint {
+  if (byteLength === 4) return BigInt(littleEndian ? buffer.readUInt32LE(offset) : buffer.readUInt32BE(offset));
+  return littleEndian ? buffer.readBigUInt64LE(offset) : buffer.readBigUInt64BE(offset);
 }
 
 function readElfInteger(buffer: Buffer, offset: number, byteLength: 2 | 4 | 8, littleEndian: boolean): bigint {

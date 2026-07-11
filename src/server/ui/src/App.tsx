@@ -33,6 +33,7 @@ import {
   contestReviewState,
   contestStrategy,
   confirmDecisionMemberKeys,
+  decisionHasUnresolvedEvidenceConflict,
   currentMaterialDetail,
   currentMaterialConfirmDecisions,
   currentMaterialFindings,
@@ -41,6 +42,7 @@ import {
   materialRefreshInProgress,
   fmtDur,
   fmtTime,
+  hasUnresolvedEvidenceConflict,
   isVerifyRun,
   isBugBountyConfig,
   isSubmissionReadyDecision,
@@ -592,6 +594,7 @@ function nextAction(finding: FindingRow): string {
   const tracking = finding.tracking_status ?? "open";
   if (tracking === "ignored") return "Ignored";
   if (tracking === "duplicate") return duplicateOfLabel(finding) ?? "Duplicate";
+  if (hasUnresolvedEvidenceConflict(finding)) return "Resolve evidence conflict";
   if (tracking === "submitted") return "Watch vendor response";
   if (tracking === "accepted") return "Track fix";
   if (tracking === "fixed") return "Close";
@@ -609,6 +612,7 @@ function findingWorkflow(finding: FindingRow): { label: string; detail: string; 
   const tracking = finding.tracking_status ?? "open";
   if (tracking === "ignored") return { label: "Ignored", detail: "Hidden from active workflow", className: "s-discharged" };
   if (tracking === "duplicate") return { label: "Duplicate", detail: duplicateOfLabel(finding) ?? "Linked duplicate", className: "s-discharged" };
+  if (hasUnresolvedEvidenceConflict(finding)) return { label: "Needs review", detail: "Local verification conflicts with real-target reproduction", className: "s-needs-evidence" };
   if (tracking === "accepted" || tracking === "fixed") return { label: tracking === "accepted" ? "Accepted" : "Fixed", detail: nextAction(finding), className: "s-confirmed-executable" };
   if (tracking === "submitted") return { label: "Submitted", detail: "Waiting for vendor response", className: "s-confirmed-source" };
   if (finding.status === "refuted" || finding.status === "discharged") return { label: "Closed", detail: nextAction(finding), className: "s-discharged" };
@@ -626,7 +630,9 @@ function isLocallyVerified(finding: FindingRow): boolean {
 }
 
 function findingCheckBadges(finding: FindingRow): { label: string; className: string; title: string }[] {
-  const verify = isLocallyVerified(finding)
+  const verify = hasUnresolvedEvidenceConflict(finding)
+    ? { label: "Conflict", className: "s-needs-evidence", title: "Local verification conflicts with the real-target reproduction and requires human review." }
+    : isLocallyVerified(finding)
     ? { label: "Verified", className: "s-confirmed-executable", title: "Local execution verification passed." }
     : finding.status === "refuted" || finding.status === "discharged"
       ? { label: "Refuted", className: "s-refuted", title: "Local verification refuted or discharged this finding." }
@@ -858,7 +864,7 @@ function pipelineRunActionDetail(detail: ProjectDetail, hasPipelineRun: boolean)
   if (verifyCount > 0) return `Continue the current pipeline by verifying ${plural(verifyCount, "candidate")} before this round can finish.`;
   const confirmCount = pendingConfirmFindings(detail.allFindings, requiresConfirmation, detail.confirmDecisions).length;
   if (confirmCount > 0) return `Continue the current pipeline by confirming ${plural(confirmCount, "finding")} before this round can finish.`;
-  const reportCount = requiresConfirmation ? pendingDecisionReports(detail.confirmDecisions).length : pendingFormalReports(detail.allFindings, requiresConfirmation).length;
+  const reportCount = requiresConfirmation ? pendingDecisionReports(detail.confirmDecisions, detail.allFindings).length : pendingFormalReports(detail.allFindings, requiresConfirmation).length;
   if (reportCount > 0) return `Continue the current pipeline by generating ${plural(reportCount, "report")} before this round can finish.`;
   const mode = coverageModeFromConfig(cfg);
   const audited = Math.max(0, detail.progress.audited ?? 0);
@@ -889,14 +895,14 @@ function pipelineRunActionDetail(detail: ProjectDetail, hasPipelineRun: boolean)
 }
 
 function reportDecisionFindings(detail: ProjectDetail, missingOnly: boolean): FindingRow[] {
-  const decisions = missingOnly ? pendingDecisionReports(detail.confirmDecisions) : reportableDecisions(detail.confirmDecisions);
+  const decisions = missingOnly ? pendingDecisionReports(detail.confirmDecisions, detail.allFindings) : reportableDecisions(detail.confirmDecisions, detail.allFindings);
   const keys = new Set(decisions.flatMap(confirmDecisionMemberKeys));
   if (!keys.size) return [];
   return activeFindings(detail.allFindings).filter((finding) => finding.finding_key && keys.has(finding.finding_key.toLowerCase()));
 }
 
 function selectedReportDecisions(detail: ProjectDetail, selectedIds: Set<number>): ConfirmDecision[] {
-  return reportableDecisions(detail.confirmDecisions).filter((decision) => decisionFindings(decision, detail.allFindings ?? []).some((finding) => selectedIds.has(finding.id)));
+  return reportableDecisions(detail.confirmDecisions, detail.allFindings).filter((decision) => decisionFindings(decision, detail.allFindings ?? []).some((finding) => selectedIds.has(finding.id)));
 }
 
 function verifyButtonLabel(count: number): string {
@@ -1083,7 +1089,7 @@ function actionSummary(detail: string): { label: string; body: string } {
 function eventPayload(event: ActivityRecord): Record<string, unknown> {
   const detail = parseJson<Record<string, unknown>>(event.detail, {});
   const payload = { ...detail };
-  for (const key of ["path", "bytes", "produced", "total", "audited", "pending", "deferred", "scopes", "findings", "hypotheses", "confirmedExecutable", "commandRuns", "steps", "stoppedReason", "resumed", "target", "runs", "toolchain", "command", "runId", "purpose", "passed", "exitCode", "timedOut", "matched", "missing", "output", "ok"] as const) {
+  for (const key of ["path", "bytes", "produced", "total", "audited", "pending", "deferred", "scopes", "findings", "hypotheses", "refuted", "confirmedExecutable", "commandRuns", "steps", "stoppedReason", "resumed", "target", "runs", "toolchain", "command", "runId", "purpose", "passed", "exitCode", "timedOut", "matched", "missing", "output", "ok"] as const) {
     if (event[key] !== undefined) payload[key] = event[key];
   }
   return payload;
@@ -1170,6 +1176,7 @@ function eventSummary(event: ActivityRecord, fallbackBody: string): { label: str
         payloadString(payload, "stoppedReason") ?? "finished",
         payloadNumber(payload, "findings") !== undefined ? `${payloadNumber(payload, "findings")} findings` : undefined,
         payloadNumber(payload, "hypotheses") !== undefined ? `${payloadNumber(payload, "hypotheses")} hypotheses` : undefined,
+        payloadNumber(payload, "refuted") !== undefined ? `${payloadNumber(payload, "refuted")} refuted` : undefined,
         payloadNumber(payload, "commandRuns") !== undefined ? `${payloadNumber(payload, "commandRuns")} command runs` : undefined,
       ].filter(Boolean);
       return { label: "Run finished", body: pieces.join(" · ") || fallbackBody };
@@ -1948,7 +1955,7 @@ export function App() {
         setModal(null);
         return;
       }
-      const reportableCount = requiresConfirmation ? reportableDecisions(currentDetail.confirmDecisions).length : reportableFindings(currentDetail.allFindings, requiresConfirmation).length;
+      const reportableCount = requiresConfirmation ? reportableDecisions(currentDetail.confirmDecisions, currentDetail.allFindings).length : reportableFindings(currentDetail.allFindings, requiresConfirmation).length;
       if (action === "report" && reportableCount === 0) {
         setToast({ tone: "warning", message: requiresConfirmation ? "There are no real-target decisions ready for submission reports yet." : "There are no locally execution-confirmed findings ready for formal reports yet." });
         setModal(null);
@@ -2761,11 +2768,11 @@ function ProjectDetailView(props: {
   const pendingConfirmBase = pendingConfirmFindings(allFindings, requiresConfirmation, confirmDecisions).length;
   const pendingConfirm = verifyRechecksConfirmed ? 0 : pendingConfirmBase;
   const pendingVerify = runningVerifyProgress ? runningVerifyProgress.remaining : verifyCandidates.length;
-  const pendingReports = requiresConfirmation ? pendingDecisionReports(confirmDecisions).length : pendingFormalReports(allFindings, requiresConfirmation).length;
+  const pendingReports = requiresConfirmation ? pendingDecisionReports(confirmDecisions, allFindings).length : pendingFormalReports(allFindings, requiresConfirmation).length;
   const locallyVerified = localVerifiedFindings(allFindings).length;
   const displayedVerified = runningVerifyProgress ? runningVerifyProgress.done : locallyVerified;
   const reportsReady = requiresConfirmation
-    ? reportableDecisions(confirmDecisions).filter((decision) => decision.has_report).length
+    ? reportableDecisions(confirmDecisions, allFindings).filter((decision) => decision.has_report).length
     : reportableFindings(allFindings, requiresConfirmation).filter((finding) => finding.has_report).length;
   const reportStat = pendingReports > 0 ? pendingReports : reportsReady;
   const reportLabel = pendingReports > 0 ? "to report" : "reports";
@@ -3072,7 +3079,7 @@ function ProjectDetailView(props: {
           configuredMapSamples={config.cfg.mapSamples ?? 1}
           resourceRequests={detail.backlogCounts?.["resource-request"] ?? 0}
         />
-        <RealTargetCallout decisions={confirmDecisions} onOpen={() => openProjectSection("decisions", "project-real-target-decisions")} />
+        <RealTargetCallout decisions={confirmDecisions} findings={allFindings} onOpen={() => openProjectSection("decisions", "project-real-target-decisions")} />
         <ProjectSetupDisclosure items={readyItems} clue={prepareClue} />
       </Card>
       <div className="tabs" role="tablist" aria-label="Project sections">
@@ -3460,7 +3467,7 @@ function ProjectOverview({
   return (
     <>
       {runningRun ? <ActivitySnapshot run={runningRun} onOpen={onOpenActivity} /> : null}
-      <ProjectOverviewDecisions decisions={detail.confirmDecisions} onOpenDecisionReport={onOpenDecisionReport} onOpenDecisions={onOpenDecisions} />
+      <ProjectOverviewDecisions decisions={detail.confirmDecisions} findings={detail.allFindings ?? []} onOpenDecisionReport={onOpenDecisionReport} onOpenDecisions={onOpenDecisions} />
       <div id="project-top-candidates" className="section-anchor">
         <Card title={<span>{candidateTitle} <Counter>{candidateCounter}</Counter></span>}>
           <div className="candidate-head">
@@ -3726,19 +3733,22 @@ function backlogSummaryDetail(item: DiscoveryBacklogRow): string {
 
 function ProjectOverviewDecisions({
   decisions,
+  findings,
   onOpenDecisionReport,
   onOpenDecisions,
 }: {
   decisions: ConfirmDecision[];
+  findings: FindingRow[];
   onOpenDecisionReport: (decision: ConfirmDecision) => void;
   onOpenDecisions: () => void;
 }) {
   if (!decisions.length) return null;
   const reproduced = confirmedDecisions(decisions).length;
-  const submissionReady = submissionReadyCount(decisions);
-  const submitCandidates = submitCandidateCount(decisions);
+  const submissionReadyDecisions = reportableDecisions(decisions, findings);
+  const submissionReady = submissionReadyDecisions.length;
+  const submitCandidates = submitCandidateCount(submissionReadyDecisions);
   const droppedReproductions = droppedReproductionCount(decisions);
-  const missingReports = pendingDecisionReports(decisions).length;
+  const missingReports = pendingDecisionReports(decisions, findings).length;
   const meta = decisionCalloutMeta(decisions);
   const preview = overviewDecisionPreview(decisions);
   const remaining = decisions.length - preview.length;
@@ -3771,13 +3781,19 @@ function ProjectOverviewDecisions({
         </div>
         <div className="decision-list overview-decision-list">
           {preview.map((decision) => {
-            const metaChips = decisionMetaChips(decision);
+            const evidenceConflict = decisionHasUnresolvedEvidenceConflict(decision, findings);
+            const metaChips = evidenceConflict
+              ? [
+                { label: "Needs human review", className: "label s-needs-evidence", title: "Local verification conflicts with the real-target reproduction." },
+                ...decisionMetaChips(decision).filter((chip) => chip.title !== "Submit recommendation"),
+              ]
+              : decisionMetaChips(decision);
             const dropReason = decisionDropReason(decision);
             return (
-              <div className={`decision-row overview-decision-row${isSubmitCandidateDecision(decision) ? " submit-candidate" : ""}`} key={decision.id ?? `${decision.run_id}-${decision.bug}`}>
+              <div className={`decision-row overview-decision-row${!evidenceConflict && isSubmitCandidateDecision(decision) ? " submit-candidate" : ""}`} key={decision.id ?? `${decision.run_id}-${decision.bug}`}>
                 <div className="decision-main">
-                  <span className={`label ${decision.reproduced === "yes" ? "s-confirmed-executable" : decision.reproduced === "no" ? "s-refuted" : "s-suspected"}`}>
-                    {decisionLabel(decision)}
+                  <span className={`label ${evidenceConflict ? "s-needs-evidence" : decision.reproduced === "yes" ? "s-confirmed-executable" : decision.reproduced === "no" ? "s-refuted" : "s-suspected"}`}>
+                    {evidenceConflict ? "Evidence conflict" : decisionLabel(decision)}
                   </span>
                   <strong>{decision.bug}</strong>
                   {metaChips.length ? (
@@ -3790,9 +3806,11 @@ function ProjectOverviewDecisions({
                   {dropReason ? <small className="decision-drop-reason">{dropReason}</small> : null}
                 </div>
                 <div className="decision-actions">
-                  <Button size="sm" icon="file" title={decisionReportButtonTitle(decision)} onClick={() => onOpenDecisionReport(decision)}>
-                    {decisionReportButtonLabel(decision)}
-                  </Button>
+                  {evidenceConflict ? <span className="label s-needs-evidence" title="Resolve the evidence conflict before generating a submission report.">Report held</span> : (
+                    <Button size="sm" icon="file" title={decisionReportButtonTitle(decision)} onClick={() => onOpenDecisionReport(decision)}>
+                      {decisionReportButtonLabel(decision)}
+                    </Button>
+                  )}
                 </div>
               </div>
             );
@@ -3872,10 +3890,6 @@ function decisionLabel(decision: ConfirmDecision): string {
 
 function isSubmitCandidateDecision(decision: ConfirmDecision): boolean {
   return decision.reproduced === "yes" && decision.recommendation === "submit-candidate";
-}
-
-function submissionReadyCount(decisions: ConfirmDecision[]): number {
-  return decisions.filter(isSubmissionReadyDecision).length;
 }
 
 function droppedReproductionCount(decisions: ConfirmDecision[]): number {
@@ -4158,13 +4172,19 @@ function ConfirmDecisionsCard({
         <div className="decision-list">
           {orderedDecisions.map((decision) => {
             const linkedFindings = decisionFindings(decision, findings);
-            const metaChips = decisionMetaChips(decision);
+            const evidenceConflict = decisionHasUnresolvedEvidenceConflict(decision, findings);
+            const metaChips = evidenceConflict
+              ? [
+                { label: "Needs human review", className: "label s-needs-evidence", title: "Local verification conflicts with the real-target reproduction." },
+                ...decisionMetaChips(decision).filter((chip) => chip.title !== "Submit recommendation"),
+              ]
+              : decisionMetaChips(decision);
             const dropReason = decisionDropReason(decision);
             return (
-              <div className={`decision-row${decision.recommendation === "submit-candidate" ? " submit-candidate" : ""}`} key={decision.id ?? `${decision.run_id}-${decision.bug}`}>
+              <div className={`decision-row${!evidenceConflict && decision.recommendation === "submit-candidate" ? " submit-candidate" : ""}`} key={decision.id ?? `${decision.run_id}-${decision.bug}`}>
                 <div className="decision-main">
-                  <span className={`label ${decision.reproduced === "yes" ? "s-confirmed-executable" : decision.reproduced === "no" ? "s-refuted" : "s-suspected"}`}>
-                    {decisionLabel(decision)}
+                  <span className={`label ${evidenceConflict ? "s-needs-evidence" : decision.reproduced === "yes" ? "s-confirmed-executable" : decision.reproduced === "no" ? "s-refuted" : "s-suspected"}`}>
+                    {evidenceConflict ? "Evidence conflict" : decisionLabel(decision)}
                   </span>
                   <strong>{decision.bug}</strong>
                   <small>{decisionMetaLabel(decision)}</small>
@@ -4187,9 +4207,11 @@ function ConfirmDecisionsCard({
                   ) : null}
                 </div>
                 <div className="decision-actions">
-                  <Button size="sm" icon="file" title={decisionReportButtonTitle(decision)} onClick={() => onOpenDecisionReport(decision)}>
-                    {decisionReportButtonLabel(decision)}
-                  </Button>
+                  {evidenceConflict ? <span className="label s-needs-evidence" title="Resolve the evidence conflict before generating a submission report.">Report held</span> : (
+                    <Button size="sm" icon="file" title={decisionReportButtonTitle(decision)} onClick={() => onOpenDecisionReport(decision)}>
+                      {decisionReportButtonLabel(decision)}
+                    </Button>
+                  )}
                 </div>
               </div>
             );
@@ -4200,9 +4222,9 @@ function ConfirmDecisionsCard({
   );
 }
 
-function RealTargetCallout({ decisions, onOpen }: { decisions: ConfirmDecision[]; onOpen: () => void }) {
+function RealTargetCallout({ decisions, findings, onOpen }: { decisions: ConfirmDecision[]; findings: FindingRow[]; onOpen: () => void }) {
   const reproduced = confirmedDecisions(decisions).length;
-  const submissionReady = submissionReadyCount(decisions);
+  const submissionReady = reportableDecisions(decisions, findings).length;
   const droppedReproductions = droppedReproductionCount(decisions);
   const meta = decisionCalloutMeta(decisions);
   if (!decisions.length) return null;
@@ -4749,7 +4771,7 @@ function ProjectFindings(props: {
     },
     {
       label: "Report",
-      count: requiresConfirmation ? pendingDecisionReports(props.detail.confirmDecisions).length : pendingFormalReports(allFindings, requiresConfirmation).length,
+      count: requiresConfirmation ? pendingDecisionReports(props.detail.confirmDecisions, allFindings).length : pendingFormalReports(allFindings, requiresConfirmation).length,
       detail: requiresConfirmation ? "Reproduced decisions missing submission reports." : "Source-only confirmed bugs missing formal reports.",
     },
     {
@@ -5092,20 +5114,23 @@ function FindingLifecycleRail({ finding, onOpen }: { finding: FindingRow; onOpen
   const verify = latestAttempt(attempts, "verify");
   const confirm = latestAttempt(attempts, "confirm");
   const report = latestAttempt(attempts, "report");
+  const evidenceConflict = hasUnresolvedEvidenceConflict(finding);
   const localSettled = finding.status === "confirmed-source" || finding.status === "confirmed-executable" || finding.status === "confirmed-differential" || finding.status === "refuted";
   const disclosureDone = ["submitted", "accepted", "fixed", "rejected", "duplicate"].includes(finding.tracking_status ?? "open");
   const phases: Array<{ label: string; state: LifecycleRailState; detail: string }> = [
     { label: "Found", state: "done", detail: (finding.occurrence_count ?? 1) > 1 ? `${finding.occurrence_count} recorded occurrences` : "Canonical finding recorded" },
     {
       label: "Local",
-      state: localSettled ? "done" : attemptState(verify),
-      detail: finding.refutation_status === "blocked"
+      state: evidenceConflict ? "blocked" : localSettled ? "done" : attemptState(verify),
+      detail: evidenceConflict
+        ? finding.refutation_reason ?? "Local verification conflicts with real-target reproduction; human review is required"
+        : finding.refutation_status === "blocked"
         ? `Independent review blocked: ${finding.refutation_reason ?? "no verdict"}`
         : verify?.blocker || (localSettled ? finding.status.replaceAll("-", " ") : "Waiting for executable evidence"),
     },
     { label: "Target", state: finding.confirm_status ? "done" : attemptState(confirm), detail: confirm?.blocker || (finding.confirm_status ? `Real target: ${finding.confirm_status}` : "Real-target confirmation pending") },
-    { label: "Report", state: finding.has_report ? "done" : attemptState(report), detail: report?.blocker || (finding.has_report ? "Formal report ready" : "Formal report pending") },
-    { label: "Disclose", state: disclosureDone ? "done" : "pending", detail: disclosureDone ? `Tracking: ${finding.tracking_status}` : "Not yet submitted" },
+    { label: "Report", state: finding.has_report ? "done" : evidenceConflict ? "blocked" : attemptState(report), detail: evidenceConflict && !finding.has_report ? "Held until the evidence conflict is resolved" : report?.blocker || (finding.has_report ? "Formal report ready" : "Formal report pending") },
+    { label: "Disclose", state: disclosureDone ? "done" : evidenceConflict ? "blocked" : "pending", detail: disclosureDone ? `Tracking: ${finding.tracking_status}` : evidenceConflict ? "Held for human evidence review" : "Not yet submitted" },
   ];
   const focus = phases.find((phase) => phase.state === "running" || phase.state === "blocked") ?? phases.find((phase) => phase.state === "pending") ?? phases[phases.length - 1]!;
   return (
@@ -6191,8 +6216,8 @@ function RunModal({ detail, busy, onClose, onLaunch, onUpdateRunTarget, onError 
   const requiresConfirmation = needsRealTargetConfirmation(detail);
   const confirmable = pendingConfirmFindings(detail.allFindings, requiresConfirmation, detail.confirmDecisions).length;
   const verifiable = pendingVerifyFindings(detail.allFindings).length;
-  const reportable = requiresConfirmation ? reportableDecisions(detail.confirmDecisions).length : reportableFindings(detail.allFindings, requiresConfirmation).length;
-  const missingReports = requiresConfirmation ? pendingDecisionReports(detail.confirmDecisions).length : pendingFormalReports(detail.allFindings, requiresConfirmation).length;
+  const reportable = requiresConfirmation ? reportableDecisions(detail.confirmDecisions, detail.allFindings).length : reportableFindings(detail.allFindings, requiresConfirmation).length;
+  const missingReports = requiresConfirmation ? pendingDecisionReports(detail.confirmDecisions, detail.allFindings).length : pendingFormalReports(detail.allFindings, requiresConfirmation).length;
   const hasPipelineRun = detail.runs.some((run) => run.kind === "run");
   const pipelineActionDetail = pipelineRunActionDetail(detail, hasPipelineRun);
   const currentRoundWorkPending = verifiable > 0 || confirmable > 0 || missingReports > 0;
@@ -6319,7 +6344,7 @@ function LaunchConfirmModal({ action, detail, busy, onCancel, onConfirm }: { act
   const count = isReport && requiresConfirmation ? selectedDecisionReports.length : selectedTargets.length;
   const selectedMissingReports = isReport ? (requiresConfirmation ? selectedDecisionReports.filter((decision) => !decision.has_report).length : selectedTargets.filter((finding) => !finding.has_report).length) : 0;
   const selectedExistingReports = isReport ? (requiresConfirmation ? selectedDecisionReports.filter((decision) => decision.has_report).length : selectedTargets.filter((finding) => finding.has_report).length) : 0;
-  const existingReportTargets = isReport ? (requiresConfirmation ? reportableDecisions(detail.confirmDecisions).filter((decision) => decision.has_report).length : targets.filter((finding) => finding.has_report).length) : 0;
+  const existingReportTargets = isReport ? (requiresConfirmation ? reportableDecisions(detail.confirmDecisions, detail.allFindings).filter((decision) => decision.has_report).length : targets.filter((finding) => finding.has_report).length) : 0;
   const allSelected = targets.length > 0 && selectedIds.size === targets.length;
   function toggleFinding(id: number) {
     setSelectedIds((current) => {
@@ -6585,6 +6610,7 @@ function LifecycleEvidencePanel({
   retryMessage: string;
   onRetry: (phase: FindingPhase) => void;
 }) {
+  const evidenceConflict = hasUnresolvedEvidenceConflict(finding);
   const findingAttempts = lifecycle?.attempts ?? finding.phase_attempts ?? [];
   const decisionAttempts = lifecycle?.decisions.flatMap((decision) => decision.attempts ?? []) ?? [];
   const attempts = [...findingAttempts, ...decisionAttempts];
@@ -6603,7 +6629,11 @@ function LifecycleEvidencePanel({
         {finding.refutation_status ? <span className={`label refutation-${finding.refutation_status}`}>Independent review: {finding.refutation_status}</span> : null}
       </div>
       <div className="lifecycle-attempt-grid">
-        {phaseRows.map(({ phase, label, attempt }) => (
+        {phaseRows.map(({ phase, label, attempt }) => {
+          const conflictRetry = evidenceConflict && (phase === "verify" || phase === "confirm");
+          const blockedRetry = Boolean(attempt && (attempt.state === "blocked" || attempt.state === "error"));
+          const retryLabel = conflictRetry ? (phase === "verify" ? "Retry Verify" : "Retry Confirm") : `Retry ${lifecyclePhaseLabel(phase)}`;
+          return (
           <div className="lifecycle-attempt" key={phase}>
             <span className={`lifecycle-dot ${attemptState(attempt)}`} />
             <div>
@@ -6611,12 +6641,14 @@ function LifecycleEvidencePanel({
               <small>{attempt ? `Attempt ${attempt.attempt_number} · ${attempt.outcome ?? attempt.state}${attempt.updated_at ? ` · ${fmtTime(attempt.updated_at)}` : ""}` : "Not attempted"}</small>
               {attempt?.blocker ? <p>{attempt.blocker}</p> : null}
             </div>
-            {attempt && (attempt.state === "blocked" || attempt.state === "error") ? (
-              <Button size="sm" icon="sync" disabled={retrying !== null} onClick={() => onRetry(phase)}>{retrying === phase ? "Reopening..." : `Retry ${lifecyclePhaseLabel(phase)}`}</Button>
+            {conflictRetry || blockedRetry ? (
+              <Button size="sm" icon="sync" disabled={retrying !== null} onClick={() => onRetry(phase)}>{retrying === phase ? "Reopening..." : retryLabel}</Button>
             ) : null}
           </div>
-        ))}
+          );
+        })}
       </div>
+      {evidenceConflict ? <div className="inline-note">Retry Verify to seek an agreeing local result, or retry Confirm to re-check the real target. Reporting stays held until the evidence agrees.</div> : null}
       {retryMessage ? <div className="inline-note">{retryMessage}</div> : null}
       {finding.refutation_reason ? <details className="lifecycle-refutation"><summary>Independent review detail</summary><p>{finding.refutation_reason}</p></details> : null}
     </section>

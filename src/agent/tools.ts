@@ -74,6 +74,14 @@ export interface AgentFinding {
   refutationReason?: string;
 }
 
+/** Verify-mode false-positive verdicts use a title prefix because the in-memory
+ * confirmation enum intentionally has no `refuted` member. Keep this predicate
+ * shared by ingestion, artifact classification, and persistence so a passing
+ * mitigation test can never turn a REFUTED verdict into a vulnerability. */
+export function isRefutedFindingTitle(title: string): boolean {
+  return /^\s*REFUTED\s*:/i.test(title);
+}
+
 export interface CommandRunRecord {
   id: string;
   purpose?: "inspect" | "build" | "confirm";
@@ -226,7 +234,9 @@ export function ingestFindingsFromScratch(session: AgentSession): { parsed: numb
 
     const commandRunId = asString(record.command_id) ?? asString(record.commandRunId) ?? asString(record.test_run_id);
     const citedRun = commandRunId ? session.commandRuns.find((run) => run.id === commandRunId) : undefined;
-    const confirmed = Boolean(citedRun?.passed);
+    // A successful local command may prove either side of a verify claim. For a
+    // REFUTED verdict it is mitigation evidence, not vulnerability confirmation.
+    const confirmed = Boolean(citedRun?.passed) && !isRefutedFindingTitle(title);
     const id = asString(record.id) ?? `f${findings.length + 1}`;
     const fixPatch = normalizeFixPatch(record.fix_patch ?? record.fixPatch);
     findings.push({
@@ -244,7 +254,7 @@ export function ingestFindingsFromScratch(session: AgentSession): { parsed: numb
       // "DISCHARGED:" title prefix. Only a passed command_id can promote a
       // claim to confirmed-executable.
       confirmationStatus: confirmed ? "confirmed-executable" : declaredUnconfirmedStatus(record, title),
-      ...(confirmed && citedRun ? { commandRunId: citedRun.id } : {}),
+      ...(citedRun?.passed ? { commandRunId: citedRun.id } : {}),
       ...(fixPatch ? { fixPatch } : {}),
       ...(asStringList(record.patched_success_patterns ?? record.patchedSuccessPatterns).length > 0
         ? { patchedSuccessPatterns: asStringList(record.patched_success_patterns ?? record.patchedSuccessPatterns) }

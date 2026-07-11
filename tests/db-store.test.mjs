@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import test from "node:test";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -1004,6 +1004,46 @@ test("store: completed finding identity migrations do not rewrite alias provenan
   assert.equal(alias.updated_at, "provenance-sentinel");
 });
 
+test("store: startup canonicalizes legacy confirm members through finding-key aliases", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "flounder-store-confirm-alias-"));
+  try {
+    let store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "confirm-member-alias" });
+    const auditRun = store.startRun({ projectId, kind: "audit", runDir: path.join(dir, "audit") });
+    store.upsertFindings(projectId, auditRun, [{
+      findingKey: "kcanonicalmember",
+      title: "Canonical member candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "confirmed-executable",
+    }]);
+    const finding = store.queryFindings(projectId, { search: "Canonical member candidate" })[0];
+    const confirmRun = store.startRun({ projectId, kind: "confirm", runDir: path.join(dir, "confirm") });
+    store.upsertConfirmDecisions(projectId, confirmRun, [{
+      bug: "Canonical member candidate",
+      reproduced: "unknown",
+      recommendation: "needs-human",
+      members: ["klegacymember"],
+    }]);
+    store.upsertFindings(projectId, auditRun, [{
+      findingKey: "klegacymember",
+      originId: Number(finding.id),
+      title: "Canonical member candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "confirmed-executable",
+    }]);
+    assert.deepEqual(JSON.parse(store.listConfirmDecisions(projectId)[0].members_json), ["klegacymember"]);
+    store.close();
+
+    store = MetadataStore.openForOutput(dir);
+    assert.deepEqual(JSON.parse(store.listConfirmDecisions(projectId)[0].members_json), ["kcanonicalmember"]);
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("store: blocked finding phases are idempotent until inputs change or an operator requests retry", async () => {
   const db = await tempDb();
   const projectId = db.upsertProject({ name: "attempts" });
@@ -1023,5 +1063,89 @@ test("store: blocked finding phases are idempotent until inputs change or an ope
   db.recordFindingPhaseAttempt(projectId, retryRun, { subjectType: "finding", subjectId: Number(finding.id), phase: "verify", inputFingerprint: "sha256:input-a", state: "settled", outcome: "refuted" });
   const attempts = db.listFindingPhaseAttempts("finding", Number(finding.id));
   assert.deepEqual(attempts.map((attempt) => [attempt.attempt_number, attempt.state]), [[1, "blocked"], [2, "settled"]]);
+  db.close();
+});
+
+test("store: remote verify ownership survives later pipeline phases and artifact replay is idempotent", async () => {
+  const db = await tempDb();
+  const daemon = db.createDaemonToken("artifact-owner");
+  const projectId = db.upsertProject({ name: "artifact-replay" });
+  const jobId = db.enqueueJob("artifact-replay", { verb: "run", pipeline: true }, daemon.id);
+  assert.equal(db.claimJob(daemon.id).id, jobId);
+
+  const sourceRun = db.startRun({ projectId, kind: "run", runDir: "/runs/source", daemonId: daemon.id });
+  db.upsertFindings(projectId, sourceRun, [{
+    findingKey: "artifact-candidate",
+    title: "Artifact replay candidate",
+    location: "src/example.ts:1",
+    severity: "high",
+    status: "confirmed-executable",
+    reportPath: "/runs/source/report_f1.md",
+    reportMarkdown: "# stale report\n",
+  }]);
+  const finding = db.queryFindings(projectId, { search: "Artifact replay candidate" })[0];
+
+  const verifyRun = db.startRun({ projectId, kind: "audit", runDir: "/runs/verify", budgets: { verify: true }, daemonId: daemon.id });
+  db.setJobRun(jobId, verifyRun);
+  db.recordFindingPhaseAttempt(projectId, verifyRun, {
+    subjectType: "finding",
+    subjectId: Number(finding.id),
+    phase: "verify",
+    inputFingerprint: "sha256:artifact-replay",
+    state: "blocked",
+    blocker: "remote verdict was not ingested",
+    metrics: { findings: 1, steps: 3 },
+  });
+  db.finishRun(verifyRun, "error");
+
+  const reportRun = db.startRun({ projectId, kind: "report", runDir: "/runs/report", daemonId: daemon.id });
+  db.setJobRun(jobId, reportRun);
+  assert.equal(db.getJob(jobId).run_id, reportRun, "job.run_id remains the mutable active-phase pointer");
+  assert.equal(db.getRun(verifyRun).daemon_id, daemon.id, "the terminal verify keeps immutable executor ownership");
+
+  const work = db.listDaemonArtifactReconciliationRuns(daemon.id, 1);
+  assert.deepEqual(work.map((run) => run.id), [verifyRun]);
+  assert.equal(db.reconcileTerminalVerifyArtifacts(verifyRun, [{
+    originId: Number(finding.id),
+    title: "REFUTED: Artifact replay candidate",
+    location: "src/example.ts:1",
+    severity: "info",
+    confirmationStatus: "confirmed-executable",
+    evidence: "The executable check disproved the claim.",
+  }], 1), true);
+
+  const refuted = db.getFinding(Number(finding.id));
+  assert.equal(refuted.status, "refuted");
+  assert.equal(refuted.run_id, verifyRun);
+  assert.equal(refuted.report_path, null);
+  assert.equal(refuted.report_markdown, null);
+  const attempt = db.latestFindingPhaseAttempt("finding", Number(finding.id), "verify");
+  assert.equal(attempt.outcome, "refuted");
+  assert.equal(attempt.metrics_json, JSON.stringify({ findings: 1, steps: 3 }));
+  assert.equal(db.listDaemonArtifactReconciliationRuns(daemon.id, 1).length, 0);
+
+  const updatedAt = refuted.updated_at;
+  assert.equal(db.reconcileTerminalVerifyArtifacts(verifyRun, [], 1), true);
+  assert.equal(db.getFinding(Number(finding.id)).updated_at, updatedAt, "a versioned replay is a true no-op");
+  assert.equal(db.getJob(jobId).run_id, reportRun, "replay never rewrites the active job phase");
+  db.close();
+});
+
+test("store: legacy daemon ownership backfill uses only the run still linked by its job", async () => {
+  const { dbPath } = await tempDbPath();
+  let db = new MetadataStore(dbPath);
+  const daemon = db.createDaemonToken("legacy-owner");
+  const projectId = db.upsertProject({ name: "legacy-run-owner" });
+  const jobId = db.enqueueJob("legacy-run-owner", { verb: "run", pipeline: true }, daemon.id);
+  assert.equal(db.claimJob(daemon.id).id, jobId);
+  const olderPhase = db.startRun({ projectId, kind: "audit", runDir: "/runs/legacy-verify", budgets: { verify: true } });
+  db.setJobRun(jobId, olderPhase);
+  const currentPhase = db.startRun({ projectId, kind: "report", runDir: "/runs/legacy-report" });
+  db.setJobRun(jobId, currentPhase);
+  db.close();
+
+  db = new MetadataStore(dbPath);
+  assert.equal(db.getRun(olderPhase).daemon_id, null, "overwritten legacy phases are not attributed by unsafe inference");
+  assert.equal(db.getRun(currentPhase).daemon_id, daemon.id, "the exact current job link is safe to backfill");
   db.close();
 });

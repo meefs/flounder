@@ -280,8 +280,11 @@ export interface AuditSummary {
     verifiedFindings: number;
     unverifiedFindings: number;
     // Unconfirmed candidates recorded separately from findings. A finding requires
-    // execution-grounded confirmation; everything else is a hypothesis.
+    // execution-grounded confirmation; terminal refutations are counted below.
     hypotheses?: number;
+    // Terminal false-positive verdicts are retained for audit history but no longer
+    // count as unresolved hypotheses or re-enter Verify.
+    refuted?: number;
   };
   findings: RankedFinding[];
 }

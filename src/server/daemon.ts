@@ -7,7 +7,7 @@
 import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { runAudit } from "../agent/audit.js";
 import { runConfirm } from "../agent/confirm.js";
 import { runReport } from "../agent/report.js";
@@ -23,6 +23,7 @@ import type { RunHealth } from "../agent/discovery-artifacts.js";
 import { assertProviderAuthenticated, knownRuntimeProviders, providerAuthStatus } from "../provider-auth.js";
 import { buildDefaultSandboxImage, checkSandboxReadiness, DEFAULT_SANDBOX_IMAGE, isDefaultSandboxImage, type SandboxImageBuildResult, type SandboxReadiness } from "../security/sandbox.js";
 import { RunLogger } from "../trace/logger.js";
+import { positiveIntegerId } from "../util/ids.js";
 
 export interface DaemonOptions {
   server: string;
@@ -54,6 +55,12 @@ export async function runDaemon(opts: DaemonOptions): Promise<void> {
   const reg = await fetch(base + "/api/daemon/register", { method: "POST", headers, body: JSON.stringify({ name: opts.name ?? "daemon", capabilities: await daemonCapabilities(), workspace }) }).catch(() => null);
   if (!reg || !reg.ok) throw new Error(`daemon: could not register with ${base} (status ${reg ? reg.status : "no response"}) — check --server and --token`);
   console.log(`[flounder daemon] connected to ${base}  (out=${out}, workspace=${workspace}, concurrency=${maxConcurrent})`);
+  // Historical terminal artifacts live on the executor, not the control plane.
+  // Replay them best-effort after registration; failures never block new work and
+  // remain eligible for the next daemon restart.
+  void replayTerminalVerifyArtifacts(base, headers, out).then((count) => {
+    if (count > 0) console.log(`[flounder daemon] reconciled ${count} terminal verify artifact${count === 1 ? "" : "s"}`);
+  }).catch(() => {});
   setInterval(heartbeat, 10_000);
   heartbeat();
 
@@ -591,9 +598,9 @@ class RemoteTracker implements RunTracker {
   }
 
   findings(findings: AgentFinding[], runDir: string, reason?: string): void {
-    const reportable = findings.filter((finding) => finding.severity !== "info" && finding.confirmationStatus !== "discharged");
-    if (reportable.length === 0) return;
-    this.enqueue(() => (this.runId ? this.req("PATCH", `/api/daemon/runs/${this.runId}`, { findings: reportable.map((f) => toFindingRow(f, runDir, this.targetName)), reason }) : Promise.resolve()));
+    const rows = remoteFindingRows(findings, runDir, this.targetName);
+    if (rows.length === 0) return;
+    this.enqueue(() => (this.runId ? this.req("PATCH", `/api/daemon/runs/${this.runId}`, { findings: rows, reason }) : Promise.resolve()));
   }
 
   stage(name: string, info: Record<string, unknown>): void {
@@ -633,6 +640,146 @@ class RemoteTracker implements RunTracker {
   flush(): Promise<void> {
     return this.chain;
   }
+}
+
+export function remoteFindingRows(findings: AgentFinding[], runDir: string, targetName: string): ReturnType<typeof toFindingRow>[] {
+  return findings
+    .map((finding) => toFindingRow(finding, runDir, targetName))
+    .filter((row) => row.status !== "discharged"
+      && (row.severity !== "info" || (row.status === "refuted" && row.originId !== undefined)));
+}
+
+const VERIFY_ARTIFACT_NAMES = ["audit_hypotheses.json", "audit_findings.json"] as const;
+const MAX_VERIFY_ARTIFACT_FILE_BYTES = 4 * 1024 * 1024;
+const MAX_VERIFY_ARTIFACT_REPLAY_ROWS = 1_000;
+const MAX_VERIFY_ARTIFACT_REPLAY_PAGES = 20;
+
+/** Read only the two verdict artifacts, only below this daemon's configured output
+ * root, and return negative verdicts stripped to the bounded protocol fields. */
+export async function loadVerifyArtifactReplay(outRoot: string, runDir: string): Promise<Array<Record<string, unknown>>> {
+  const root = await realpath(path.resolve(outRoot));
+  const run = await realpath(path.resolve(runDir));
+  if (!pathIsWithin(root, run)) throw new Error("verify artifact run directory escapes the daemon output root");
+
+  const all: Array<Record<string, unknown>> = [];
+  for (const name of VERIFY_ARTIFACT_NAMES) {
+    const candidate = path.join(run, name);
+    let resolved: string;
+    try {
+      resolved = await realpath(candidate);
+    } catch (error) {
+      if (isMissingFile(error)) continue;
+      throw error;
+    }
+    if (!pathIsWithin(run, resolved)) throw new Error("verify artifact file escapes its run directory");
+    const fileStat = await stat(resolved);
+    if (!fileStat.isFile() || fileStat.size > MAX_VERIFY_ARTIFACT_FILE_BYTES) throw new Error("verify artifact file is not a bounded regular file");
+    const parsed = JSON.parse(await readFile(resolved, "utf8")) as unknown;
+    all.push(...findingArtifactRows(parsed));
+    if (all.length > MAX_VERIFY_ARTIFACT_REPLAY_ROWS) throw new Error("too many verify artifact rows");
+  }
+
+  const seen = new Set<number>();
+  const negative: Array<Record<string, unknown>> = [];
+  for (const artifact of all) {
+    const originId = positiveIntegerId(artifact.originId ?? artifact.origin_id);
+    if (originId === undefined) continue;
+    // Multiple verdicts for one origin in one run are ambiguous even if only one is
+    // negative. Do not let transport ordering choose a winner.
+    if (seen.has(originId)) throw new Error("conflicting verify artifact rows for one origin");
+    seen.add(originId);
+    const title = typeof artifact.title === "string" ? artifact.title : "";
+    const status = typeof (artifact.confirmationStatus ?? artifact.status) === "string"
+      ? String(artifact.confirmationStatus ?? artifact.status)
+      : "";
+    if (!/^\s*REFUTED\s*:/i.test(title) && status !== "suspected") continue;
+    negative.push(sanitizeVerifyArtifactRow(artifact, originId));
+  }
+  return negative;
+}
+
+/** Best-effort paged replay. A failed/missing/corrupt run remains unversioned on
+ * the server and will be retried the next time this daemon registers. */
+export async function replayTerminalVerifyArtifacts(
+  base: string,
+  headers: Record<string, string>,
+  outRoot: string,
+): Promise<number> {
+  let beforeId: number | undefined;
+  let reconciled = 0;
+  for (let page = 0; page < MAX_VERIFY_ARTIFACT_REPLAY_PAGES; page += 1) {
+    const response = await fetch(base + "/api/daemon/reconciliation/worklist", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ ...(beforeId ? { beforeId } : {}), limit: 50 }),
+    }).catch(() => null);
+    if (!response?.ok) return reconciled;
+    const body = (await response.json().catch(() => null)) as { version?: unknown; runs?: unknown; nextBeforeId?: unknown } | null;
+    if (!body || !Number.isInteger(body.version) || !Array.isArray(body.runs)) return reconciled;
+    const version = Number(body.version);
+    for (const entry of body.runs) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+      const row = entry as Record<string, unknown>;
+      const runId = positiveIntegerId(row.runId);
+      if (runId === undefined || typeof row.runDir !== "string" || !row.runDir) continue;
+      let artifacts: Array<Record<string, unknown>>;
+      try {
+        artifacts = await loadVerifyArtifactReplay(outRoot, row.runDir);
+      } catch {
+        continue;
+      }
+      const replay = await fetch(base + `/api/daemon/reconciliation/runs/${runId}`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ version, artifacts }),
+      }).catch(() => null);
+      if (replay?.ok) reconciled += 1;
+    }
+    if (body.runs.length === 0) return reconciled;
+    const next = positiveIntegerId(body.nextBeforeId);
+    if (next === undefined || next === beforeId) return reconciled;
+    beforeId = next;
+  }
+  return reconciled;
+}
+
+function findingArtifactRows(value: unknown): Array<Record<string, unknown>> {
+  if (Array.isArray(value)) return value.filter(isObjectRecord);
+  if (!isObjectRecord(value)) throw new Error("verify artifact must be an array or wrapper object");
+  for (const key of ["findings", "hypotheses", "items"]) {
+    const rows = value[key];
+    if (Array.isArray(rows)) return rows.filter(isObjectRecord);
+  }
+  throw new Error("verify artifact wrapper has no finding rows");
+}
+
+function sanitizeVerifyArtifactRow(artifact: Record<string, unknown>, originId: number): Record<string, unknown> {
+  const allowedText = ["title", "location", "severity", "scopeId", "scope_id", "description", "evidence", "exploitSketch", "exploit_sketch", "fix", "confirmationStatus", "status"] as const;
+  const row: Record<string, unknown> = { originId };
+  for (const key of allowedText) {
+    const value = artifact[key];
+    if (value === undefined) continue;
+    if (typeof value !== "string" || value.length > 1_000_000) throw new Error("invalid verify artifact field");
+    row[key] = value;
+  }
+  if (artifact.confidence !== undefined) {
+    if (typeof artifact.confidence !== "number" || !Number.isFinite(artifact.confidence)) throw new Error("invalid verify artifact confidence");
+    row.confidence = artifact.confidence;
+  }
+  return row;
+}
+
+function pathIsWithin(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!relative.startsWith(".." + path.sep) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isMissingFile(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && "code" in error && (error as { code?: unknown }).code === "ENOENT");
 }
 
 // Batches token-level activity (~200ms) so the live stream stays token-granular without a

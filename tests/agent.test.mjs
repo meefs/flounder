@@ -10,7 +10,7 @@ import { ProjectMemory } from "../dist/agent/memory.js";
 import { buildTools, describeAction, ingestFindingsFromScratch, newSession, dedupeFindings, readScratchScopes, isReportFile, scratchHasFindings, scratchHasFindingsArtifact, commandFileArgsForTest, confirmCommandTargetLinkForTest, splitCommandLineForTest } from "../dist/agent/tools.js";
 import { buildRunHealth, mergeFollowupScopes, readScratchCoverageGaps, readScratchFollowupScopes, readScratchResourceRequests } from "../dist/agent/discovery-artifacts.js";
 import { mergeScopeInventory } from "../dist/agent/scope-store.js";
-import { runAudit } from "../dist/agent/audit.js";
+import { dedupeVerifyInputs, normalizeVerifyVerdicts, runAudit } from "../dist/agent/audit.js";
 import { normalizePrepareManifest, prepareValidationBlockingIssues, readPrepareManifest } from "../dist/agent/acquire.js";
 import { runAuditLoop, isTransientError } from "../dist/agent/loop.js";
 import { MetadataStore } from "../dist/db/store.js";
@@ -23,6 +23,7 @@ import { buildSessionPrompt, createIsolatedResourceLoader, FINDINGS_FINALIZE_PRO
 import { MockAuditLlmClient } from "../dist/llm/mock.js";
 import { RunLogger } from "../dist/trace/logger.js";
 import { renderDisclosure } from "../dist/reports/disclosure.js";
+import { remoteFindingRows } from "../dist/server/daemon.js";
 
 process.env.FLOUNDER_SANDBOX_BACKEND = "host";
 process.env.FLOUNDER_ALLOW_HOST_EXECUTION = "1";
@@ -81,6 +82,20 @@ class VerifyProgressLlmClient {
       return JSON.stringify({ done: true, summary: "no verdict" });
     }
     if (input.user.includes("second settled verdict")) {
+      if (!input.user.includes("refuted_repro.test.mjs")) {
+        return action("Write a local mitigation check.", "write", {
+          path: "refuted_repro.test.mjs",
+          content: "import test from 'node:test'; import assert from 'node:assert/strict'; import { confirmsMissingConstraintHarness } from './mock_target.mjs'; test('mitigation evidence passed', () => { assert.equal(confirmsMissingConstraintHarness(), true); console.log('mitigation evidence passed'); });",
+        });
+      }
+      if (!input.user.includes("action: bash")) {
+        return action("Execute the mitigation check before refuting the claim.", "bash", {
+          cmd: "node --test refuted_repro.test.mjs",
+          purpose: "confirm",
+          expected_exit_code: 0,
+          success_patterns: ["mitigation evidence passed"],
+        });
+      }
       if (!input.user.includes('"path":"findings.json"')) {
         return action("Record a refutation verdict.", "write", {
           path: "findings.json",
@@ -94,7 +109,7 @@ class VerifyProgressLlmClient {
             exploitSketch: "Not reproducible.",
             fix: "No change required.",
             confidence: 0.95,
-            confirmationStatus: "suspected",
+            command_id: "cmd1",
           }]),
         });
       }
@@ -103,6 +118,139 @@ class VerifyProgressLlmClient {
     return JSON.stringify({ done: true, summary: "unexpected" });
   }
 }
+
+test("remote daemon preserves semantic refutations while filtering ordinary info rows", () => {
+  const common = {
+    location: "src/Foo.sol:1",
+    description: "description",
+    evidence: "evidence",
+    exploitSketch: "not reproducible",
+    fix: "no change",
+    confidence: 0.99,
+  };
+  const rows = remoteFindingRows([
+    {
+      ...common,
+      id: "f1",
+      title: "REFUTED: Explicit design intent makes the seeded claim false",
+      severity: "info",
+      confirmationStatus: "confirmed-executable",
+      commandRunId: "cmd1",
+      originId: 42,
+    },
+    { ...common, id: "f2", title: "Informational note", severity: "info", confirmationStatus: "suspected" },
+    { ...common, id: "f3", title: "Discharged obligation", severity: "medium", confirmationStatus: "discharged" },
+    {
+      ...common,
+      id: "f4",
+      title: "Differentially confirmed finding with a skeptic objection",
+      severity: "high",
+      confirmationStatus: "confirmed-differential",
+      commandRunId: "cmd2",
+      disputed: true,
+      refutation: { refuted: true, reason: "Human review must resolve the remaining model disagreement." },
+    },
+  ], "/runs/verify", "test target");
+
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].status, "refuted");
+  assert.equal(rows[0].originId, 42);
+  assert.equal(rows[0].reportPath, undefined, "an execution-backed refutation must not get a confirmed report path");
+  assert.equal(rows[0].reportMarkdown, undefined, "an execution-backed refutation must not get disclosure markdown");
+  assert.equal(rows[1].status, "confirmed-differential", "a differential proof survives a non-vacuity skeptic disagreement");
+  assert.match(rows[1].reportMarkdown, /DISPUTED by independent refutation/);
+});
+
+test("verify input deduplicates durable finding origins before concurrent execution", () => {
+  const first = { originId: 42, title: "first representation" };
+  const duplicate = { origin_id: 42, title: "duplicate representation" };
+  const anonymousA = { title: "anonymous lead" };
+  const anonymousB = { title: "anonymous lead" };
+  assert.deepEqual(dedupeVerifyInputs([first, duplicate, anonymousA, anonymousB]), [first, anonymousA, anonymousB]);
+});
+
+test("verify normalization rejects contradictory same-claim verdicts before persistence", () => {
+  const common = {
+    id: "f1",
+    title: "Candidate invariant failure",
+    severity: "high",
+    location: "src/Foo.sol:7",
+    description: "description",
+    evidence: "evidence",
+    exploitSketch: "exploit",
+    fix: "fix",
+    confidence: 0.9,
+  };
+  const normalized = normalizeVerifyVerdicts([
+    { ...common, confirmationStatus: "confirmed-differential", commandRunId: "cmd1" },
+    { ...common, id: "f2", title: `REFUTED: ${common.title}`, severity: "info", confirmationStatus: "confirmed-executable", commandRunId: "cmd2" },
+  ]);
+
+  assert.equal(normalized.conflict, true);
+  assert.equal(normalized.inputCount, 2);
+  assert.deepEqual(normalized.findings, []);
+});
+
+test("refuted finding transitions atomically clear stale disclosure reports", async () => {
+  const dir = await tempDir();
+  try {
+    const store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "refuted-report-cleanup" });
+    const sourceRunId = store.startRun({ projectId, kind: "run", runDir: path.join(dir, "source-run") });
+    store.upsertFindings(projectId, sourceRunId, [{
+      findingKey: "report-cleanup",
+      title: "Candidate with a stale report",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "confirmed-executable",
+      reportPath: path.join(dir, "source-run", "report_f1.md"),
+      reportMarkdown: "# Security disclosure\n",
+      refutationStatus: "passed",
+      refutationReason: "An earlier reviewer accepted the confirmation.",
+    }]);
+    const original = store.queryFindings(projectId, { search: "Candidate with a stale report" })[0];
+    store.upsertFindings(projectId, sourceRunId, [{
+      findingKey: "report-cleanup",
+      title: "Candidate with a stale report",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "confirmed-executable",
+    }]);
+    assert.equal(store.getFinding(Number(original.id)).refutation_status, "passed", "same-run final persistence preserves reviewer metadata");
+    const verifyRunId = store.startRun({ projectId, kind: "audit", runDir: path.join(dir, "verify-run"), budgets: { verify: true } });
+    store.recordFindingPhaseAttempt(projectId, verifyRunId, {
+      subjectType: "finding",
+      subjectId: Number(original.id),
+      phase: "verify",
+      inputFingerprint: "sha256:report-cleanup",
+      state: "settled",
+      outcome: "refuted",
+      metrics: { findings: 1, steps: 9 },
+    });
+    store.upsertFindings(projectId, verifyRunId, [{
+      findingKey: "report-cleanup-refuted",
+      originId: Number(original.id),
+      title: "Candidate with a stale report",
+      location: "src/Foo.sol:1",
+      severity: "info",
+      status: "refuted",
+      phaseAttempt: { subjectType: "finding", subjectId: Number(original.id), inputFingerprint: "sha256:report-cleanup" },
+    }]);
+
+    const refuted = store.getFinding(Number(original.id));
+    assert.equal(refuted.status, "refuted");
+    assert.equal(refuted.report_path, null);
+    assert.equal(refuted.report_markdown, null);
+    assert.equal(refuted.refutation_status, null, "a new authoritative verdict clears stale reviewer state");
+    assert.equal(refuted.refutation_reason, null);
+    assert.equal(store.latestFindingPhaseAttempt("finding", Number(original.id), "verify").metrics_json, JSON.stringify({ findings: 1, steps: 9 }), "final finding persistence preserves attempt metrics");
+    assert.equal(store.queryFindings(projectId, { reportable: true }).some((finding) => finding.id === original.id), true);
+    assert.equal(store.listGlobalFindings({ source: "all" }).some((finding) => finding.id === original.id), true);
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 class ManyScopeRefutationLlmClient {
   constructor() {
@@ -2109,7 +2257,14 @@ test("verify progress counts settled verdicts instead of candidate indexes", asy
     const verifyFile = path.join(dir, "to-verify.json");
     await writeFile(verifyFile, JSON.stringify([
       { title: "first missing verdict", location: "halo2_missing_constraint.rs:5", severity: "high", description: "no local setup" },
-      { title: "second settled verdict", location: "halo2_missing_constraint.rs:5", severity: "high", description: "trace the binding" },
+      {
+        title: "second settled verdict",
+        location: "halo2_missing_constraint.rs:5",
+        severity: "high",
+        description: "trace the binding",
+        originId: 42,
+        phaseAttempt: { subjectType: "finding", subjectId: 42, inputFingerprint: "sha256:verify-refuted" },
+      },
     ]), "utf8");
     const cfg = defaultConfig();
     cfg.targetName = "verify-progress-e2e";
@@ -2120,20 +2275,691 @@ test("verify progress counts settled verdicts instead of candidate indexes", asy
     cfg.auditVerifyConcurrency = 1;
     cfg.auditRefute = false;
     const progress = [];
+    const phaseAttempts = [];
     const tracker = {
       runDbId: undefined,
       scopes() {},
       runScopes(done, target) { progress.push({ done, target }); },
       findings() {},
+      phaseAttempt(input) { phaseAttempts.push(input); },
       stage() {},
       confirmDecisions() {},
       findingReports() {},
       finish() {},
     };
 
-    await runAudit(cfg, { llm: new VerifyProgressLlmClient(), makeTracker: () => tracker });
+    const { runDir, summary } = await runAudit(cfg, { llm: new VerifyProgressLlmClient(), makeTracker: () => tracker });
     assert.deepEqual(progress.at(-1), { done: 1, target: 2 });
     assert.equal(progress.some((entry) => entry.done === 2), false, "a later verdict must not make an earlier missing verdict look complete");
+    assert.equal(phaseAttempts.findLast((attempt) => attempt.subjectId === 42 && attempt.state === "settled")?.outcome, "refuted");
+    assert.equal(summary.findings.length, 0, "a passed mitigation command must not count a REFUTED verdict as a vulnerability");
+    const findings = JSON.parse(await readFile(path.join(runDir, "audit_findings.json"), "utf8"));
+    const hypotheses = JSON.parse(await readFile(path.join(runDir, "audit_hypotheses.json"), "utf8"));
+    assert.equal(findings.length, 0);
+    assert.equal(hypotheses.length, 1);
+    assert.match(hypotheses[0].title, /^REFUTED:/);
+    assert.equal(hypotheses[0].confirmationStatus, "suspected");
+    assert.equal(summary.coverage.hypotheses, 0, "terminal refutations are not unresolved hypotheses");
+    assert.equal(summary.coverage.refuted, 1);
+    const persistedSummary = JSON.parse(await readFile(path.join(runDir, "summary.json"), "utf8"));
+    assert.equal(persistedSummary.coverage.hypotheses, 0);
+    assert.equal(persistedSummary.coverage.refuted, 1);
+    const report = await readFile(path.join(runDir, "audit_report.md"), "utf8");
+    assert.match(report, /Refuted claims — terminal, no further verification required \(1\)/);
+    assert.doesNotMatch(report, /Hypotheses — suspected, need a human or a test/);
+    await assert.rejects(stat(path.join(runDir, "report_f1.md")), /ENOENT/, "refuted verdicts must not get disclosure artifacts");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("startup reconciliation repairs dropped remote refutations and their phase outcomes", async () => {
+  const dir = await tempDir();
+  const sourceRunDir = path.join(dir, "source-run");
+  const verifyRunDir = path.join(dir, "verify-run");
+  try {
+    let store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "verify-reconciliation" });
+    const sourceRunId = store.startRun({ projectId, kind: "run", runDir: sourceRunDir });
+    const verifyRunId = store.startRun({ projectId, kind: "audit", runDir: verifyRunDir, budgets: { verify: true } });
+    store.upsertFindings(projectId, sourceRunId, [{
+      findingKey: "dropped-refutation",
+      title: "Explicit design intent makes the seeded claim false",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "suspected",
+      reportPath: path.join(sourceRunDir, "report_f1.md"),
+    }]);
+    const finding = store.queryFindings(projectId, { search: "Explicit design intent" })[0];
+    store.recordFindingPhaseAttempt(projectId, verifyRunId, {
+      subjectType: "finding",
+      subjectId: Number(finding.id),
+      phase: "verify",
+      inputFingerprint: "sha256:dropped-refutation",
+      state: "settled",
+      outcome: "confirmed-executable",
+      metrics: { findings: 1 },
+    });
+    store.finishRun(sourceRunId, "done");
+    store.finishRun(verifyRunId, "error");
+    store.close();
+
+    await mkdir(verifyRunDir, { recursive: true });
+    await writeFile(path.join(verifyRunDir, "audit_findings.json"), JSON.stringify([{
+      id: "f1",
+      originId: Number(finding.id),
+      title: "REFUTED: Explicit design intent makes the seeded claim false",
+      location: "src/Foo.sol:1",
+      severity: "info",
+      description: "The seeded property is explicitly not required.",
+      evidence: "The design material states the prospective behavior.",
+      exploitSketch: "No attacker path exists.",
+      fix: "No change required.",
+      confidence: 0.99,
+      confirmationStatus: "confirmed-executable",
+    }]));
+
+    store = MetadataStore.openForOutput(dir);
+    const repaired = store.getFinding(Number(finding.id));
+    assert.equal(repaired.status, "refuted");
+    assert.equal(repaired.report_path, null);
+    assert.equal(repaired.report_markdown, null);
+    const attempt = store.latestFindingPhaseAttempt("finding", Number(finding.id), "verify");
+    assert.equal(attempt.state, "settled");
+    assert.equal(attempt.outcome, "refuted");
+    assert.equal(attempt.metrics_json, JSON.stringify({ findings: 1 }), "reconciliation preserves attempt metrics");
+    const repairedAt = attempt.updated_at;
+    store.close();
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    store = MetadataStore.openForOutput(dir);
+    assert.equal(
+      store.latestFindingPhaseAttempt("finding", Number(finding.id), "verify").updated_at,
+      repairedAt,
+      "reopening an already-reconciled store must not rewrite attempt timestamps",
+    );
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("startup reconciliation never lets an old refutation overwrite a newer confirmed retry", async () => {
+  const dir = await tempDir();
+  const sourceRunDir = path.join(dir, "source-run");
+  const oldVerifyDir = path.join(dir, "old-verify");
+  const newVerifyDir = path.join(dir, "new-verify");
+  try {
+    let store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "verify-authority" });
+    const sourceRunId = store.startRun({ projectId, kind: "run", runDir: sourceRunDir });
+    store.upsertFindings(projectId, sourceRunId, [{
+      findingKey: "verify-authority",
+      title: "Retry authority candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "suspected",
+    }]);
+    const finding = store.queryFindings(projectId, { search: "Retry authority candidate" })[0];
+    const oldVerifyId = store.startRun({ projectId, kind: "audit", runDir: oldVerifyDir, budgets: { verify: true } });
+    store.recordFindingPhaseAttempt(projectId, oldVerifyId, {
+      subjectType: "finding",
+      subjectId: Number(finding.id),
+      phase: "verify",
+      inputFingerprint: "sha256:old-refutation",
+      state: "blocked",
+      blocker: "remote verdict was dropped",
+    });
+    const newVerifyId = store.startRun({ projectId, kind: "audit", runDir: newVerifyDir, budgets: { verify: true } });
+    store.recordFindingPhaseAttempt(projectId, newVerifyId, {
+      subjectType: "finding",
+      subjectId: Number(finding.id),
+      phase: "verify",
+      inputFingerprint: "sha256:new-confirmation",
+      state: "settled",
+      outcome: "confirmed-differential",
+    });
+    store.upsertFindings(projectId, newVerifyId, [{
+      findingKey: "verify-authority-confirmed",
+      originId: Number(finding.id),
+      title: "Retry authority candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "confirmed-differential",
+      reportPath: path.join(newVerifyDir, "report_f1.md"),
+      reportMarkdown: "# New confirmed report\n",
+    }]);
+    store.finishRun(sourceRunId, "done");
+    store.finishRun(oldVerifyId, "error");
+    store.finishRun(newVerifyId, "done");
+    store.close();
+
+    await mkdir(oldVerifyDir, { recursive: true });
+    await mkdir(newVerifyDir, { recursive: true });
+    await writeFile(path.join(oldVerifyDir, "audit_findings.json"), JSON.stringify([{
+      id: "f1",
+      originId: Number(finding.id),
+      title: "REFUTED: Retry authority candidate",
+      location: "src/Foo.sol:1",
+      severity: "info",
+      confirmationStatus: "confirmed-executable",
+    }]));
+    await writeFile(path.join(newVerifyDir, "audit_findings.json"), JSON.stringify([{
+      id: "f1",
+      originId: Number(finding.id),
+      title: "Retry authority candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      confirmationStatus: "confirmed-differential",
+    }]));
+
+    store = MetadataStore.openForOutput(dir);
+    const canonical = store.getFinding(Number(finding.id));
+    assert.equal(canonical.status, "confirmed-differential");
+    assert.equal(canonical.run_id, newVerifyId);
+    assert.equal(canonical.report_path, path.join(newVerifyDir, "report_f1.md"));
+    assert.equal(canonical.report_markdown, "# New confirmed report\n");
+    const attempts = store.listFindingPhaseAttempts("finding", Number(finding.id));
+    assert.equal(attempts.find((attempt) => attempt.run_id === oldVerifyId).outcome, "refuted", "the old attempt itself is repaired");
+    assert.equal(attempts.find((attempt) => attempt.run_id === oldVerifyId).blocker, null);
+    assert.equal(attempts.find((attempt) => attempt.run_id === newVerifyId).outcome, "confirmed-differential");
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a late verdict from an older verify attempt cannot overwrite the newer retry", async () => {
+  const dir = await tempDir();
+  try {
+    const store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "late-verify-verdict" });
+    const sourceRunId = store.startRun({ projectId, kind: "run", runDir: path.join(dir, "source-run") });
+    store.upsertFindings(projectId, sourceRunId, [{ findingKey: "late-verdict", title: "Late verdict candidate", location: "src/Foo.sol:1", severity: "high", status: "suspected" }]);
+    const finding = store.queryFindings(projectId, { search: "Late verdict candidate" })[0];
+    const oldVerifyId = store.startRun({ projectId, kind: "audit", runDir: path.join(dir, "old-verify"), budgets: { verify: true } });
+    store.recordFindingPhaseAttempt(projectId, oldVerifyId, {
+      subjectType: "finding", subjectId: Number(finding.id), phase: "verify", inputFingerprint: "sha256:old", state: "running",
+    });
+    const newVerifyId = store.startRun({ projectId, kind: "audit", runDir: path.join(dir, "new-verify"), budgets: { verify: true } });
+    store.recordFindingPhaseAttempt(projectId, newVerifyId, {
+      subjectType: "finding", subjectId: Number(finding.id), phase: "verify", inputFingerprint: "sha256:new", state: "settled", outcome: "confirmed-differential",
+    });
+    store.upsertFindings(projectId, newVerifyId, [{
+      findingKey: "late-verdict-new",
+      originId: Number(finding.id),
+      title: "Late verdict candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "confirmed-differential",
+      reportPath: path.join(dir, "new-verify", "report_f1.md"),
+      reportMarkdown: "# New retry report\n",
+    }]);
+    store.upsertFindings(projectId, oldVerifyId, [{
+      findingKey: "late-verdict-old",
+      originId: Number(finding.id),
+      title: "Late verdict candidate",
+      location: "src/Foo.sol:1",
+      severity: "info",
+      status: "refuted",
+      phaseAttempt: { subjectType: "finding", subjectId: Number(finding.id), inputFingerprint: "sha256:old" },
+    }]);
+
+    const canonical = store.getFinding(Number(finding.id));
+    assert.equal(canonical.status, "confirmed-differential");
+    assert.equal(canonical.run_id, newVerifyId);
+    assert.equal(canonical.report_path, path.join(dir, "new-verify", "report_f1.md"));
+    const attempts = store.listFindingPhaseAttempts("finding", Number(finding.id));
+    assert.equal(attempts.find((attempt) => attempt.run_id === oldVerifyId).outcome, "refuted");
+    assert.equal(attempts.find((attempt) => attempt.run_id === newVerifyId).outcome, "confirmed-differential");
+    assert.equal(store.findingOccurrences(Number(finding.id)).some((occurrence) => occurrence.run_id === oldVerifyId && occurrence.status === "refuted"), true, "the stale verdict remains in occurrence history");
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("startup reconciliation treats a newer canonical audit run as an ordering barrier", async () => {
+  const dir = await tempDir();
+  const oldVerifyDir = path.join(dir, "old-verify");
+  const rediscoveryDir = path.join(dir, "rediscovery");
+  try {
+    let store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "canonical-run-barrier" });
+    const sourceRunId = store.startRun({ projectId, kind: "run", runDir: path.join(dir, "source-run") });
+    store.upsertFindings(projectId, sourceRunId, [{ findingKey: "canonical-barrier", title: "Rediscovered candidate", location: "src/Foo.sol:1", severity: "high", status: "suspected" }]);
+    const finding = store.queryFindings(projectId, { search: "Rediscovered candidate" })[0];
+    const oldVerifyId = store.startRun({ projectId, kind: "audit", runDir: oldVerifyDir, budgets: { verify: true } });
+    store.recordFindingPhaseAttempt(projectId, oldVerifyId, {
+      subjectType: "finding",
+      subjectId: Number(finding.id),
+      phase: "verify",
+      inputFingerprint: "sha256:old-attempt",
+      state: "blocked",
+      blocker: "remote verdict was dropped",
+    });
+    const rediscoveryId = store.startRun({ projectId, kind: "run", runDir: rediscoveryDir });
+    store.upsertFindings(projectId, rediscoveryId, [{
+      findingKey: "canonical-barrier-confirmed",
+      originId: Number(finding.id),
+      title: "Rediscovered candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "confirmed-differential",
+      reportPath: path.join(rediscoveryDir, "report_f1.md"),
+      reportMarkdown: "# Rediscovered report\n",
+    }]);
+    store.finishRun(sourceRunId, "done");
+    store.finishRun(oldVerifyId, "error");
+    store.finishRun(rediscoveryId, "done");
+    store.close();
+
+    await mkdir(oldVerifyDir, { recursive: true });
+    await writeFile(path.join(oldVerifyDir, "audit_findings.json"), JSON.stringify([{
+      id: "f1", originId: Number(finding.id), title: "REFUTED: Rediscovered candidate", location: "src/Foo.sol:1", severity: "info", confirmationStatus: "confirmed-executable",
+    }]));
+
+    store = MetadataStore.openForOutput(dir);
+    const canonical = store.getFinding(Number(finding.id));
+    assert.equal(canonical.status, "confirmed-differential");
+    assert.equal(canonical.run_id, rediscoveryId);
+    assert.equal(canonical.report_path, path.join(rediscoveryDir, "report_f1.md"));
+    const oldAttempt = store.latestFindingPhaseAttempt("finding", Number(finding.id), "verify");
+    assert.equal(oldAttempt.outcome, "refuted", "historical attempt repair remains independent of canonical ordering");
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("startup reconciliation applies an older refutation to a same-material suspected rediscovery", async () => {
+  const dir = await tempDir();
+  const oldVerifyDir = path.join(dir, "old-verify");
+  const rediscoveryDir = path.join(dir, "rediscovery");
+  try {
+    let store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "same-material-suspected-rediscovery" });
+    const sourceRunId = store.startRun({ projectId, kind: "run", runDir: path.join(dir, "source-run"), materialFingerprint: "sha256:m1" });
+    store.upsertFindings(projectId, sourceRunId, [{ findingKey: "same-material-candidate", title: "Same-material candidate", location: "src/Foo.sol:1", severity: "high", status: "suspected" }]);
+    const finding = store.queryFindings(projectId, { search: "Same-material candidate" })[0];
+    const oldVerifyId = store.startRun({ projectId, kind: "audit", runDir: oldVerifyDir, budgets: { verify: true }, materialFingerprint: "sha256:m1" });
+    store.recordFindingPhaseAttempt(projectId, oldVerifyId, {
+      subjectType: "finding", subjectId: Number(finding.id), phase: "verify", inputFingerprint: "sha256:same-material-old", state: "blocked", blocker: "remote verdict was dropped",
+    });
+    const rediscoveryId = store.startRun({ projectId, kind: "run", runDir: rediscoveryDir, materialFingerprint: "sha256:m1" });
+    store.upsertFindings(projectId, rediscoveryId, [{
+      findingKey: "same-material-candidate-rediscovered",
+      originId: Number(finding.id),
+      title: "Same-material candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "suspected",
+    }]);
+    store.finishRun(sourceRunId, "done");
+    store.finishRun(oldVerifyId, "error");
+    store.finishRun(rediscoveryId, "done");
+    store.close();
+
+    await mkdir(oldVerifyDir, { recursive: true });
+    await writeFile(path.join(oldVerifyDir, "audit_hypotheses.json"), JSON.stringify([{
+      id: "h1", originId: Number(finding.id), title: "REFUTED: Same-material candidate", location: "src/Foo.sol:1", severity: "info", confirmationStatus: "confirmed-executable",
+    }]));
+
+    store = MetadataStore.openForOutput(dir);
+    const canonical = store.getFinding(Number(finding.id));
+    assert.equal(canonical.status, "refuted");
+    assert.equal(canonical.run_id, oldVerifyId);
+    assert.equal(store.latestFindingPhaseAttempt("finding", Number(finding.id), "verify").outcome, "refuted");
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("startup reconciliation never applies an old-material refutation to a new-material rediscovery", async () => {
+  const dir = await tempDir();
+  const oldVerifyDir = path.join(dir, "old-verify");
+  const rediscoveryDir = path.join(dir, "rediscovery");
+  try {
+    let store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "changed-material-suspected-rediscovery" });
+    const sourceRunId = store.startRun({ projectId, kind: "run", runDir: path.join(dir, "source-run"), materialFingerprint: "sha256:m1" });
+    store.upsertFindings(projectId, sourceRunId, [{ findingKey: "changed-material-candidate", title: "Changed-material candidate", location: "src/Foo.sol:1", severity: "high", status: "suspected" }]);
+    const finding = store.queryFindings(projectId, { search: "Changed-material candidate" })[0];
+    const oldVerifyId = store.startRun({ projectId, kind: "audit", runDir: oldVerifyDir, budgets: { verify: true }, materialFingerprint: "sha256:m1" });
+    store.recordFindingPhaseAttempt(projectId, oldVerifyId, {
+      subjectType: "finding", subjectId: Number(finding.id), phase: "verify", inputFingerprint: "sha256:changed-material-old", state: "blocked", blocker: "remote verdict was dropped",
+    });
+    const rediscoveryId = store.startRun({ projectId, kind: "run", runDir: rediscoveryDir, materialFingerprint: "sha256:m2" });
+    store.upsertFindings(projectId, rediscoveryId, [{
+      findingKey: "changed-material-candidate-rediscovered",
+      originId: Number(finding.id),
+      title: "Changed-material candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "suspected",
+    }]);
+    store.finishRun(sourceRunId, "done");
+    store.finishRun(oldVerifyId, "error");
+    store.finishRun(rediscoveryId, "done");
+    store.close();
+
+    await mkdir(oldVerifyDir, { recursive: true });
+    await writeFile(path.join(oldVerifyDir, "audit_hypotheses.json"), JSON.stringify([{
+      id: "h1", originId: Number(finding.id), title: "REFUTED: Changed-material candidate", location: "src/Foo.sol:1", severity: "info", confirmationStatus: "confirmed-executable",
+    }]));
+
+    store = MetadataStore.openForOutput(dir);
+    const canonical = store.getFinding(Number(finding.id));
+    assert.equal(canonical.status, "suspected");
+    assert.equal(canonical.run_id, rediscoveryId);
+    assert.equal(store.latestFindingPhaseAttempt("finding", Number(finding.id), "verify").outcome, "refuted", "the historical attempt is still repaired without mutating the newer material");
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("startup reconciliation does not guess between conflicting same-run verdict artifacts", async () => {
+  const dir = await tempDir();
+  const verifyRunDir = path.join(dir, "verify-run");
+  try {
+    let store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "same-run-verdict-conflict" });
+    const sourceRunId = store.startRun({ projectId, kind: "run", runDir: path.join(dir, "source-run") });
+    store.upsertFindings(projectId, sourceRunId, [{ findingKey: "same-run-conflict", title: "Conflicting verdict candidate", location: "src/Foo.sol:1", severity: "high", status: "suspected" }]);
+    const finding = store.queryFindings(projectId, { search: "Conflicting verdict candidate" })[0];
+    const verifyRunId = store.startRun({ projectId, kind: "audit", runDir: verifyRunDir, budgets: { verify: true } });
+    store.recordFindingPhaseAttempt(projectId, verifyRunId, {
+      subjectType: "finding",
+      subjectId: Number(finding.id),
+      phase: "verify",
+      inputFingerprint: "sha256:conflicting-verdicts",
+      state: "settled",
+      outcome: "confirmed-differential",
+    });
+    store.upsertFindings(projectId, verifyRunId, [{
+      findingKey: "same-run-conflict-confirmed",
+      originId: Number(finding.id),
+      title: "Conflicting verdict candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "confirmed-differential",
+      reportPath: path.join(verifyRunDir, "report_f1.md"),
+      reportMarkdown: "# Confirmed report\n",
+    }]);
+    store.finishRun(sourceRunId, "done");
+    store.finishRun(verifyRunId, "error");
+    store.close();
+
+    await mkdir(verifyRunDir, { recursive: true });
+    await writeFile(path.join(verifyRunDir, "audit_hypotheses.json"), JSON.stringify([{
+      id: "h1", originId: Number(finding.id), title: "REFUTED: Conflicting verdict candidate", location: "src/Foo.sol:1", severity: "info", confirmationStatus: "suspected",
+    }]));
+    await writeFile(path.join(verifyRunDir, "audit_findings.json"), JSON.stringify([{
+      id: "f1", originId: Number(finding.id), title: "Conflicting verdict candidate", location: "src/Foo.sol:1", severity: "high", confirmationStatus: "confirmed-differential",
+    }]));
+
+    store = MetadataStore.openForOutput(dir);
+    const canonical = store.getFinding(Number(finding.id));
+    assert.equal(canonical.status, "confirmed-differential");
+    assert.equal(canonical.report_path, path.join(verifyRunDir, "report_f1.md"));
+    assert.equal(store.latestFindingPhaseAttempt("finding", Number(finding.id), "verify").outcome, "confirmed-differential");
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("real-target reproduction is preserved when a later local verify refutes the claim", async () => {
+  const dir = await tempDir();
+  const sourceRunDir = path.join(dir, "source-run");
+  const verifyRunDir = path.join(dir, "verify-run");
+  try {
+    let store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "real-target-evidence-precedence" });
+    const sourceRunId = store.startRun({ projectId, kind: "run", runDir: sourceRunDir });
+    store.upsertFindings(projectId, sourceRunId, [{
+      findingKey: "real-target-evidence",
+      title: "Real-target reproduced candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "confirmed-differential",
+      reportPath: path.join(sourceRunDir, "report_f1.md"),
+      reportMarkdown: "# Real-target-backed report\n",
+    }]);
+    const finding = store.queryFindings(projectId, { search: "Real-target reproduced candidate" })[0];
+    assert.equal(store.setFindingConfirmStatus(projectId, "real-target-evidence", "reproduced"), true);
+    const verifyRunId = store.startRun({ projectId, kind: "audit", runDir: verifyRunDir, budgets: { verify: true } });
+    store.upsertFindings(projectId, verifyRunId, [{
+      findingKey: "real-target-evidence-checkpoint",
+      originId: Number(finding.id),
+      title: "Real-target reproduced candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "confirmed-executable",
+    }]);
+    store.upsertFindings(projectId, verifyRunId, [{
+      findingKey: "real-target-evidence-refuted",
+      originId: Number(finding.id),
+      title: "Real-target reproduced candidate",
+      location: "src/Foo.sol:1",
+      severity: "info",
+      status: "refuted",
+    }]);
+    store.finishRun(sourceRunId, "done");
+    store.finishRun(verifyRunId, "error");
+    let protectedFinding = store.getFinding(Number(finding.id));
+    assert.equal(protectedFinding.status, "confirmed-differential");
+    assert.equal(protectedFinding.confirm_status, "reproduced");
+    assert.equal(protectedFinding.report_path, path.join(sourceRunDir, "report_f1.md"));
+    assert.equal(protectedFinding.refutation_status, "conflict");
+    store.close();
+
+    await mkdir(verifyRunDir, { recursive: true });
+    await writeFile(path.join(verifyRunDir, "audit_hypotheses.json"), JSON.stringify([{
+      id: "h1", originId: Number(finding.id), title: "REFUTED: Real-target reproduced candidate", location: "src/Foo.sol:1", severity: "info", confirmationStatus: "suspected",
+    }]));
+    store = MetadataStore.openForOutput(dir);
+    protectedFinding = store.getFinding(Number(finding.id));
+    assert.equal(protectedFinding.status, "confirmed-differential");
+    assert.equal(protectedFinding.confirm_status, "reproduced");
+    assert.equal(protectedFinding.report_path, path.join(sourceRunDir, "report_f1.md"));
+    assert.equal(protectedFinding.refutation_status, "conflict");
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a later real-target reproduction restores a locally refuted finding and its report", async () => {
+  const dir = await tempDir();
+  const sourceRunDir = path.join(dir, "source-run");
+  const verifyRunDir = path.join(dir, "verify-run");
+  try {
+    let store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "reverse-real-target-evidence-precedence" });
+    const sourceRunId = store.startRun({ projectId, kind: "run", runDir: sourceRunDir });
+    store.upsertFindings(projectId, sourceRunId, [{
+      findingKey: "reverse-real-target-evidence",
+      title: "Reverse-order reproduced candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "confirmed-differential",
+      reportPath: path.join(sourceRunDir, "report_f1.md"),
+      reportMarkdown: "# Reverse-order report\n",
+    }]);
+    const finding = store.queryFindings(projectId, { search: "Reverse-order reproduced candidate" })[0];
+    const verifyRunId = store.startRun({ projectId, kind: "audit", runDir: verifyRunDir, budgets: { verify: true } });
+    store.upsertFindings(projectId, verifyRunId, [{
+      findingKey: "reverse-real-target-evidence-refuted",
+      originId: Number(finding.id),
+      title: "Reverse-order reproduced candidate",
+      location: "src/Foo.sol:1",
+      severity: "info",
+      status: "refuted",
+    }]);
+
+    let canonical = store.getFinding(Number(finding.id));
+    assert.equal(canonical.status, "refuted");
+    assert.equal(canonical.report_path, null);
+    assert.equal(canonical.report_markdown, null);
+    assert.equal(store.setFindingConfirmStatus(projectId, "reverse-real-target-evidence", "reproduced"), true);
+    canonical = store.getFinding(Number(finding.id));
+    assert.equal(canonical.status, "confirmed-executable");
+    assert.equal(canonical.confirm_status, "reproduced");
+    assert.equal(canonical.report_path, path.join(sourceRunDir, "report_f1.md"));
+    assert.equal(canonical.report_markdown, "# Reverse-order report\n");
+    assert.equal(canonical.refutation_status, "conflict");
+    store.close();
+
+    store = MetadataStore.openForOutput(dir);
+    canonical = store.getFinding(Number(finding.id));
+    assert.equal(canonical.status, "confirmed-executable");
+    assert.equal(canonical.confirm_status, "reproduced");
+    assert.equal(canonical.report_path, path.join(sourceRunDir, "report_f1.md"));
+    assert.equal(canonical.report_markdown, "# Reverse-order report\n");
+    assert.equal(canonical.refutation_status, "conflict");
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a real-target retry that no longer reproduces resolves an evidence conflict as refuted", async () => {
+  const dir = await tempDir();
+  try {
+    const store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "real-target-conflict-resolution" });
+    const sourceRunId = store.startRun({ projectId, kind: "run", runDir: path.join(dir, "source-run") });
+    store.upsertFindings(projectId, sourceRunId, [{
+      findingKey: "krealconflictresolution",
+      title: "Conflicted candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "confirmed-differential",
+      reportPath: path.join(dir, "source-run", "report_f1.md"),
+      reportMarkdown: "# Conflicted report\n",
+    }]);
+    const finding = store.queryFindings(projectId, { search: "Conflicted candidate" })[0];
+    assert.equal(store.setFindingConfirmStatus(projectId, "krealconflictresolution", "reproduced"), true);
+    const verifyRunId = store.startRun({ projectId, kind: "audit", runDir: path.join(dir, "verify-run"), budgets: { verify: true } });
+    store.upsertFindings(projectId, verifyRunId, [{
+      findingKey: "real-target-conflict-resolution-refuted",
+      originId: Number(finding.id),
+      title: "Conflicted candidate",
+      location: "src/Foo.sol:1",
+      severity: "info",
+      status: "refuted",
+    }]);
+    assert.equal(store.getFinding(Number(finding.id)).refutation_status, "conflict");
+
+    const confirmRetryRunId = store.startRun({ projectId, kind: "confirm", runDir: path.join(dir, "confirm-retry") });
+    store.upsertConfirmDecisions(projectId, confirmRetryRunId, [{
+      bug: "Conflicted candidate",
+      reproduced: "no",
+      recommendation: "drop",
+      members: ["krealconflictresolution"],
+      reproEvidence: "The fresh real-target replay did not reproduce the claimed effect.",
+    }]);
+
+    const resolved = store.getFinding(Number(finding.id));
+    assert.equal(resolved.status, "refuted");
+    assert.equal(resolved.confirm_status, "not-reproduced");
+    assert.equal(resolved.refutation_status, "refuted");
+    assert.equal(resolved.report_path, null);
+    assert.equal(resolved.report_markdown, null);
+    assert.match(resolved.refutation_reason, /no longer reproduced/);
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("startup reconciliation ignores running verify artifacts", async () => {
+  const dir = await tempDir();
+  const sourceRunDir = path.join(dir, "source-run");
+  const runningVerifyDir = path.join(dir, "running-verify");
+  try {
+    let store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "running-verify-artifact" });
+    const sourceRunId = store.startRun({ projectId, kind: "run", runDir: sourceRunDir });
+    store.upsertFindings(projectId, sourceRunId, [{ findingKey: "running-artifact", title: "Running candidate", location: "src/Foo.sol:1", severity: "high", status: "suspected" }]);
+    const finding = store.queryFindings(projectId, { search: "Running candidate" })[0];
+    const verifyRunId = store.startRun({ projectId, kind: "audit", runDir: runningVerifyDir, budgets: { verify: true } });
+    store.recordFindingPhaseAttempt(projectId, verifyRunId, {
+      subjectType: "finding",
+      subjectId: Number(finding.id),
+      phase: "verify",
+      inputFingerprint: "sha256:running",
+      state: "running",
+    });
+    store.finishRun(sourceRunId, "done");
+    store.close();
+
+    await mkdir(runningVerifyDir, { recursive: true });
+    await writeFile(path.join(runningVerifyDir, "audit_findings.json"), JSON.stringify([{
+      id: "f1",
+      originId: Number(finding.id),
+      title: "REFUTED: Running candidate",
+      location: "src/Foo.sol:1",
+      severity: "info",
+      confirmationStatus: "confirmed-executable",
+    }]));
+
+    store = MetadataStore.openForOutput(dir);
+    assert.equal(store.getFinding(Number(finding.id)).status, "suspected");
+    const attempt = store.latestFindingPhaseAttempt("finding", Number(finding.id), "verify");
+    assert.equal(attempt.state, "running");
+    assert.equal(attempt.outcome, null);
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("legacy reconciliation uses the newest terminal verify artifact as an ordering barrier", async () => {
+  const dir = await tempDir();
+  const oldVerifyDir = path.join(dir, "legacy-old-verify");
+  const newVerifyDir = path.join(dir, "legacy-new-verify");
+  const refuteOnlyDir = path.join(dir, "legacy-refute-only");
+  try {
+    let store = MetadataStore.openForOutput(dir);
+    const barrierProjectId = store.upsertProject({ name: "legacy-confirmed-barrier" });
+    const barrierSourceId = store.startRun({ projectId: barrierProjectId, kind: "run", runDir: path.join(dir, "legacy-source") });
+    store.upsertFindings(barrierProjectId, barrierSourceId, [{ findingKey: "legacy-barrier", title: "Legacy barrier candidate", location: "src/Foo.sol:1", severity: "high", status: "suspected" }]);
+    const barrierFinding = store.queryFindings(barrierProjectId, { search: "Legacy barrier candidate" })[0];
+    const oldVerifyId = store.startRun({ projectId: barrierProjectId, kind: "audit", runDir: oldVerifyDir, budgets: { verify: true } });
+    const newVerifyId = store.startRun({ projectId: barrierProjectId, kind: "audit", runDir: newVerifyDir, budgets: { verify: true } });
+    store.finishRun(barrierSourceId, "done");
+    store.finishRun(oldVerifyId, "error");
+    store.finishRun(newVerifyId, "done");
+
+    const refuteProjectId = store.upsertProject({ name: "legacy-refute-latest" });
+    const refuteSourceId = store.startRun({ projectId: refuteProjectId, kind: "run", runDir: path.join(dir, "legacy-refute-source") });
+    store.upsertFindings(refuteProjectId, refuteSourceId, [{ findingKey: "legacy-refute", title: "Legacy refute candidate", location: "src/Bar.sol:1", severity: "high", status: "suspected" }]);
+    const refuteFinding = store.queryFindings(refuteProjectId, { search: "Legacy refute candidate" })[0];
+    const refuteVerifyId = store.startRun({ projectId: refuteProjectId, kind: "audit", runDir: refuteOnlyDir, budgets: { verify: true } });
+    store.finishRun(refuteSourceId, "done");
+    store.finishRun(refuteVerifyId, "error");
+    store.close();
+
+    await mkdir(oldVerifyDir, { recursive: true });
+    await mkdir(newVerifyDir, { recursive: true });
+    await mkdir(refuteOnlyDir, { recursive: true });
+    const refutedArtifact = (originId, title, location) => JSON.stringify([{
+      id: "f1", originId, title: `REFUTED: ${title}`, location, severity: "info", confirmationStatus: "confirmed-executable",
+    }]);
+    await writeFile(path.join(oldVerifyDir, "audit_findings.json"), refutedArtifact(Number(barrierFinding.id), "Legacy barrier candidate", "src/Foo.sol:1"));
+    await writeFile(path.join(newVerifyDir, "audit_findings.json"), JSON.stringify([{
+      id: "f1", originId: Number(barrierFinding.id), title: "Legacy barrier candidate", location: "src/Foo.sol:1", severity: "high", confirmationStatus: "confirmed-executable",
+    }]));
+    await writeFile(path.join(refuteOnlyDir, "audit_findings.json"), refutedArtifact(Number(refuteFinding.id), "Legacy refute candidate", "src/Bar.sol:1"));
+
+    store = MetadataStore.openForOutput(dir);
+    assert.equal(store.getFinding(Number(barrierFinding.id)).status, "suspected", "the newer confirmed artifact prevents replaying an older refutation");
+    assert.equal(store.getFinding(Number(refuteFinding.id)).status, "refuted", "the latest legacy refutation still repairs canonical state");
+    store.close();
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

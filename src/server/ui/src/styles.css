@@ -3000,6 +3000,7 @@ small {
 }
 
 .refutation-blocked,
+.refutation-conflict,
 .refutation-refuted {
   color: var(--warning);
 }

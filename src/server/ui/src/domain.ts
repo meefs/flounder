@@ -120,6 +120,12 @@ export function localVerifiedFindings(rows: FindingRow[] | undefined): FindingRo
   return activeFindings(rows).filter(isExecutionConfirmedFinding);
 }
 
+export function hasUnresolvedEvidenceConflict(
+  finding: Pick<FindingRow, "refutation_status"> | null | undefined,
+): boolean {
+  return finding?.refutation_status === "conflict";
+}
+
 export function pendingVerifyFindings(rows: FindingRow[] | undefined): FindingRow[] {
   return topCandidateFindings(activeFindings(rows).filter((finding) => finding.status === "suspected" || finding.status === "confirmed-source"));
 }
@@ -129,19 +135,44 @@ export function rawPendingVerifyCount(rows: FindingRow[] | undefined): number {
 }
 
 export function reportableFindings(rows: FindingRow[] | undefined, requiresConfirmation = true): FindingRow[] {
-  return activeFindings(rows).filter((finding) => requiresConfirmation ? finding.confirm_status === "reproduced" : isExecutionConfirmedFinding(finding));
+  return activeFindings(rows).filter((finding) =>
+    !hasUnresolvedEvidenceConflict(finding)
+    && (requiresConfirmation ? finding.confirm_status === "reproduced" : isExecutionConfirmedFinding(finding))
+  );
 }
 
 export function pendingFormalReports(rows: FindingRow[] | undefined, requiresConfirmation = true): FindingRow[] {
   return reportableFindings(rows, requiresConfirmation).filter((finding) => !finding.has_report);
 }
 
-export function reportableDecisions(decisions: ConfirmDecision[] | undefined): ConfirmDecision[] {
-  return sortConfirmDecisionsForSubmission(decisions).filter(isSubmissionReadyDecision);
+function unresolvedConflictKeys(rows: FindingRow[] | undefined): Set<string> {
+  const keys = new Set<string>();
+  for (const finding of rows ?? []) {
+    if (!hasUnresolvedEvidenceConflict(finding)) continue;
+    for (const key of [finding.finding_key, finding.canonical_key]) {
+      const normalized = key?.trim().toLowerCase();
+      if (normalized) keys.add(normalized);
+    }
+  }
+  return keys;
 }
 
-export function pendingDecisionReports(decisions: ConfirmDecision[] | undefined): ConfirmDecision[] {
-  return reportableDecisions(decisions).filter((decision) => !decision.has_report);
+export function decisionHasUnresolvedEvidenceConflict(
+  decision: ConfirmDecision,
+  findings: FindingRow[] | undefined,
+): boolean {
+  const conflictKeys = unresolvedConflictKeys(findings);
+  return conflictKeys.size > 0 && confirmDecisionMemberKeys(decision).some((key) => conflictKeys.has(key));
+}
+
+export function reportableDecisions(decisions: ConfirmDecision[] | undefined, findings?: FindingRow[]): ConfirmDecision[] {
+  return sortConfirmDecisionsForSubmission(decisions)
+    .filter(isSubmissionReadyDecision)
+    .filter((decision) => !decisionHasUnresolvedEvidenceConflict(decision, findings));
+}
+
+export function pendingDecisionReports(decisions: ConfirmDecision[] | undefined, findings?: FindingRow[]): ConfirmDecision[] {
+  return reportableDecisions(decisions, findings).filter((decision) => !decision.has_report);
 }
 
 function severityScore(finding: FindingRow): number {
@@ -374,14 +405,14 @@ export function sortConfirmDecisionsForSubmission(rows: ConfirmDecision[] | unde
 
 function reportPackageStats(findings: FindingRow[], decisions: ConfirmDecision[], requiresConfirmation: boolean): { ready: number; total: number; submissions: number } {
   if (!requiresConfirmation) {
-    const reportable = findings.filter(isExecutionConfirmedFinding);
+    const reportable = reportableFindings(findings, false);
     return {
       ready: reportable.filter((finding) => finding.has_report).length,
       total: reportable.length,
       submissions: 0,
     };
   }
-  const reproduced = decisions.filter(isSubmissionReadyDecision);
+  const reproduced = reportableDecisions(decisions, findings);
   return {
     ready: reproduced.filter((decision) => decision.has_report).length,
     total: reproduced.length,

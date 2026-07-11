@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { startUiServer } from "../dist/server/app.js";
-import { ensureDaemonDirectories } from "../dist/server/daemon.js";
+import { ensureDaemonDirectories, loadVerifyArtifactReplay } from "../dist/server/daemon.js";
 import { MetadataStore } from "../dist/db/store.js";
 
 const execFileAsync = promisify(execFile);
@@ -60,6 +60,221 @@ test("daemon: startup creates the reported product home and workspace directorie
 
   assert.equal((await stat(out)).isDirectory(), true);
   assert.equal((await stat(workspace)).isDirectory(), true);
+});
+
+test("daemon: terminal verify artifact replay is allowlisted, bounded, and contained", async () => {
+  const out = await mkdtemp(path.join(os.tmpdir(), "flounder-artifact-replay-"));
+  const runDir = path.join(out, "run-1");
+  await mkdir(runDir, { recursive: true });
+  await writeFile(path.join(runDir, "audit_findings.json"), JSON.stringify({ findings: [
+    {
+      originId: 17,
+      title: "REFUTED: Candidate is bound by the checked commitment",
+      confirmationStatus: "confirmed-executable",
+      evidence: "The local test disproved the claim.",
+      reportPath: "/must/not/be/replayed.md",
+    },
+    {
+      originId: 18,
+      title: "A positive verdict is not part of negative replay",
+      confirmationStatus: "confirmed-differential",
+    },
+  ] }));
+  const rows = await loadVerifyArtifactReplay(out, runDir);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].originId, 17);
+  assert.equal(rows[0].reportPath, undefined, "report paths are never accepted from replay artifacts");
+
+  const outside = await mkdtemp(path.join(os.tmpdir(), "flounder-artifact-outside-"));
+  await assert.rejects(loadVerifyArtifactReplay(out, outside), /escapes the daemon output root/);
+
+  const escapedRun = path.join(out, "run-escape");
+  await mkdir(escapedRun, { recursive: true });
+  const outsideArtifact = path.join(outside, "audit_findings.json");
+  await writeFile(outsideArtifact, "[]");
+  await symlink(outsideArtifact, path.join(escapedRun, "audit_findings.json"));
+  await assert.rejects(loadVerifyArtifactReplay(out, escapedRun), /escapes its run directory/);
+
+  const conflictRun = path.join(out, "run-conflict");
+  await mkdir(conflictRun, { recursive: true });
+  await writeFile(path.join(conflictRun, "audit_findings.json"), JSON.stringify([{ originId: 19, title: "REFUTED: first" }]));
+  await writeFile(path.join(conflictRun, "audit_hypotheses.json"), JSON.stringify([{ originId: 19, title: "second", confirmationStatus: "confirmed-differential" }]));
+  await assert.rejects(loadVerifyArtifactReplay(out, conflictRun), /conflicting verify artifact rows/);
+});
+
+test("daemon: terminal verify replay is owner-only, versioned, and updates canonical state", async () => {
+  await withServerAndToken(async ({ base, token, out }) => {
+    const owner = await j(await asDaemon(base, token, "POST", "/api/daemon/register", { name: "artifact-owner", capabilities: {} }));
+    const setup = MetadataStore.openForOutput(out);
+    const outsiderToken = setup.createDaemonToken("artifact-outsider").token;
+    const projectId = setup.upsertProject({ name: "artifact-owner-project" });
+    const sourceRun = setup.startRun({ projectId, kind: "audit", runDir: path.join(out, "artifact-owner-source"), daemonId: owner.daemonId });
+    setup.upsertFindings(projectId, sourceRun, [{
+      findingKey: "kartifactowner",
+      title: "Artifact owner candidate",
+      location: "src/Foo.sol:3",
+      severity: "high",
+      status: "confirmed-executable",
+      reportPath: path.join(out, "artifact-owner-source", "report_f1.md"),
+      reportMarkdown: "# Artifact owner report\n",
+    }]);
+    const findingId = Number(setup.queryFindings(projectId, { search: "Artifact owner candidate" })[0].id);
+    const verifyRun = setup.startRun({ projectId, kind: "audit", runDir: path.join(out, "artifact-owner-verify"), budgets: { verify: true }, daemonId: owner.daemonId });
+    setup.recordFindingPhaseAttempt(projectId, verifyRun, {
+      subjectType: "finding",
+      subjectId: findingId,
+      phase: "verify",
+      inputFingerprint: "sha256:artifact-owner",
+      state: "blocked",
+      blocker: "remote verdict was not ingested",
+    });
+    setup.finishRun(sourceRun, "done");
+    setup.finishRun(verifyRun, "error");
+    setup.close();
+
+    const outsider = await j(await asDaemon(base, outsiderToken, "POST", "/api/daemon/register", { name: "artifact-outsider", capabilities: {} }));
+    const ownerWork = await j(await asDaemon(base, token, "POST", "/api/daemon/reconciliation/worklist", {}));
+    assert.equal(ownerWork.runs.some((run) => run.runId === verifyRun), true);
+    const outsiderWork = await j(await asDaemon(base, outsiderToken, "POST", "/api/daemon/reconciliation/worklist", {}));
+    assert.equal(outsiderWork.runs.some((run) => run.runId === verifyRun), false);
+    assert.notEqual(outsider.daemonId, owner.daemonId);
+    const forbidden = await asDaemon(base, outsiderToken, "POST", `/api/daemon/reconciliation/runs/${verifyRun}`, {
+      version: ownerWork.version,
+      artifacts: [{ originId: findingId, title: "REFUTED: Artifact owner candidate" }],
+    });
+    assert.equal(forbidden.status, 403);
+
+    const applied = await asDaemon(base, token, "POST", `/api/daemon/reconciliation/runs/${verifyRun}`, {
+      version: ownerWork.version,
+      artifacts: [{
+        originId: findingId,
+        title: "REFUTED: Artifact owner candidate",
+        location: "src/Foo.sol:3",
+        severity: "info",
+        confirmationStatus: "confirmed-executable",
+        evidence: "The executable mitigation check disproved the claim.",
+      }],
+    });
+    assert.equal(applied.status, 200);
+    const after = MetadataStore.openForOutput(out);
+    assert.equal(after.getFinding(findingId).status, "refuted");
+    assert.equal(after.getFinding(findingId).report_path, null);
+    assert.equal(after.getRun(verifyRun).artifact_reconcile_version, ownerWork.version);
+    after.close();
+    const empty = await j(await asDaemon(base, token, "POST", "/api/daemon/reconciliation/worklist", {}));
+    assert.equal(empty.runs.some((run) => run.runId === verifyRun), false);
+  });
+});
+
+test("daemon: an explicit evidence-conflict retry re-enters Verify and clears after agreeing evidence", async () => {
+  await withServerAndToken(async ({ base, token, out }) => {
+    const registration = await j(await asDaemon(base, token, "POST", "/api/daemon/register", { name: "conflict-retry-daemon", capabilities: {} }));
+    const created = await j(await ui(base, "POST", "/api/projects", {
+      name: "conflict-retry-project",
+      daemonId: registration.daemonId,
+      sourcePaths: ["."],
+      buildRoot: ".",
+    }));
+
+    const store = MetadataStore.openForOutput(out);
+    let findingId;
+    let jobId;
+    try {
+      const auditRun = store.startRun({ projectId: created.id, kind: "audit", runDir: path.join(out, "conflict-audit") });
+      store.upsertFindings(created.id, auditRun, [{
+        findingKey: "kconflictretry",
+        title: "Conflicted retry candidate",
+        location: "src/Target.sol:9",
+        severity: "high",
+        status: "confirmed-executable",
+        reportPath: path.join(out, "conflict-audit", "report_f1.md"),
+        reportMarkdown: "# Conflicted retry candidate\n",
+      }]);
+      findingId = Number(store.queryFindings(created.id, { search: "Conflicted retry candidate" })[0].id);
+      const confirmRun = store.startRun({ projectId: created.id, kind: "confirm", runDir: path.join(out, "conflict-confirm") });
+      store.upsertConfirmDecisions(created.id, confirmRun, [{
+        bug: "Conflicted retry candidate",
+        reproduced: "yes",
+        recommendation: "submit-candidate",
+        members: ["kconflictretry"],
+        reproEvidence: "purpose=confirm command cmd1 reproduced the real target effect",
+        reproCommandId: "cmd1",
+      }]);
+      const verifyRun = store.startRun({ projectId: created.id, kind: "audit", runDir: path.join(out, "conflict-verify"), budgets: { verify: true } });
+      store.upsertFindings(created.id, verifyRun, [{
+        findingKey: "kconflictretry-refuted",
+        originId: findingId,
+        title: "Conflicted retry candidate",
+        location: "src/Target.sol:9",
+        severity: "info",
+        status: "refuted",
+      }]);
+      store.finishRun(auditRun, "done");
+      store.finishRun(confirmRun, "done");
+      store.finishRun(verifyRun, "done");
+      assert.equal(store.getFinding(findingId).refutation_status, "conflict");
+      jobId = store.enqueueJob("conflict-retry-project", { verb: "run", pipeline: true }, registration.daemonId);
+    } finally {
+      store.close();
+    }
+
+    const reopened = await ui(base, "POST", `/api/findings/${findingId}/retry`, { phase: "verify" });
+    assert.equal(reopened.status, 200);
+    const claimed = await j(await asDaemon(base, token, "POST", "/api/daemon/claim"));
+    assert.equal(claimed.job.id, jobId);
+    const running = await j(await asDaemon(base, token, "POST", "/api/daemon/runs", {
+      jobId,
+      project: "conflict-retry-project",
+      kind: "run",
+      runDir: path.join(out, "conflict-pipeline"),
+      budgets: {},
+    }));
+    assert.ok(running.runId);
+
+    const worklist = await j(await asDaemon(base, token, "POST", "/api/daemon/pipeline-worklist", {
+      jobId,
+      project: "conflict-retry-project",
+      phase: "verify",
+    }));
+    assert.equal(worklist.verifyFindings.length, 1);
+    assert.equal(worklist.verifyFindings[0].originId, findingId);
+    const inputFingerprint = worklist.verifyFindings[0]._phaseAttempt.inputFingerprint;
+
+    const verifyPhase = await j(await asDaemon(base, token, "POST", "/api/daemon/runs", {
+      jobId,
+      project: "conflict-retry-project",
+      kind: "verify",
+      runDir: path.join(out, "conflict-pipeline-verify"),
+      budgets: { verify: true },
+      additional: true,
+    }));
+    await asDaemon(base, token, "PATCH", `/api/daemon/runs/${verifyPhase.runId}`, {
+      phaseAttempt: { subjectType: "finding", subjectId: findingId, phase: "verify", inputFingerprint, state: "running" },
+    });
+    const agreed = await asDaemon(base, token, "PATCH", `/api/daemon/runs/${verifyPhase.runId}`, {
+      findings: [{
+        findingKey: "kconflictretry-agreed",
+        originId: findingId,
+        title: "Conflicted retry candidate",
+        location: "src/Target.sol:9",
+        severity: "high",
+        status: "confirmed-executable",
+        phaseAttempt: { subjectType: "finding", subjectId: findingId, inputFingerprint },
+      }],
+    });
+    assert.equal(agreed.status, 200);
+
+    const detail = await j(await fetch(base + `/api/projects/${created.uuid}`));
+    const resolved = detail.allFindings.find((finding) => finding.id === findingId);
+    assert.equal(resolved.refutation_status, null);
+    assert.equal(resolved.confirm_status, "reproduced");
+    const after = await j(await asDaemon(base, token, "POST", "/api/daemon/pipeline-worklist", {
+      jobId,
+      project: "conflict-retry-project",
+      phase: "verify",
+    }));
+    assert.equal(after.verifyFindings.length, 0);
+  });
 });
 
 test("daemon: register requires a valid bearer token", async () => {
