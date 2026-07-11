@@ -80,10 +80,20 @@ test("daemon: terminal verify artifact replay is allowlisted, bounded, and conta
       confirmationStatus: "confirmed-differential",
     },
   ] }));
+  await writeFile(path.join(runDir, "audit_hypotheses.json"), JSON.stringify([{
+    originId: 20,
+    title: "Reviewer-rejected candidate",
+    confirmationStatus: "suspected",
+    refutationStatus: "refuted",
+    refutationReason: "The PoC relies on an excluded attacker capability.",
+  }]));
   const rows = await loadVerifyArtifactReplay(out, runDir);
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0].originId, 17);
-  assert.equal(rows[0].reportPath, undefined, "report paths are never accepted from replay artifacts");
+  assert.equal(rows.length, 2);
+  const explicit = rows.find((row) => row.originId === 17);
+  const reviewed = rows.find((row) => row.originId === 20);
+  assert.equal(explicit.reportPath, undefined, "report paths are never accepted from replay artifacts");
+  assert.equal(reviewed.refutationStatus, "refuted");
+  assert.equal(reviewed.refutationReason, "The PoC relies on an excluded attacker capability.");
 
   const outside = await mkdtemp(path.join(os.tmpdir(), "flounder-artifact-outside-"));
   await assert.rejects(loadVerifyArtifactReplay(out, outside), /escapes the daemon output root/);
@@ -148,16 +158,20 @@ test("daemon: terminal verify replay is owner-only, versioned, and updates canon
       version: ownerWork.version,
       artifacts: [{
         originId: findingId,
-        title: "REFUTED: Artifact owner candidate",
+        title: "Artifact owner candidate",
         location: "src/Foo.sol:3",
-        severity: "info",
-        confirmationStatus: "confirmed-executable",
+        severity: "high",
+        confirmationStatus: "suspected",
+        refutationStatus: "refuted",
+        refutationReason: "The independent reviewer rejected the attacker model and appeal failed.",
         evidence: "The executable mitigation check disproved the claim.",
       }],
     });
     assert.equal(applied.status, 200);
     const after = MetadataStore.openForOutput(out);
     assert.equal(after.getFinding(findingId).status, "refuted");
+    assert.equal(after.getFinding(findingId).refutation_status, "refuted");
+    assert.equal(after.getFinding(findingId).refutation_reason, "The independent reviewer rejected the attacker model and appeal failed.");
     assert.equal(after.getFinding(findingId).report_path, null);
     assert.equal(after.getRun(verifyRun).artifact_reconcile_version, ownerWork.version);
     after.close();

@@ -754,7 +754,7 @@ function findingArtifactRows(value: unknown): Array<Record<string, unknown>> {
 }
 
 function sanitizeVerifyArtifactRow(artifact: Record<string, unknown>, originId: number): Record<string, unknown> {
-  const allowedText = ["title", "location", "severity", "scopeId", "scope_id", "description", "evidence", "exploitSketch", "exploit_sketch", "fix", "confirmationStatus", "status"] as const;
+  const allowedText = ["title", "location", "severity", "scopeId", "scope_id", "description", "evidence", "exploitSketch", "exploit_sketch", "fix", "confirmationStatus", "status", "refutationStatus", "refutation_status", "refutationReason", "refutation_reason"] as const;
   const row: Record<string, unknown> = { originId };
   for (const key of allowedText) {
     const value = artifact[key];

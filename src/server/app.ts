@@ -58,7 +58,7 @@ const PERSISTED_ACTIVITY_TAIL_BYTES = 16 * 1024 * 1024;
 const BUG_BOUNTY_CONTEST_KIND = "bug-bounty-contest";
 const DEFAULT_CONTEST_BATCH_SCOPES = 10;
 const DEFAULT_CONTEST_DIG_CONCURRENCY = 5;
-const VERIFY_ARTIFACT_RECONCILIATION_VERSION = 2;
+const VERIFY_ARTIFACT_RECONCILIATION_VERSION = 3;
 const VERIFY_ARTIFACT_RECONCILIATION_LIMIT = 50;
 const MAX_VERIFY_ARTIFACT_REPLAY_ROWS = 1_000;
 const MAX_VERIFY_ARTIFACT_REPLAY_BYTES = 8 * 1024 * 1024;
@@ -4870,7 +4870,7 @@ function daemonRunIsVerify(run: Record<string, unknown>): boolean {
 }
 
 function normalizeVerifyArtifactReplay(input: unknown[]): Array<Record<string, unknown>> | null {
-  const allowedText = ["title", "location", "severity", "scopeId", "scope_id", "description", "evidence", "exploitSketch", "exploit_sketch", "fix", "confirmationStatus", "status"] as const;
+  const allowedText = ["title", "location", "severity", "scopeId", "scope_id", "description", "evidence", "exploitSketch", "exploit_sketch", "fix", "confirmationStatus", "status", "refutationStatus", "refutation_status", "refutationReason", "refutation_reason"] as const;
   const seen = new Set<number>();
   const rows: Array<Record<string, unknown>> = [];
   for (const value of input) {
