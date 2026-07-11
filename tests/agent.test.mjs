@@ -10,7 +10,7 @@ import { ProjectMemory } from "../dist/agent/memory.js";
 import { buildTools, describeAction, ingestFindingsFromScratch, newSession, dedupeFindings, readScratchScopes, isReportFile, scratchHasFindings, scratchHasFindingsArtifact, commandFileArgsForTest, confirmCommandTargetLinkForTest, splitCommandLineForTest } from "../dist/agent/tools.js";
 import { buildRunHealth, mergeFollowupScopes, readScratchCoverageGaps, readScratchFollowupScopes, readScratchResourceRequests } from "../dist/agent/discovery-artifacts.js";
 import { mergeScopeInventory } from "../dist/agent/scope-store.js";
-import { dedupeVerifyInputs, dischargeChallengeFindingTitle, dischargeChallengeScopeOutcomes, normalizeVerifyVerdicts, runAudit } from "../dist/agent/audit.js";
+import { dedupeVerifyInputs, dischargeChallengeFindingTitle, dischargeChallengeScopeOutcomes, normalizeVerifyVerdicts, runAudit, verifyBatchStoppedReason } from "../dist/agent/audit.js";
 import { normalizePrepareManifest, prepareValidationBlockingIssues, readPrepareManifest } from "../dist/agent/acquire.js";
 import { runAuditLoop, isTransientError } from "../dist/agent/loop.js";
 import { MetadataStore } from "../dist/db/store.js";
@@ -641,7 +641,10 @@ test("run health distinguishes blocked, shallow, and coverage-incomplete runs", 
     coverageGaps: [{ id: "G1", status: "open", obligation: "Parser length must bind payload bytes", reason: "Budget ended before parser sink was audited" }],
   }).status, "needs-coverage");
   assert.equal(buildRunHealth({ ...base, stoppedReason: "error" }).status, "infra-failed");
+  assert.equal(buildRunHealth({ ...base, mode: "verify", steps: [...base.steps, { tool: "(session-error)" }] }).status, "healthy");
   assert.equal(buildRunHealth({ ...base, infraErrors: 1 }).status, "infra-failed");
+  assert.equal(verifyBatchStoppedReason("error", 7, 7), "finished");
+  assert.equal(verifyBatchStoppedReason("error", 6, 7), "error");
 });
 
 test("scope inventory merge appends novel scopes while preserving existing status", () => {
