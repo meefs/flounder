@@ -106,6 +106,34 @@ function auditActionFor(user: string): string {
       ]),
     });
   }
+  if (!user.includes('"path":"scope_outcome.json"')) {
+    const scopeId = user.match(/scope\s+(S\d+)/i)?.[1] ?? "S1";
+    return action("Persist the completed coverage handoff separately from the confirmed finding.", "write", {
+      path: "scope_outcome.json",
+      content: JSON.stringify({
+        scope_id: scopeId,
+        coverage_complete: true,
+        obligations: [{
+          id: "O1",
+          statement: "the advice cell is constrained to its trusted source value",
+          status: "unmet",
+          location: "halo2_missing_constraint.rs:5",
+          evidence: "the executable harness confirms the missing equality edge",
+          confidence: 0.85,
+        }],
+        composition_edges: [{
+          id: "E1",
+          kind: "binding",
+          description: "prover-controlled advice reaches checked logic without a trusted-source equality edge",
+          status: "observed",
+          location: "halo2_missing_constraint.rs:5",
+          from: "advice assignment",
+          to: "downstream checked logic",
+        }],
+        blockers: [],
+      }),
+    });
+  }
   return JSON.stringify({ thought: "Coverage of the loaded fixture is sufficient.", done: true, summary: "One confirmed-executable missing-constraint finding." });
 }
 

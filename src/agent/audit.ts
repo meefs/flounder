@@ -560,6 +560,10 @@ export async function runAudit(
     const buildDeepFocus = (scope: AuditScope): string =>
       `scope ${scope.id}; code region ${scope.region} — audit this WHOLE region: independently enumerate and discharge ALL of its security obligations; ` +
       `do NOT limit yourself to any single one. The map flagged one concern as a starting point (not a boundary): "${scope.obligation}"`;
+    const coverageCompleted = (outcomes: ScopeOutcome[]): boolean => {
+      const latest = outcomes.at(-1);
+      return Boolean(latest && !scopeOutcomeNeedsCoverage(latest));
+    };
     // Run a scope's dig `samples` times and union the findings. Per-pass recall on a
     // subtle obligation is < 1 and stochastic; K independent passes raise cumulative
     // recall (1 - (1-p)^K). `over` isolates a concurrent dig in its own session.
@@ -647,12 +651,16 @@ export async function runAudit(
             if (finding.commandRunId) finding.commandRunId = `${scope.id}:${finding.commandRunId}`;
           }
           const scopedScratchFiles = [...digSession.scratchFiles.entries()].map(([scratchPath, content]) => [`dig-${scopeWorkspaceKey(scope.id)}/${scratchPath}`, content] as [string, string]);
-          scope.status = "audited";
+          const completed = coverageCompleted(outcomes);
+          // Finishing a model attempt is not the same as completing coverage. An
+          // incomplete handoff must remain resumable instead of disappearing from
+          // the next run's pending inventory.
+          scope.status = completed ? "audited" : "pending";
           scope.digSeconds = Math.max(1, Math.round((Date.now() - digT0) / 1000));
-          await logger.event("audit_dig_done", { scope: scope.id, samples, findings: unioned.length, concurrent: true, digSeconds: scope.digSeconds });
-          // Resume checkpoint: persist the audited status so a kill mid-run skips this scope
-          // on the next run (concurrent digs' findings live in their isolated workspaces).
-          await saveScopeInventory(inventoryDir, scopeInventory);
+          await logger.event("audit_dig_done", { scope: scope.id, samples, findings: unioned.length, concurrent: true, coverageComplete: completed, digSeconds: scope.digSeconds });
+          // Resume checkpoint: only complete coverage is skipped on the next run;
+          // incomplete attempts stay pending (their findings still survive below).
+          await saveScopeInventory(inventoryDir, scopeInventory, completed ? {} : { forceStatusIds: [scope.id] });
           await appendScopeOutcomes(inventoryDir, outcomes);
           recorder.scopes(scopeInventory);
           recorder.findings(unioned, logger.runDir, "dig checkpoint"); // persist this scope's findings live (content-keyed upsert)
@@ -696,12 +704,13 @@ export async function runAudit(
           aggregatedSteps.push(...digSteps);
           aggregated.push(...unioned);
           newScopeOutcomes.push(...outcomes);
-          scope.status = "audited";
+          const completed = coverageCompleted(outcomes);
+          scope.status = completed ? "audited" : "pending";
           scope.digSeconds = Math.max(1, Math.round((Date.now() - digT0) / 1000));
-          await logger.event("audit_dig_done", { scope: scope.id, samples, findings: unioned.length, digSeconds: scope.digSeconds });
-          // Resume checkpoint: persist the audited status + findings-so-far after each dig,
-          // so a kill mid-run resumes at the next pending scope and keeps completed work.
-          await saveScopeInventory(inventoryDir, scopeInventory);
+          await logger.event("audit_dig_done", { scope: scope.id, samples, findings: unioned.length, coverageComplete: completed, digSeconds: scope.digSeconds });
+          // Resume checkpoint: persist coverage status + findings-so-far after each
+          // attempt so incomplete coverage remains eligible for a later resume.
+          await saveScopeInventory(inventoryDir, scopeInventory, completed ? {} : { forceStatusIds: [scope.id] });
           await appendScopeOutcomes(inventoryDir, outcomes);
           await checkpointFindings();
           recorder.scopes(scopeInventory);

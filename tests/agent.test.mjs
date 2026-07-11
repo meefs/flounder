@@ -395,6 +395,29 @@ class OutcomeOnlySynthesisLlmClient {
   }
 }
 
+class IncompleteOutcomeLlmClient extends OutcomeOnlySynthesisLlmClient {
+  async complete(input) {
+    if (input.system.includes("DEEP, NARROW-SCOPE audit") && !input.user.includes('"path":"scope_outcome.json"')) {
+      const scopeId = input.user.includes("consumer-region-marker") ? "S2" : "S1";
+      return JSON.stringify({
+        thought: "Persist the unresolved coverage handoff.",
+        tool: "write",
+        args: {
+          path: "scope_outcome.json",
+          content: JSON.stringify({
+            scope_id: scopeId,
+            coverage_complete: false,
+            obligations: [{ id: "O1", statement: "the external build-dependent edge is checked", status: "blocked" }],
+            composition_edges: [],
+            blockers: ["required local build fixture is unavailable"],
+          }),
+        },
+      });
+    }
+    return super.complete(input);
+  }
+}
+
 function tarGz(files) {
   const blocks = [];
   for (const [name, contentText] of Object.entries(files)) {
@@ -2037,6 +2060,36 @@ test("zero-finding dig outcomes still trigger complete cross-scope synthesis", a
     assert.equal(outcomes[0].coverageComplete, true, JSON.stringify(outcomes));
     const runHealth = JSON.parse(await readFile(path.join(runDir, "run_health.json"), "utf8"));
     assert.equal(runHealth.signals.scopeOutcomesIncomplete, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("incomplete dig coverage remains pending after serial and concurrent attempts", async () => {
+  const dir = await tempDir();
+  try {
+    for (const concurrency of [1, 2]) {
+      const cfg = defaultConfig();
+      cfg.targetName = `incomplete-coverage-${concurrency}`;
+      cfg.sourcePaths = [fixtures];
+      cfg.outputDir = path.join(dir, `runs-${concurrency}`);
+      cfg.auditDeep = true;
+      cfg.auditMaxScopes = 1;
+      cfg.auditDigSamples = 1;
+      cfg.auditDigMaxSamples = 1;
+      cfg.auditDigConcurrency = concurrency;
+      cfg.auditSynthesize = false;
+      cfg.auditChallengeDischarges = false;
+      cfg.auditRefute = false;
+
+      const { runDir, scopeCoverage } = await runAudit(cfg, { llm: new IncompleteOutcomeLlmClient() });
+      const scopes = JSON.parse(await readFile(path.join(runDir, "audit_scopes.json"), "utf8"));
+      assert.equal(scopes.find((scope) => scope.id === "S1").status, "pending", `concurrency ${concurrency}`);
+      assert.deepEqual(scopeCoverage, { total: 2, audited: 0, pending: 2, deferred: 0 }, `concurrency ${concurrency}`);
+      const events = (await readFile(path.join(runDir, "events.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+      const done = events.find((event) => event.kind === "audit_dig_done");
+      assert.equal(done.coverageComplete, false, `concurrency ${concurrency}`);
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
