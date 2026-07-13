@@ -61,14 +61,22 @@ function truncatedMachO64() {
 async function fakeContainerCli(options = {}) {
   const dir = await tempDir("flounder-fake-container-bin-");
   const bin = path.join(dir, "container");
+  const deleteStateFile = path.join(dir, "delete-count");
   await writeFile(bin, `#!/usr/bin/env bash
 LOG_FILE=${JSON.stringify(options.logFile ?? "")}
 RUN_SLEEP_SECONDS=${JSON.stringify(String(options.runSleepSeconds ?? 0))}
+DELETE_FAIL_COUNT=${JSON.stringify(String(options.deleteFailCount ?? 0))}
+DELETE_STATE_FILE=${JSON.stringify(deleteStateFile)}
 if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then printf '%s' ${JSON.stringify(options.imageInspectStderr ?? "")} >&2; exit ${options.imageInspectExit ?? 0}; fi
 if [ "$1" = "network" ] && [ "$2" = "inspect" ]; then exit ${options.networkInspectExit ?? 0}; fi
 if [ "$1" = "network" ] && [ "$2" = "create" ]; then exit ${options.networkCreateExit ?? 0}; fi
 if [ "$1" = "delete" ]; then
   if [ -n "$LOG_FILE" ]; then printf 'DELETE:%s\\n' "\${3:-}" >> "$LOG_FILE"; fi
+  DELETE_COUNT=0
+  if [ -f "$DELETE_STATE_FILE" ]; then read -r DELETE_COUNT < "$DELETE_STATE_FILE"; fi
+  DELETE_COUNT=$((DELETE_COUNT + 1))
+  printf '%s\\n' "$DELETE_COUNT" > "$DELETE_STATE_FILE"
+  if [ "$DELETE_COUNT" -le "$DELETE_FAIL_COUNT" ]; then printf 'transient delete failure\\n' >&2; exit 1; fi
   exit ${options.deleteExit ?? 0}
 fi
 if [ "$1" = "run" ]; then
@@ -451,7 +459,7 @@ test("sandbox Apple container backend force-deletes timed-out containers", async
   const workspace = await tempDir("flounder-sandbox-apple-timeout-");
   const logDir = await tempDir("flounder-sandbox-apple-timeout-log-");
   const logFile = path.join(logDir, "container.log");
-  const fakeBin = await fakeContainerCli({ logFile, runSleepSeconds: 5 });
+  const fakeBin = await fakeContainerCli({ logFile, runSleepSeconds: 5, deleteFailCount: 1 });
   const oldPath = process.env.PATH;
   try {
     process.env.PATH = `${fakeBin}${path.delimiter}${oldPath ?? ""}`;
@@ -465,7 +473,8 @@ test("sandbox Apple container backend force-deletes timed-out containers", async
     );
 
     assert.equal(result.timedOut, true);
-    await waitForFileMatch(logFile, /DELETE:flounder-/);
+    const cleanupLog = await waitForFileMatch(logFile, /DELETE:flounder-[^\n]+\nDELETE:flounder-/);
+    assert.equal(cleanupLog.match(/DELETE:flounder-/g)?.length, 2);
   } finally {
     process.env.PATH = oldPath;
     await rm(workspace, { recursive: true, force: true });

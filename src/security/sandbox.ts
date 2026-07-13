@@ -507,12 +507,6 @@ async function runAppleContainerSandboxProcess(input: ProcessRunInput): Promise<
     if (value !== undefined) containerArgs.push("--env", `${key}=${value}`);
   }
   containerArgs.push(input.options.image, input.command.program, ...input.command.args);
-  let cleanupStarted = false;
-  const cleanupTimedOutContainer = (): void => {
-    if (cleanupStarted) return;
-    cleanupStarted = true;
-    void forceRemoveAppleContainer(containerName);
-  };
   const result = await runSpawnedProcess({
     program: "container",
     args: containerArgs,
@@ -520,10 +514,21 @@ async function runAppleContainerSandboxProcess(input: ProcessRunInput): Promise<
     env: containerClientEnv(),
     timeoutMs: input.command.timeoutMs ?? 120_000,
     maxLogBytes: input.maxLogBytes,
-    onTimeout: cleanupTimedOutContainer,
-    timeoutKillDelayMs: 250,
   });
-  if (result.timedOut) cleanupTimedOutContainer();
+  if (result.timedOut) {
+    // The Apple CLI may still be unwinding its `container run` XPC session when
+    // the timeout fires. Deleting concurrently races that session and can leave
+    // the per-container VM running indefinitely, so wait for the client process
+    // to exit before retrying and observing cleanup.
+    const cleanup = await forceRemoveAppleContainer(containerName);
+    if (!cleanup.ok) {
+      result.stderr = appendLimited(
+        result.stderr,
+        `Apple container cleanup failed after command timeout: ${cleanup.message}`,
+        input.maxLogBytes,
+      );
+    }
+  }
   return result;
 }
 
@@ -1190,15 +1195,31 @@ async function forceRemoveContainer(name: string): Promise<void> {
   });
 }
 
-async function forceRemoveAppleContainer(name: string): Promise<void> {
-  await runSpawnedProcess({
-    program: "container",
-    args: ["delete", "--force", name],
-    cwd: process.cwd(),
-    env: containerClientEnv(),
-    timeoutMs: 10_000,
-    maxLogBytes: 2000,
-  });
+async function forceRemoveAppleContainer(name: string): Promise<{ ok: boolean; message: string }> {
+  const attempts = 3;
+  let message = "container delete did not complete";
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const result = await runSpawnedProcess({
+      program: "container",
+      args: ["delete", "--force", name],
+      cwd: process.cwd(),
+      env: containerClientEnv(),
+      timeoutMs: 10_000,
+      maxLogBytes: 2000,
+    });
+    const output = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
+    if (result.exitCode === 0 || appleContainerIsAlreadyAbsent(output)) return { ok: true, message: "removed" };
+    message = output || `container delete exited with code ${String(result.exitCode)}`;
+    if (attempt < attempts) {
+      await new Promise<void>((resolve) => setTimeout(resolve, attempt * 250));
+    }
+  }
+  return { ok: false, message };
+}
+
+function appleContainerIsAlreadyAbsent(output: string): boolean {
+  const normalized = output.toLowerCase();
+  return normalized.includes("container with id") && (normalized.includes("notfound") || normalized.includes("not found"));
 }
 
 function dockerClientEnv(): NodeJS.ProcessEnv {
