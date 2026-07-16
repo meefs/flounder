@@ -631,12 +631,12 @@ export async function runAudit(
     };
 
     if (concurrency > 1) {
-      // Concurrent digs are scheduled as a bounded pool; runtime target changes can
-      // only affect scopes that have not been scheduled yet in sequential mode.
-      toDig = toDig.slice(0, reportedRunScopesTarget);
       // Concurrent dig: each scope runs in its OWN isolated workspace + session +
       // differential confirmation, so parallel digs cannot corrupt each other's
       // test files, build output, or findings. A bounded pool caps simultaneous digs.
+      // Schedule in small batches until the requested number of scopes reaches
+      // coverage-complete. An incomplete attempt remains pending and must not consume
+      // one of the run's audited-scope slots.
       const workspaceRoots = cfg.buildRoot ? [cfg.buildRoot] : cfg.sourcePaths;
       const digScope = async (scope: AuditScope): Promise<{ findings: AgentFinding[]; outcomes: ScopeOutcome[]; steps: TranscriptStep[]; commandRuns: typeof session.commandRuns; scratchFiles: Array<[string, string]>; resourceRequests: ResourceRequest[] }> => {
         scope.status = "auditing"; // mark in-progress so the live UI shows which scope is being dug
@@ -681,15 +681,24 @@ export async function runAudit(
           await appendScopeOutcomes(inventoryDir, outcomes);
           recorder.scopes(scopeInventory);
           recorder.findings(unioned, logger.runDir, "dig checkpoint"); // persist this scope's findings live (content-keyed upsert)
-          recorder.runScopes(++digDone, toDig.length);
+          if (completed) digDone += 1;
+          recorder.runScopes(digDone, reportedRunScopesTarget);
           return { findings: unioned, outcomes, steps: digSteps, commandRuns: scopedRuns, scratchFiles: scopedScratchFiles, resourceRequests: digSession.resourceRequests ?? [] };
         } catch (error) {
           await resetInFlightScope(scope);
           throw error;
         }
       };
-      await logger.event("audit_dig_concurrent_start", { scopes: toDig.length, concurrency });
-      const perScope = await runWithConcurrency(toDig, concurrency, digScope);
+      await logger.event("audit_dig_concurrent_start", { scopes: toDig.length, target: reportedRunScopesTarget, concurrency });
+      const perScope: Awaited<ReturnType<typeof digScope>>[] = [];
+      let cursor = 0;
+      while (cursor < toDig.length && digDone < reportedRunScopesTarget) {
+        const remaining = reportedRunScopesTarget - digDone;
+        const batchSize = Math.min(concurrency, remaining, toDig.length - cursor);
+        const batch = toDig.slice(cursor, cursor + batchSize);
+        cursor += batchSize;
+        perScope.push(...await runWithConcurrency(batch, concurrency, digScope));
+      }
       // Merge every dig's findings, transcript steps, and command runs into the run
       // aggregates so the persisted artifacts reflect the concurrent digs, not just
       // the map phase. runWithConcurrency preserves scope order.
@@ -731,7 +740,7 @@ export async function runAudit(
           await appendScopeOutcomes(inventoryDir, outcomes);
           await checkpointFindings();
           recorder.scopes(scopeInventory);
-          digDone += 1;
+          if (completed) digDone += 1;
           const targetAfter = effectiveRunScopesTarget(digDone);
           if (targetAfter !== reportedRunScopesTarget) {
             reportedRunScopesTarget = targetAfter;
