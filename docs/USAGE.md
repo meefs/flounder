@@ -142,9 +142,24 @@ then the specialized image you need:
 
 ```bash
 npm run sandbox:build
+npm run sandbox:rust:target -- --target <target-root> --execute
 npm run sandbox:cairo:build  # flounder-sandbox:cairo, with Scarb + Starknet Foundry
 npm run sandbox:ton:build    # flounder-sandbox:ton, with TON Blueprint + FunC/Tolk/Tact tooling
 ```
+
+For Rust targets with an exact `rust-toolchain.toml` or `rust-toolchain` release
+pin, the reviewed Rust recipe builds a matching image instead of relying on the
+Ubuntu Cargo version in the baseline:
+
+```bash
+npm run sandbox:rust:target -- --target <target-root> --execute
+```
+
+It tags `flounder-sandbox:rust-<version>`, uses the matching official Rust
+toolchain image, and verifies both `rustc` and `cargo` during the build. Omit
+`--execute` to review the build command, or add `--runtime container` to build
+into Apple's container runtime. Non-exact channels such as `stable` fail closed;
+pass an exact release with `--rust-version` when the repository does not pin one.
 
 For Cairo targets that pin older toolchains in `.tool-versions`, build a
 target-specific Cairo image from the reviewed recipe instead of relying on the
@@ -166,6 +181,7 @@ Use them explicitly for matching targets:
 
 ```bash
 flounder run --source ./src --build-root . --sandbox-image flounder-sandbox:cairo
+flounder run --source ./src --build-root . --sandbox-image flounder-sandbox:rust-1.86.0
 flounder run --source ./src --build-root . --sandbox-image flounder-sandbox:cairo-scarb-2.12.0-snfoundry-0.49.0
 flounder run --source ./contracts --build-root . --sandbox-image flounder-sandbox:ton
 ```

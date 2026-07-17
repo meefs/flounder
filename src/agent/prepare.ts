@@ -220,6 +220,12 @@ interface VersionCheckSpec {
 }
 
 function versionCheckSpecs(pin: PinnedToolVersion): VersionCheckSpec[] {
+  if (pin.tool === "rust") {
+    return [
+      { tool: "rustc", expected: pin.version, argv: ["rustc", "--version"], cwd: pin.dir },
+      { tool: "cargo", expected: pin.version, argv: ["cargo", "--version"], cwd: pin.dir },
+    ];
+  }
   if (pin.tool === "scarb") return [{ tool: "scarb", expected: pin.version, argv: ["scarb", "--version"], cwd: pin.dir }];
   if (pin.tool === "starknet-foundry") {
     return [
@@ -344,6 +350,7 @@ function relevantPinnedToolVersions(pins: PinnedToolVersion[], plans: ToolchainP
 }
 
 function pinAppliesToPlan(pin: PinnedToolVersion, plan: ToolchainPlan): boolean {
+  if (pin.tool === "rust") return plan.toolchain === "cargo" && sameOrNestedPlan(pin.dir, plan.cwd ?? "");
   if (pin.tool === "scarb" || pin.tool === "starknet-foundry" || pin.tool === "universal-sierra-compiler") {
     return plan.toolchain === "scarb" && sameOrNestedPlan(pin.dir, plan.cwd ?? "");
   }
@@ -439,6 +446,21 @@ function outermostManifestDirs(manifests: ManifestEntry[], name: string): string
 export async function detectPinnedToolVersions(workspaceAbsolute: string): Promise<PinnedToolVersion[]> {
   const manifests = await scanManifests(workspaceAbsolute);
   const out: PinnedToolVersion[] = [];
+  for (const entry of manifests.filter((manifest) => manifest.name === "rust-toolchain" || manifest.name === "rust-toolchain.toml")) {
+    const abs = path.join(workspaceAbsolute, ...entry.dir.split("/").filter(Boolean), entry.name);
+    let content: string;
+    try {
+      content = await readFile(abs, "utf8");
+    } catch {
+      continue;
+    }
+    const channel = entry.name === "rust-toolchain.toml"
+      ? content.match(/^\s*channel\s*=\s*["']([^"']+)["']/m)?.[1]
+      : content.split(/\r?\n/).map((line) => line.replace(/#.*/, "").trim()).find(Boolean);
+    if (channel && /^\d+\.\d+\.\d+(?:[-+._a-zA-Z0-9]+)?$/.test(channel)) {
+      out.push({ tool: "rust", version: channel, dir: entry.dir || "." });
+    }
+  }
   for (const entry of manifests.filter((manifest) => manifest.name === ".tool-versions")) {
     const abs = path.join(workspaceAbsolute, ...entry.dir.split("/").filter(Boolean), entry.name);
     let content: string;
@@ -468,7 +490,7 @@ interface ManifestEntry {
 }
 
 async function scanManifests(root: string): Promise<ManifestEntry[]> {
-  const wanted = new Set(["Cargo.toml", "go.mod", "package.json", "foundry.toml", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "Scarb.toml", "Scarb.lock", "snfoundry.toml", ".tool-versions", "blueprint.config.ts", "blueprint.config.js", "blueprint.config.cjs", "blueprint.config.mjs", "tact.config.json"]);
+  const wanted = new Set(["Cargo.toml", "Cargo.lock", "rust-toolchain", "rust-toolchain.toml", "go.mod", "package.json", "foundry.toml", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "Scarb.toml", "Scarb.lock", "snfoundry.toml", ".tool-versions", "blueprint.config.ts", "blueprint.config.js", "blueprint.config.cjs", "blueprint.config.mjs", "tact.config.json"]);
   const out: ManifestEntry[] = [];
   let budget = MAX_SCAN_ENTRIES;
   const walk = async (absDir: string, relDir: string, depth: number): Promise<void> => {

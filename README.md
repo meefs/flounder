@@ -302,6 +302,17 @@ The default image is a baseline, not a promise to cover every target stack. It i
 flounder run --source ./src --build-root . --sandbox-image your-audit-image:latest
 ```
 
+For a Rust repository with an exact `rust-toolchain.toml` or `rust-toolchain`
+release pin, build the reviewed matching image outside the audit loop:
+
+```bash
+npm run sandbox:rust:target -- --target <target-root> --execute
+flounder run --source ./src --build-root . --sandbox-image flounder-sandbox:rust-1.86.0
+```
+
+Use `--runtime container` to build into Apple's container runtime. The command
+prints the exact build plan by default and rejects moving/non-exact channels.
+
 Image construction is part of the trusted execution base. The audit model may report missing toolchains or propose an image recipe, but it should not receive unrestricted `docker build` / `docker pull` capability inside the audit loop. A safe automation path is to generate a reviewable target-specific image plan, build it in a controlled daemon/operator step, then pin and reuse that image by name or digest.
 
 For trusted local smoke tests only, use `--sandbox-backend host --allow-host-execution` or set `FLOUNDER_ALLOW_HOST_EXECUTION=1`. Host mode still uses the copied workspace plus isolated `HOME` and package-cache paths, but it cannot enforce command-level network sealing or provide kernel-level filesystem isolation and should not be used for untrusted targets, malicious dependencies, or real model-generated exploit code.

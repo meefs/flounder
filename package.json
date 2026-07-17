@@ -48,6 +48,7 @@
     "hooks:install": "git config core.hooksPath .githooks",
     "verify": "npm run check && npm test && npm run check:api-catalog:dist && npm run check:db-upgrade:dist && npm run mock-audit && npm run check:public",
     "sandbox:build": "docker build -f docker/flounder-sandbox.Dockerfile -t flounder-sandbox:latest .",
+    "sandbox:rust:target": "node scripts/rust-sandbox-image.mjs",
     "sandbox:cairo:build": "docker build -f docker/flounder-sandbox-cairo.Dockerfile -t flounder-sandbox:cairo .",
     "sandbox:cairo:target": "node scripts/cairo-sandbox-image.mjs",
     "sandbox:ton:build": "docker build -f docker/flounder-sandbox-ton.Dockerfile -t flounder-sandbox:ton .",
