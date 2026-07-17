@@ -2442,19 +2442,19 @@ async function runLaunch(c: Ctx): Promise<void> {
     || stringValue(materialBoundary?.material_fingerprint);
   if (currentMaterialFingerprint) spec.materialFingerprint = currentMaterialFingerprint;
   if (spec.verb === "run") {
-    if (spec.sourcePaths.length > 0) {
+    const prepared = latestPreparedWorkspace(runs);
+    if (prepared && !runBodyHasMaterialOverride(body)) {
+      applyProjectPrepareDefaults(spec, project, runs);
+      spec.pipeline = true;
+      applyPreparedWorkspaceToSpec(spec, prepared);
+    } else if (spec.sourcePaths.length > 0) {
       applyProjectSourceDefaults(spec, project);
       if (!spec.pipeline) spec.pipeline = false;
     } else {
       applyProjectPrepareDefaults(spec, project, runs);
       spec.pipeline = true;
-      const prepared = latestPreparedWorkspace(runs);
       if (prepared) {
-        spec.dir = undefined;
-        spec.sourcePaths = [prepared.workspaceDir];
-        spec.buildRoot = prepared.workspaceDir;
-        spec.clue = undefined;
-        if (!spec.scopeNote && prepared.scopeNote) spec.scopeNote = prepared.scopeNote;
+        applyPreparedWorkspaceToSpec(spec, prepared);
       } else if (spec.clue && spec.sourcePaths.length === 0) {
         resetPipelineCoverageForUnknownInventory(spec);
       }
@@ -2688,6 +2688,11 @@ function runBodyHasConfigOverride(body: Record<string, unknown>, key: string): b
   const overrides = objectValue(body.overrides);
   const config = objectValue(overrides?.config);
   return config?.[key] !== undefined;
+}
+
+function runBodyHasMaterialOverride(body: Record<string, unknown>): boolean {
+  const overrides = objectValue(body.overrides);
+  return overrides?.sourcePaths !== undefined || overrides?.buildRoot !== undefined || overrides?.corpusPaths !== undefined;
 }
 
 function resumeInterruptedCoverageBatch(spec: LaunchSpec, progress: Coverage, runs: Array<Record<string, unknown>>): void {
@@ -3261,11 +3266,17 @@ function applyPreparedWorkspaceIfNeeded(spec: LaunchSpec, runs: Array<Record<str
         : "this project has no source paths and no prepared workspace yet. Run Prepare first, or configure source paths.",
     };
   }
+  applyPreparedWorkspaceToSpec(spec, prepared);
+  return { ok: true };
+}
+
+function applyPreparedWorkspaceToSpec(spec: LaunchSpec, prepared: { workspaceDir: string; manifestPath: string; scopeNote?: string }): void {
   spec.dir = undefined;
   spec.sourcePaths = [prepared.workspaceDir];
   spec.buildRoot = prepared.workspaceDir;
+  spec.corpusPaths = [];
+  spec.clue = undefined;
   if (!spec.scopeNote && prepared.scopeNote) spec.scopeNote = prepared.scopeNote;
-  return { ok: true };
 }
 
 function latestPreparedWorkspace(runs: Array<Record<string, unknown>>): { workspaceDir: string; manifestPath: string; scopeNote?: string } | undefined {

@@ -60,7 +60,7 @@ test("prepare and audit fingerprint the same staged workspace identically", asyn
   }
 });
 
-test("legacy prepared workspace fingerprints are backfilled only after exact verification", async () => {
+test("prepared workspace fingerprints are backfilled only after an exact canonical result", async () => {
   const runDir = await mkdtemp(path.join(os.tmpdir(), "flounder-legacy-prepare-run-"));
   const workspace = path.join(runDir, "prepare", "workspace");
   try {
@@ -78,8 +78,10 @@ test("legacy prepared workspace fingerprints are backfilled only after exact ver
     const runs = [
       { id: 1, project_id: 7, kind: "prepare", status: "done", run_dir: runDir, material_fingerprint: legacyFingerprint, started_at: "2026-01-01T00:00:00.000Z" },
       { id: 2, project_id: 7, kind: "run", status: "done", run_dir: path.join(runDir, "audit"), material_fingerprint: canonicalFingerprint, started_at: "2026-01-01T00:01:00.000Z" },
-      { id: 3, project_id: 8, kind: "prepare", status: "done", run_dir: runDir, material_fingerprint: "sha256:not-legacy", started_at: "2026-01-01T00:00:00.000Z" },
+      { id: 3, project_id: 8, kind: "prepare", status: "done", run_dir: runDir, material_fingerprint: "sha256:included-external-corpus", started_at: "2026-01-01T00:00:00.000Z" },
       { id: 4, project_id: 8, kind: "run", status: "done", run_dir: path.join(runDir, "other"), material_fingerprint: canonicalFingerprint, started_at: "2026-01-01T00:01:00.000Z" },
+      { id: 5, project_id: 9, kind: "prepare", status: "done", run_dir: runDir, material_fingerprint: "sha256:unverified", started_at: "2026-01-01T00:00:00.000Z" },
+      { id: 6, project_id: 9, kind: "run", status: "done", run_dir: path.join(runDir, "unrelated"), material_fingerprint: "sha256:different", started_at: "2026-01-01T00:01:00.000Z" },
     ];
     const replacements = [];
     const changed = await reconcileLegacyPreparedMaterialFingerprints(runs, (runId, expected, replacement) => {
@@ -87,8 +89,11 @@ test("legacy prepared workspace fingerprints are backfilled only after exact ver
       return true;
     });
 
-    assert.equal(changed, 1);
-    assert.deepEqual(replacements, [{ runId: 1, expected: legacyFingerprint, replacement: canonicalFingerprint }]);
+    assert.equal(changed, 2);
+    assert.deepEqual(replacements, [
+      { runId: 1, expected: legacyFingerprint, replacement: canonicalFingerprint },
+      { runId: 3, expected: "sha256:included-external-corpus", replacement: canonicalFingerprint },
+    ]);
   } finally {
     await rm(runDir, { recursive: true, force: true });
   }

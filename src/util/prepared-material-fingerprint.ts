@@ -19,11 +19,6 @@ export async function preparedWorkspaceMaterialFingerprint(workspaceDir: string,
   return workspaceFingerprint(preparedSource, preparedCorpus);
 }
 
-async function legacyPreparedWorkspaceMaterialFingerprint(workspaceDir: string): Promise<string> {
-  const preparedSource = await loadSource([workspaceDir]);
-  return workspaceFingerprint(preparedSource, []);
-}
-
 export async function reconcileLegacyPreparedMaterialFingerprints(
   runs: PreparedMaterialRunRow[],
   replace: (runId: number, expected: string, replacement: string) => boolean,
@@ -36,20 +31,16 @@ export async function reconcileLegacyPreparedMaterialFingerprints(
     const storedFingerprint = stringValue(prepare.material_fingerprint);
     const prepareStartedAt = stringValue(prepare.started_at);
     if (!Number.isFinite(prepareId) || !Number.isFinite(projectId) || prepare.kind !== "prepare" || prepare.status !== "done" || !runDir || !storedFingerprint) continue;
-    const hasDifferentLaterResult = runs.some((run) => Number(run.project_id) === projectId
-      && run.kind !== "prepare"
-      && Boolean(stringValue(run.material_fingerprint))
-      && stringValue(run.material_fingerprint) !== storedFingerprint
-      && Boolean(stringValue(run.started_at) && prepareStartedAt && stringValue(run.started_at) >= prepareStartedAt));
-    if (!hasDifferentLaterResult) continue;
-
     const workspaceDir = path.join(path.resolve(runDir), "prepare", "workspace");
     if (!existsSync(workspaceDir)) continue;
-    const legacy = await legacyPreparedWorkspaceMaterialFingerprint(workspaceDir);
-    if (legacy !== storedFingerprint) continue;
     const canonical = await preparedWorkspaceMaterialFingerprint(workspaceDir, []);
-    if (canonical === legacy) continue;
-    if (replace(prepareId, legacy, canonical)) changed += 1;
+    if (canonical === storedFingerprint) continue;
+    const hasCanonicalLaterResult = runs.some((run) => Number(run.project_id) === projectId
+      && run.kind !== "prepare"
+      && stringValue(run.material_fingerprint) === canonical
+      && Boolean(stringValue(run.started_at) && prepareStartedAt && stringValue(run.started_at) >= prepareStartedAt));
+    if (!hasCanonicalLaterResult) continue;
+    if (replace(prepareId, storedFingerprint, canonical)) changed += 1;
   }
   return changed;
 }

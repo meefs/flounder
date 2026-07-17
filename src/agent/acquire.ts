@@ -148,7 +148,9 @@ export async function runPrepare(
     blockingIssues: blockingIssues.length,
   });
 
-  stagedCfg.materialFingerprint = await preparedWorkspaceMaterialFingerprint(workspace.absolute, stagedCfg.corpusPaths);
+  // The staged workspace is the complete handoff to sealed audit. Project-local
+  // corpus inputs are acquisition hints, not additional post-Prepare material.
+  stagedCfg.materialFingerprint = await preparedWorkspaceMaterialFingerprint(workspace.absolute, []);
   recorder.materialFingerprint?.(stagedCfg.materialFingerprint);
 
   const finalStatus: RunStatus = options.signal?.aborted ? "killed" : manifest !== undefined && blockingIssues.length === 0 ? "done" : "error";
