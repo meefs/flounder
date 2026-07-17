@@ -157,6 +157,53 @@ test("prepareWorkspaceToolchain reports pinned tool version mismatch before warm
   }
 });
 
+test("prepareWorkspaceToolchain enforces exact rust-toolchain.toml pins before Cargo warm-up", async () => {
+  const workspace = await tempDir("flounder-prepare-rust-pin-");
+  const binDir = await tempDir("flounder-prepare-bin-");
+  const cacheDir = await tempDir("flounder-prepare-cache-");
+  const logPath = path.join(workspace, "tools.log");
+  const oldPath = process.env.PATH;
+  try {
+    await writeFile(path.join(workspace, "Cargo.toml"), "[package]\nname = \"audit_target\"\nversion = \"0.1.0\"\n");
+    await writeFile(path.join(workspace, "rust-toolchain.toml"), "[toolchain]\nchannel = \"1.86.0\"\nprofile = \"minimal\"\n");
+    await writeFakeTool(binDir, "rustc", logPath, "rustc 1.75.0");
+    await writeFakeTool(binDir, "cargo", logPath, "cargo 1.75.0");
+    process.env.PATH = `${binDir}${path.delimiter}${oldPath ?? ""}`;
+
+    const cfg = defaultConfig();
+    cfg.sandboxBackend = "host";
+    cfg.sandboxAllowHostFallback = true;
+    cfg.auditPrepareTimeoutMs = 10_000;
+    cfg.reproductionMaxLogBytes = 4000;
+    cfg.sourcePaths = [workspace];
+    const report = await prepareWorkspaceToolchain({
+      workspace: { absolute: workspace, relative: "workspace" },
+      cfg,
+      logger: logger(),
+      cacheDir,
+    });
+
+    assert.equal(report.ran, false);
+    assert.deepEqual(report.pinnedToolVersions, [{ tool: "rust", version: "1.86.0", dir: "." }]);
+    assert.deepEqual(report.toolVersionChecks.map((result) => [result.tool, result.expected, result.actual, result.ok]), [
+      ["rustc", "1.86.0", "rustc 1.75.0", false],
+      ["cargo", "1.86.0", "cargo 1.75.0", false],
+    ]);
+    assert.equal(report.results.length, 0);
+    assert.doesNotMatch(await readFile(logPath, "utf8"), /cargo fetch/);
+    const requests = prepareResourceRequests(report);
+    assert.deepEqual(requests.map((request) => request.needed), [
+      "Sandbox image with rustc 1.86.0",
+      "Sandbox image with cargo 1.86.0",
+    ]);
+  } finally {
+    process.env.PATH = oldPath;
+    await rm(workspace, { recursive: true, force: true });
+    await rm(binDir, { recursive: true, force: true });
+    await rm(cacheDir, { recursive: true, force: true });
+  }
+});
+
 test("prepareWorkspaceToolchain limits eager warm-up to the selected scope build tree", async () => {
   const workspace = await tempDir("flounder-prepare-focused-");
   const binDir = await tempDir("flounder-prepare-bin-");

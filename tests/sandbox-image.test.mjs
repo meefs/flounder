@@ -31,6 +31,16 @@ test("default sandbox image includes common JavaScript package managers", async 
   assert.match(dockerfile, /pnpm --version/);
 });
 
+test("Rust sandbox image installs one exact toolchain over the baseline", async () => {
+  const dockerfile = await readFile(new URL("../docker/flounder-sandbox-rust.Dockerfile", import.meta.url), "utf8");
+  assert.match(dockerfile, /FROM rust:\$\{RUST_VERSION\}-bookworm AS rust-toolchain/);
+  assert.match(dockerfile, /FROM flounder-sandbox:latest/);
+  assert.match(dockerfile, /COPY --from=rust-toolchain \/usr\/local\/cargo \/usr\/local\/cargo/);
+  assert.match(dockerfile, /COPY --from=rust-toolchain \/usr\/local\/rustup \/usr\/local\/rustup/);
+  assert.match(dockerfile, /test "\$\(rustc --version \| awk '\{print \$2\}'\)" = "\$\{RUST_VERSION\}"/);
+  assert.match(dockerfile, /test "\$\(cargo --version \| awk '\{print \$2\}'\)" = "\$\{RUST_VERSION\}"/);
+});
+
 test("Cairo sandbox image pins Scarb, Starknet Foundry, and Sierra compiler", async () => {
   const dockerfile = await readFile(new URL("../docker/flounder-sandbox-cairo.Dockerfile", import.meta.url), "utf8");
   assert.match(dockerfile, /FROM flounder-sandbox:latest/);
