@@ -2454,7 +2454,7 @@ async function runLaunch(c: Ctx): Promise<void> {
   const currentMaterialFingerprint = currentResultRuns(currentRuns, scopeBoundary).map((run) => stringValue(run.material_fingerprint)).find(Boolean)
     || stringValue(materialBoundary?.material_fingerprint);
   if (currentMaterialFingerprint) spec.materialFingerprint = currentMaterialFingerprint;
-  const preparedWorkspace = latestPreparedWorkspace(runs);
+  const preparedWorkspace = latestPreparedWorkspace(allRuns);
   if (spec.verb === "run") {
     if (preparedWorkspace && !runBodyHasMaterialOverride(body)) {
       applyProjectPrepareDefaults(spec, project, runs);

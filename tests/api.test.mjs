@@ -321,7 +321,7 @@ test("api: project run defaults leave map/dig turns unbounded and use standard s
   });
 });
 
-test("api: project phases prefer the current prepared workspace over stored source paths", async () => {
+test("api: project phases prefer the current prepared workspace beyond the recent-run display window", async () => {
   await withServer(async (base, out) => {
     const json = (r) => r.json();
     const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -356,6 +356,16 @@ test("api: project phases prefer the current prepared workspace over stored sour
     try {
       const prepareRun = store.startRun({ projectId: created.id, kind: "prepare", runDir, provider: "openai-codex", model: "gpt-5.5" });
       store.finishRun(prepareRun, "done");
+      for (let i = 0; i < 55; i += 1) {
+        const noiseRun = store.startRun({
+          projectId: created.id,
+          kind: "report",
+          runDir: path.join(out, `failed-followup-${i}`),
+          provider: "openai-codex",
+          model: "gpt-5.5",
+        });
+        store.finishRun(noiseRun, "error");
+      }
     } finally {
       store.close();
     }
