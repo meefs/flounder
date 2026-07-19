@@ -1227,6 +1227,7 @@ function dockerClientEnv(): NodeJS.ProcessEnv {
   for (const key of ["PATH", "HOME", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DOCKER_CERT_PATH", "DOCKER_TLS_VERIFY"]) {
     if (process.env[key] !== undefined) out[key] = process.env[key];
   }
+  out.PATH = sandboxToolPath(process.env.PATH);
   return out;
 }
 
@@ -1235,6 +1236,7 @@ function containerClientEnv(): NodeJS.ProcessEnv {
   for (const key of ["PATH", "HOME"]) {
     if (process.env[key] !== undefined) out[key] = process.env[key];
   }
+  out.PATH = sandboxToolPath(process.env.PATH);
   return out;
 }
 
