@@ -2454,26 +2454,32 @@ async function runLaunch(c: Ctx): Promise<void> {
   const currentMaterialFingerprint = currentResultRuns(currentRuns, scopeBoundary).map((run) => stringValue(run.material_fingerprint)).find(Boolean)
     || stringValue(materialBoundary?.material_fingerprint);
   if (currentMaterialFingerprint) spec.materialFingerprint = currentMaterialFingerprint;
+  const preparedWorkspace = latestPreparedWorkspace(runs);
   if (spec.verb === "run") {
-    const prepared = latestPreparedWorkspace(runs);
-    if (prepared && !runBodyHasMaterialOverride(body)) {
+    if (preparedWorkspace && !runBodyHasMaterialOverride(body)) {
       applyProjectPrepareDefaults(spec, project, runs);
       spec.pipeline = true;
-      applyPreparedWorkspaceToSpec(spec, prepared);
+      applyPreparedWorkspaceToSpec(spec, preparedWorkspace);
     } else if (spec.sourcePaths.length > 0) {
       applyProjectSourceDefaults(spec, project);
       if (!spec.pipeline) spec.pipeline = false;
     } else {
       applyProjectPrepareDefaults(spec, project, runs);
       spec.pipeline = true;
-      if (prepared) {
-        applyPreparedWorkspaceToSpec(spec, prepared);
+      if (preparedWorkspace) {
+        applyPreparedWorkspaceToSpec(spec, preparedWorkspace);
       } else if (spec.clue && spec.sourcePaths.length === 0) {
         resetPipelineCoverageForUnknownInventory(spec);
       }
     }
   } else if (spec.verb === "prepare") {
     applyProjectPrepareDefaults(spec, project, runs);
+  }
+  if (spec.verb !== "run" && spec.verb !== "prepare" && preparedWorkspace && !runBodyHasMaterialOverride(body)) {
+    // Prepare defines the current material snapshot for every downstream phase. Reusing the
+    // project's original source configuration here can compute a different material fingerprint
+    // and make a valid prepared scope inventory appear missing (notably for direct Dig launches).
+    applyPreparedWorkspaceToSpec(spec, preparedWorkspace);
   }
   const prepared = applyPreparedWorkspaceIfNeeded(spec, runs);
   if (!prepared.ok) return sendJson(c.res, 400, { error: prepared.error });

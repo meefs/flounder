@@ -321,7 +321,7 @@ test("api: project run defaults leave map/dig turns unbounded and use standard s
   });
 });
 
-test("api: project run prefers the current prepared workspace over stored source paths", async () => {
+test("api: project phases prefer the current prepared workspace over stored source paths", async () => {
   await withServer(async (base, out) => {
     const json = (r) => r.json();
     const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -372,6 +372,19 @@ test("api: project run prefers the current prepared workspace over stored source
     assert.deepEqual(spec.corpusPaths, []);
     assert.equal(spec.clue, undefined);
 
+    const audit = await json(await post(`/api/projects/${created.uuid}/runs`, {
+      verb: "audit",
+      scope: "prepared-scope",
+    }));
+    assert.equal(audit.queued, true);
+    const auditJob = (await json(await fetch(base + "/api/jobs/" + audit.jobId))).job;
+    const auditSpec = JSON.parse(auditJob.spec_json);
+    assert.equal(auditSpec.scope, "prepared-scope");
+    assert.equal(auditSpec.dir, undefined);
+    assert.deepEqual(auditSpec.sourcePaths, [workspace]);
+    assert.equal(auditSpec.buildRoot, workspace);
+    assert.deepEqual(auditSpec.corpusPaths, []);
+
     const explicit = await json(await post(`/api/projects/${created.uuid}/runs`, {
       verb: "run",
       overrides: { sourcePaths: ["./explicit"], buildRoot: "./explicit", corpusPaths: ["docs.md"] },
@@ -383,6 +396,20 @@ test("api: project run prefers the current prepared workspace over stored source
     assert.deepEqual(explicitSpec.sourcePaths, ["./explicit"]);
     assert.equal(explicitSpec.buildRoot, "./explicit");
     assert.deepEqual(explicitSpec.corpusPaths, ["docs.md"]);
+
+    const explicitAudit = await json(await post(`/api/projects/${created.uuid}/runs`, {
+      verb: "audit",
+      scope: "explicit-scope",
+      overrides: { sourcePaths: ["./explicit"], buildRoot: "./explicit", corpusPaths: ["docs.md"] },
+    }));
+    assert.equal(explicitAudit.queued, true);
+    const explicitAuditJob = (await json(await fetch(base + "/api/jobs/" + explicitAudit.jobId))).job;
+    const explicitAuditSpec = JSON.parse(explicitAuditJob.spec_json);
+    assert.equal(explicitAuditSpec.scope, "explicit-scope");
+    assert.equal(explicitAuditSpec.dir, created.uuid);
+    assert.deepEqual(explicitAuditSpec.sourcePaths, ["./explicit"]);
+    assert.equal(explicitAuditSpec.buildRoot, "./explicit");
+    assert.deepEqual(explicitAuditSpec.corpusPaths, ["docs.md"]);
   });
 });
 
