@@ -237,6 +237,7 @@ export function openWorldCommandNeedsNetwork(command: StructuredReproductionComm
   if (program === "cast") return isReadOnlyCastCommand(args);
   if (program === "forge") return isReadOnlyForgeForkCommand(args);
   if (program === "anvil") return hasRemoteForkTarget(args) && !args.some((arg) => /broadcast|transaction/i.test(arg));
+  if (program === "solana") return isReadOnlySolanaCommand(args);
   return false;
 }
 
@@ -281,6 +282,62 @@ const READ_ONLY_JSON_RPC_METHODS = new Set([
   "trace_call",
   "trace_replayTransaction",
   "web3_clientVersion",
+]);
+
+// Solana's HTTP API exposes read-only queries and live-state mutations through
+// the same JSON-RPC transport. Keep egress method-scoped so an audit can inspect
+// deployed programs without granting sendTransaction/requestAirdrop access.
+const READ_ONLY_SOLANA_JSON_RPC_METHODS = new Set([
+  "getAccountInfo",
+  "getBalance",
+  "getBlock",
+  "getBlockCommitment",
+  "getBlockHeight",
+  "getBlockProduction",
+  "getBlocks",
+  "getBlocksWithLimit",
+  "getBlockTime",
+  "getClusterNodes",
+  "getEpochInfo",
+  "getEpochSchedule",
+  "getFeeForMessage",
+  "getFirstAvailableBlock",
+  "getGenesisHash",
+  "getHealth",
+  "getHighestSnapshotSlot",
+  "getIdentity",
+  "getInflationGovernor",
+  "getInflationRate",
+  "getInflationReward",
+  "getLargestAccounts",
+  "getLatestBlockhash",
+  "getLeaderSchedule",
+  "getMaxRetransmitSlot",
+  "getMaxShredInsertSlot",
+  "getMinimumBalanceForRentExemption",
+  "getMultipleAccounts",
+  "getProgramAccounts",
+  "getRecentPerformanceSamples",
+  "getRecentPrioritizationFees",
+  "getSignaturesForAddress",
+  "getSignatureStatuses",
+  "getSlot",
+  "getSlotLeader",
+  "getSlotLeaders",
+  "getStakeMinimumDelegation",
+  "getSupply",
+  "getTokenAccountBalance",
+  "getTokenAccountsByDelegate",
+  "getTokenAccountsByOwner",
+  "getTokenLargestAccounts",
+  "getTokenSupply",
+  "getTransaction",
+  "getTransactionCount",
+  "getVersion",
+  "getVoteAccounts",
+  "isBlockhashValid",
+  "minimumLedgerSlot",
+  "simulateTransaction",
 ]);
 
 function isReadOnlyJsonRpcCurl(args: string[]): boolean {
@@ -351,7 +408,9 @@ function isReadOnlyJsonRpcRequest(input: unknown): boolean {
   if (Object.keys(request).some((key) => !new Set(["jsonrpc", "id", "method", "params"]).has(key))) return false;
   if (request.jsonrpc !== "2.0" || typeof request.method !== "string") return false;
   if (request.params !== undefined && !Array.isArray(request.params) && (typeof request.params !== "object" || request.params === null)) return false;
-  return READ_ONLY_JSON_RPC_METHODS.has(request.method) || /^eth_get[A-Z][A-Za-z0-9]*$/.test(request.method);
+  return READ_ONLY_JSON_RPC_METHODS.has(request.method)
+    || READ_ONLY_SOLANA_JSON_RPC_METHODS.has(request.method)
+    || /^eth_get[A-Z][A-Za-z0-9]*$/.test(request.method);
 }
 
 function isSafeCurlResolveTarget(input: string, rpcUrl: URL): boolean {
@@ -474,6 +533,58 @@ function isReadOnlyForgeForkCommand(args: string[]): boolean {
   return verb === "test"
     && hasRemoteForkTarget(args)
     && !args.some((arg) => arg === "--ffi" || arg.startsWith("--ffi=") || arg === "--broadcast" || /send-?raw-?transaction/i.test(arg));
+}
+
+function isReadOnlySolanaCommand(args: string[]): boolean {
+  if (args[0] !== "program" || (args[1] !== "show" && args[1] !== "dump")) return false;
+
+  const verb = args[1];
+  const positional: string[] = [];
+  let remoteUrl: string | undefined;
+  for (let idx = 2; idx < args.length; idx += 1) {
+    const arg = args[idx] ?? "";
+    if (arg === "--url" || arg === "-u") {
+      if (remoteUrl !== undefined) return false;
+      remoteUrl = args[idx + 1];
+      if (!remoteUrl) return false;
+      idx += 1;
+      continue;
+    }
+    if (arg.startsWith("--url=")) {
+      if (remoteUrl !== undefined) return false;
+      remoteUrl = arg.slice("--url=".length);
+      continue;
+    }
+    if (arg === "--commitment") {
+      if (!new Set(["processed", "confirmed", "finalized"]).has(args[idx + 1] ?? "")) return false;
+      idx += 1;
+      continue;
+    }
+    if (arg.startsWith("--commitment=")) {
+      if (!new Set(["processed", "confirmed", "finalized"]).has(arg.slice("--commitment=".length))) return false;
+      continue;
+    }
+    if (arg === "--output") {
+      if (!new Set(["json", "json-compact"]).has(args[idx + 1] ?? "")) return false;
+      idx += 1;
+      continue;
+    }
+    if (arg.startsWith("--output=")) {
+      if (!new Set(["json", "json-compact"]).has(arg.slice("--output=".length))) return false;
+      continue;
+    }
+    if (arg === "--verbose" && verb === "show") continue;
+    if (arg.startsWith("-")) return false;
+    positional.push(arg);
+  }
+
+  if (!remoteUrl || !firstNonLocalRemoteUrl(remoteUrl) || !hasOnlyHttpRemoteTargets([remoteUrl])) return false;
+  const address = positional[0] ?? "";
+  if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address)) return false;
+  if (verb === "show") return positional.length === 1;
+  return positional.length === 2
+    && !positional[1]?.startsWith("/")
+    && !looksLikePathEscape(positional[1] ?? "");
 }
 
 function hasRemoteForkTarget(args: string[]): boolean {
