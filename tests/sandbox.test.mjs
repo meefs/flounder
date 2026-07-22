@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { defaultConfig, sandboxExecutionOptions, sandboxNetworkForPurpose } from "../dist/config.js";
-import { autoPrefersAppleContainer, checkSandboxReadiness, clearSandboxAvailabilityCache, compactSandboxWorkspace, DEFAULT_SANDBOX_BUILD_MIN_FREE_DISK_MB, defaultAppleContainerMemoryMb, runSandboxCommand, sandboxMinFreeDiskMb, sandboxToolPath } from "../dist/security/sandbox.js";
+import { analyzeSandboxFileSafety, autoPrefersAppleContainer, checkSandboxReadiness, clearSandboxAvailabilityCache, compactSandboxWorkspace, DEFAULT_SANDBOX_BUILD_MIN_FREE_DISK_MB, defaultAppleContainerMemoryMb, runSandboxCommand, sandboxMinFreeDiskMb, sandboxToolPath } from "../dist/security/sandbox.js";
 
 async function tempDir(prefix) {
   return mkdtemp(path.join(os.tmpdir(), prefix));
@@ -42,6 +42,26 @@ test("completed sandbox workspaces discard rebuildable output but retain source 
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
+});
+
+test("sandbox file safety blocks capabilities instead of audit vocabulary", () => {
+  assert.equal(analyzeSandboxFileSafety({
+    path: "tests/local_withdraw.rs",
+    content: "// Reproduce the published mainnet artifact locally.\n#[test] fn withdraw_before_cancel() {}\nconst RPC: &str = \"http://127.0.0.1:8899\";\n",
+  }), undefined);
+
+  assert.match(analyzeSandboxFileSafety({
+    path: "tests/remote.ts",
+    content: "fetch('https://rpc.example.test/mainnet');\n",
+  }), /must not reference remote URLs/);
+  assert.match(analyzeSandboxFileSafety({
+    path: "tests/process.ts",
+    content: "import { execSync } from 'node:child_process';\n",
+  }), /must not spawn subprocesses/);
+  assert.match(analyzeSandboxFileSafety({
+    path: "tests/secret.ts",
+    content: "const rpc = process.env.RPC_URL;\n",
+  }), /must not read secret or RPC environment variables/);
 });
 
 function truncatedElf64() {

@@ -184,9 +184,6 @@ export function analyzeSandboxFileSafety(file: ReproductionFile): string | undef
   if (/\b(?:PRIVATE_KEY|MNEMONIC|SECRET|TOKEN|ALCHEMY|INFURA|QUICKNODE|MORALIS|ETHERSCAN|RPC_URL)\b/.test(content)) {
     return `Blocked by flounder guardrail: generated test file ${file.path} must not read secret or RPC environment variables.`;
   }
-  if (/\b(?:sendRawTransaction|broadcast|transferFrom|withdraw|drain)\b/i.test(content) && /\b(?:mainnet|testnet|public\s+rpc|production)\b/i.test(content)) {
-    return `Blocked by flounder guardrail: generated test file ${file.path} combines live-network and value-moving terms.`;
-  }
   return undefined;
 }
 
